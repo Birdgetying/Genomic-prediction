@@ -1,0 +1,163 @@
+#!/bin/bash
+#JSUB -q fat
+#JSUB -n 16
+#JSUB -m "fnode206"
+#JSUB -o /storage/public/home/2024110093/genomic_prediction/logs/comprehensive_ablation_%J.log
+#JSUB -e /storage/public/home/2024110093/genomic_prediction/logs/comprehensive_ablation_%J.err
+
+# ============================================================
+# Comprehensive Ablation Study and Model Ensemble
+# 综合消融实验与模型集成 - Fat节点
+# ============================================================
+
+echo "=========================================="
+echo "COMPREHENSIVE ABLATION STUDY"
+echo "=========================================="
+echo "Job Start Time: $(date)"
+echo "Node: $(hostname)"
+echo "Job ID: ${JSUB_JOBID}"
+echo "=========================================="
+
+# ============================================================
+# 环境配置
+# ============================================================
+
+echo ""
+echo "[Step 1] Loading PyTorch environment..."
+module load pytorch-2.3.0_py311
+
+# Fat节点无GPU，禁用CUDA
+export CUDA_VISIBLE_DEVICES=""
+export CUDA_LAUNCH_BLOCKING=0
+
+# 增加OpenMP线程数（充分利用CPU）
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+
+echo ""
+echo "[CPU Mode - Fat Node]"
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "OMP_NUM_THREADS: $OMP_NUM_THREADS"
+
+echo "Python: $(python --version)"
+echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
+
+# CPU模式检查
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'Device: CPU')"
+
+# ============================================================
+# 工作目录
+# ============================================================
+
+echo ""
+echo "[Step 2] Setting up working directory..."
+
+cd ~/genomic_prediction 2>/dev/null || \
+cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+    echo "ERROR: Cannot find project directory"
+    exit 1
+}
+
+echo "Working directory: $(pwd)"
+
+# 创建输出目录
+mkdir -p results/comprehensive_ablation
+mkdir -p logs
+
+echo "Output directories created"
+
+# ============================================================
+# 依赖检查
+# ============================================================
+
+echo ""
+echo "[Step 3] Checking dependencies..."
+
+python -c "import xgboost; print(f'XGBoost: {xgboost.__version__}')" 2>/dev/null || {
+    echo "Installing xgboost..."
+    pip install xgboost --quiet
+}
+
+python -c "import cyvcf2; print('cyvcf2: OK')" 2>/dev/null || {
+    echo "Warning: cyvcf2 not available, will use fallback"
+}
+
+# ============================================================
+# 运行综合消融实验
+# ============================================================
+
+echo ""
+echo "=========================================="
+echo "Starting Comprehensive Ablation Study..."
+echo "=========================================="
+echo ""
+echo "This experiment includes:"
+echo "  1. Base models: RRBLUP, XGBoost, WheatGP, DNNGP"
+echo "  2. Enhanced model ablation (9 variants)"
+echo "  3. Depth ablation (4 depths)"
+echo "  4. Model ensemble"
+echo ""
+echo "Expected runtime: 8-12 hours"
+echo "Start: $(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+
+# 带时间戳的日志文件
+TIMESTAMP=$(date +%s)
+LOG_FILE="logs/comprehensive_ablation_${TIMESTAMP}.log"
+
+echo "Log file: $LOG_FILE"
+echo ""
+
+python train_comprehensive_ablation.py 2>&1 | tee "$LOG_FILE"
+EXIT_CODE=${PIPESTATUS[0]}
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo ""
+    echo "=========================================="
+    echo "✓ Comprehensive ablation study completed!"
+    echo "=========================================="
+    
+    # 显示结果摘要
+    echo ""
+    echo "Results summary:"
+    ls -la results/comprehensive_ablation/
+    
+    # 显示最新结果文件
+    LATEST_RESULT=$(ls -t results/comprehensive_ablation/*.json 2>/dev/null | head -1)
+    if [ -n "$LATEST_RESULT" ]; then
+        echo ""
+        echo "Latest result file: $LATEST_RESULT"
+        echo ""
+        echo "Top 10 models:"
+        python -c "
+import json
+with open('$LATEST_RESULT') as f:
+    data = json.load(f)
+results = data.get('results', {})
+sorted_r = sorted(results.items(), key=lambda x: x[1].get('r2_mean', 0), reverse=True)[:10]
+print(f\"{'Model':<35} {'R² Mean':>10} {'R² Std':>10}\")
+print('-'*60)
+for name, r in sorted_r:
+    r2_mean = r.get('r2_mean', 0)
+    r2_std = r.get('r2_std', 0)
+    print(f'{name:<35} {r2_mean:>10.4f} {r2_std:>10.4f}')
+print()
+print(f\"Best Model: {data.get('best_model', 'N/A')}\")
+print(f\"Best R²: {data.get('best_r2', 'N/A'):.4f}\")
+"
+    fi
+else
+    echo ""
+    echo "=========================================="
+    echo "✗ Training failed with exit code: $EXIT_CODE"
+    echo "=========================================="
+    echo "Check log: $LOG_FILE"
+    tail -100 "$LOG_FILE"
+    exit $EXIT_CODE
+fi
+
+echo ""
+echo "=========================================="
+echo "Job End Time: $(date)"
+echo "Total runtime: $(($(date +%s) - $TIMESTAMP)) seconds"
+echo "=========================================="
