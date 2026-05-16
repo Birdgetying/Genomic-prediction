@@ -1,0 +1,72 @@
+#!/bin/bash
+# ============================================================================
+# Rice Genomic Prediction — FGN+EFM+MICNN Ensemble System
+# 超算 GPU 作业脚本
+#
+# GPU模式 (默认):  -q gpu, -gpgpu 1, 不指定节点由系统自动分配
+# 若GPU资源紧张可改用Fat节点 (无GPU, CPU Only):
+#   将下方 -q gpu 改为 -q fat, -gpgpu 1 改为 -n 16 -m "fnode206"
+#   同时取消 export CUDA_VISIBLE_DEVICES="" 的注释
+# ============================================================================
+#JSUB -q fat
+#JSUB -n 16
+#JSUB -m fnode206
+#JSUB -J rice_ensemble
+#JSUB -o logs/rice_ensemble_%J.out
+#JSUB -e logs/rice_ensemble_%J.err
+
+echo "======================================================================"
+echo "Rice Ensemble System — Job started at $(date)"
+echo "======================================================================"
+
+# PyTorch 2.3.0 (CUDA) 环境
+module load pytorch-2.3.0_py311
+echo "Module loaded: pytorch-2.3.0_py311"
+
+# GPU模式: export CUDA_VISIBLE_DEVICES=0
+# Fat节点模式 (当前): export CUDA_VISIBLE_DEVICES="" (禁用CUDA)
+export CUDA_VISIBLE_DEVICES=""
+# export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+export CUDA_LAUNCH_BLOCKING=0
+
+# 工作目录
+cd $HOME/genomic_prediction 2>/dev/null || \
+cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+    echo "ERROR: Cannot find project directory"
+    exit 1
+}
+echo "Working directory: $(pwd)"
+
+# GPU 诊断
+echo ""
+echo "GPU Diagnostics:"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>&1 || echo "nvidia-smi not available"
+python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')"
+
+# 确认关键文件存在
+echo ""
+echo "Checking files..."
+for f in "rice_models_ensemble.py" "results/rice_data/genotype_matrix.npz" "results/rice_data/trait_data.json"; do
+    if [ -f "$f" ]; then
+        echo "  [OK] $f"
+    else
+        echo "  [MISSING] $f"
+        exit 1
+    fi
+done
+
+# 完整实验 (--full 覆盖 QUICK_TEST)
+echo ""
+echo "Starting ensemble experiment (full mode)..."
+python -u rice_models_ensemble.py --full 2>&1 | tee "logs/rice_ensemble_$(date +%Y%m%d_%H%M%S).log"
+EXIT_CODE=${PIPESTATUS[0]}
+echo ""
+echo "======================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "SUCCESS — Job completed at $(date)"
+else
+    echo "FAILED with exit code $EXIT_CODE at $(date)"
+fi
+echo "======================================================================"
+exit $EXIT_CODE

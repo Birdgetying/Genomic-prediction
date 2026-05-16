@@ -6,3 +6,5 @@
 !submit_comprehensive_ablation.jsub
 !train_comprehensive_ablation.py
 !requirements.txt
+!rice_models_ensemble.py
+!submit_rice_ensemble.jsub
