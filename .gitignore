@@ -10,3 +10,5 @@
 !submit_rice_ensemble.jsub
 !plot_ensemble_comparison.py
 !rice_models_fast.py
+!wheat_models_ensemble.py
+!submit_wheat_ensemble.jsub

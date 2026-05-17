@@ -1,0 +1,84 @@
+#!/bin/bash
+# ============================================================================
+# Wheat Genomic Prediction — FGN+EFM+MICNN Ensemble System
+# 超算 GPU 作业脚本
+#
+# GPU模式: -q gpu, -gpgpu 1
+# ============================================================================
+#JSUB -q gpu
+#JSUB -n 4
+#JSUB -gpgpu 1
+#JSUB -J wheat_ensemble
+#JSUB -o logs/wheat_ensemble_%J.out
+#JSUB -e logs/wheat_ensemble_%J.err
+
+echo "======================================================================"
+echo "Wheat Ensemble System — Job started at $(date)"
+echo "======================================================================"
+
+module load pytorch-2.3.0_py311
+echo "Module loaded: pytorch-2.3.0_py311"
+
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+export CUDA_LAUNCH_BLOCKING=0
+
+# 工作目录
+cd $HOME/genomic_prediction 2>/dev/null || \
+cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+    echo "ERROR: Cannot find project directory"
+    exit 1
+}
+echo "Working directory: $(pwd)"
+
+# GPU 诊断
+echo ""
+echo "GPU Diagnostics:"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>&1 || echo "nvidia-smi not available"
+python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')"
+
+# 确认关键文件存在
+echo ""
+echo "Checking files..."
+for f in "wheat_models_ensemble.py"; do
+    if [ -f "$f" ]; then
+        echo "  [OK] $f"
+    else
+        echo "  [MISSING] $f"
+        exit 1
+    fi
+done
+
+# 检查数据文件 (HPC路径)
+DATA_BASE="/storage/public/home/2024110093/data/Variation/CSIAAS"
+echo ""
+echo "Checking data files..."
+for f in \
+    "Core819Samples_snp.filter.final.id_gt.813m.vcf.gz" \
+    "Core819Samples_indel.filter.final.id_gt.813m.vcf.gz" \
+    "SV.new.vcf.gz" \
+    "Phe.txt" \
+    "VCFID.txt"
+do
+    if [ -f "$DATA_BASE/$f" ]; then
+        SIZE=$(du -h "$DATA_BASE/$f" | cut -f1)
+        echo "  [OK] $f ($SIZE)"
+    else
+        echo "  [MISSING] $f"
+    fi
+done
+
+# 完整实验
+echo ""
+echo "Starting wheat ensemble experiment (full mode)..."
+python -u wheat_models_ensemble.py --full 2>&1 | tee "logs/wheat_ensemble_$(date +%Y%m%d_%H%M%S).log"
+EXIT_CODE=${PIPESTATUS[0]}
+echo ""
+echo "======================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "SUCCESS — Job completed at $(date)"
+else
+    echo "FAILED with exit code $EXIT_CODE at $(date)"
+fi
+echo "======================================================================"
+exit $EXIT_CODE
