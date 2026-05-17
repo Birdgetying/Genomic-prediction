@@ -15,7 +15,7 @@ Rice Genomic Prediction — FGN + EFM + MICNN Ensemble
 对照: 保留 FGN/EFM/MICNN 原版作为基线
 """
 
-import json, time
+import json, time, pickle
 import numpy as np
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
@@ -519,23 +519,27 @@ def main():
         y = np.array(td['values']).astype(np.float32)
         X_all = G[idxs]
 
-        k = min(GWAS_TOP_K, X_all.shape[1] - 50)
-        gidx = gwas_select(X_all, y, k)
-        X_sel = X_all[:, gidx]
-        n_snps = X_sel.shape[1]
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        models = {m: create_model(m, n_snps) for m in all_names}
+        n_snps = min(GWAS_TOP_K, X_all.shape[1] - 50)
+        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> "
+              f"{n_snps} GWAS-selected (per-fold, no leakage)")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
                    for m in all_names}
         oof = {m: np.zeros(len(y)) for m in base_names}
 
-        for fi, (tr, te) in enumerate(kf.split(X_sel)):
+        # models are re-created per fold with same n_snps (constant input dim)
+        models = {m: create_model(m, n_snps) for m in all_names}
+
+        for fi, (tr, te) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fi+1}/{folds_run} ---")
-            Xtr, Xte = X_sel[tr], X_sel[te]
+            Xtr_raw, Xte_raw = X_all[tr], X_all[te]
             ytr, yte = y[tr], y[te]
+
+            # GWAS selection on TRAINING data only — no leakage
+            gidx = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr = Xtr_raw[:, gidx]
+            Xte = Xte_raw[:, gidx]
 
             sc = StandardScaler()
             Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
@@ -567,7 +571,7 @@ def main():
 
                 models[mname] = create_model(mname, n_snps)
 
-            # 加权平均集成
+            # Weighted average
             w = np.array([max(0.001, r2_score(yte, fold_preds[m])) for m in base_names])
             w = w / w.sum()
             wavg = np.zeros(len(yte))
@@ -575,7 +579,7 @@ def main():
                 wavg += w[mi] * fold_preds[mname]
             print(f"    {'WeightedAvg':<16s} R2={r2_score(yte, wavg):+.4f}")
 
-        # 性状汇总
+        # ── 性状汇总 ──
         print(f"\n  {'-'*65}")
         print(f"  {trait} Final Results:")
         print(f"  {'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Params':>8s} {'Time':>7s}")
@@ -607,6 +611,42 @@ def main():
             print(f"    weights: {weights_str}")
 
         all_results[trait] = trait_res
+
+        # ── 最终部署: 全量数据重训 + 保存模型 ──
+        print(f"\n  Deploying models on full dataset ({len(y)} samples) ...")
+        deploy_dir = OUTPUT_DIR / "deployed_models" / trait
+        deploy_dir.mkdir(parents=True, exist_ok=True)
+
+        # GWAS on full data (for deployment only — informative prior, not CV evaluation)
+        gidx_full = gwas_select(X_all, y, n_snps)
+        X_full = X_all[:, gidx_full]
+        sc_full = StandardScaler().fit(X_full)
+        X_full_s = sc_full.fit_transform(X_full).astype(np.float32)
+
+        deployment_meta = {
+            'gwas_indices': gidx_full.tolist(),
+            'n_snps': n_snps,
+            'base_names': base_names,
+        }
+
+        for mname in base_names + ['FusionNet']:
+            model = create_model(mname, n_snps)
+            model = train_torch_model(
+                model, X_full_s, y, X_full_s, y,
+                epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
+            torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
+            print(f"    [saved] {mname}.pt")
+
+        # Stacking meta-learner on full OOF
+        X_meta = np.column_stack([oof[m] for m in base_names])
+        meta_learner = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+        meta_learner.fit(X_meta, y)
+        pickle.dump(meta_learner, open(deploy_dir / "Stacking_meta.pkl", 'wb'))
+        deployment_meta['meta_coef'] = meta_learner.coef_.tolist()
+        deployment_meta['meta_intercept'] = float(meta_learner.intercept_)
+        pickle.dump(sc_full, open(deploy_dir / "scaler.pkl", 'wb'))
+        pickle.dump(deployment_meta, open(deploy_dir / "deployment_meta.pkl", 'wb'))
+        print(f"    [saved] Stacking_meta.pkl, scaler.pkl, deployment_meta.pkl")
 
         with open(OUTPUT_DIR / "ensemble_intermediate.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)

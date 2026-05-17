@@ -17,7 +17,7 @@ Wheat Genomic Prediction — FGN + EFM + MICNN Ensemble System
   python wheat_models_ensemble.py --full    # 完整实验 (所有性状 x 5折)
 """
 
-import json, time, os, sys
+import json, time, os, sys, pickle
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
@@ -397,12 +397,6 @@ def evaluate_traditional_stacking(oof_trad, y):
         'Meta_intercept': float(meta.intercept_),
         'Base_models': trad_names
     }
-
-
-def compute_grm(X):
-    """计算基因组关系矩阵 G = XX^T / p (VanRaden 2008)"""
-    X_s = X - X.mean(axis=0)
-    return X_s @ X_s.T / X_s.shape[1]
 
 
 # ============================================================================
@@ -820,56 +814,54 @@ def main():
         X_all, y = trait_data[trait]
         y = y.astype(np.float32)
 
-        # GWAS 筛选
-        k = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-        if X_all.shape[1] > k:
-            gidx = gwas_select(X_all, y, k)
-            X_sel = X_all[:, gidx]
-        else:
-            X_sel = X_all
-        n_snps = X_sel.shape[1]
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        # 预计算 GRM (GBLUP 和传统 Stacking 需要)
-        G_mat = compute_grm(X_sel)
-        print(f"  GRM: {G_mat.shape}")
-
-        # DL 模型初始化 (每折重建)
-        dl_models = {m: create_model(m, n_snps) for m in dl_names}
+        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
+        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> "
+              f"{n_snps} GWAS-selected (per-fold, no leakage)")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
                    for m in all_names}
 
-        # OOF 预测 (用于 Stacking)
         oof_trad = {m: np.zeros(len(y)) for m in trad_names}
         oof_dl = {m: np.zeros(len(y)) for m in dl_base_names}
 
-        for fi, (tr, te) in enumerate(kf.split(X_sel)):
+        dl_models = {m: create_model(m, n_snps) for m in dl_names}
+
+        for fi, (tr, te) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fi+1}/{folds_run} ---")
-            Xtr, Xte = X_sel[tr], X_sel[te]
+            Xtr_raw, Xte_raw = X_all[tr], X_all[te]
             ytr, yte = y[tr], y[te]
+
+            # GWAS selection on TRAINING data only — no leakage
+            gidx = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr = Xtr_raw[:, gidx]
+            Xte = Xte_raw[:, gidx]
 
             sc = StandardScaler()
             Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
             Xte_s = sc.transform(Xte).astype(np.float32)
 
+            # GRM computed on fold-specific markers
+            G_fold_train = Xtr_s @ Xtr_s.T / n_snps
+            G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
+
             # ── 传统模型 ──
             trad_configs = [
-                ('RRBLUP', lambda: RRBLUP(), lambda m, Xtr, ytr: m.fit(Xtr, ytr),
-                 lambda m, Xte: m.predict(Xte), n_snps + 1),
+                ('RRBLUP', lambda: RRBLUP(),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), n_snps + 1),
                 ('GBLUP', lambda: GBLUP(),
-                 lambda m, Xtr, ytr: m.fit(G_mat[tr][:, tr], ytr),
-                 lambda m, Xte: m.predict(G_mat[te][:, tr]), len(tr) + 1),
+                 lambda m, _x, yt: m.fit(G_fold_train, yt),
+                 lambda m, _x: m.predict(G_fold_te_tr), len(tr) + 1),
                 ('XGBoost', lambda: XGBoostModel(n_estimators=300),
-                 lambda m, Xtr, ytr: m.fit(Xtr, ytr),
-                 lambda m, Xte: m.predict(Xte), 300 * 6 * 2),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), 300 * 6 * 2),
                 ('ElasticNet', lambda: ElasticNetModel(),
-                 lambda m, Xtr, ytr: m.fit(Xtr, ytr),
-                 lambda m, Xte: m.predict(Xte), n_snps + 1),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), n_snps + 1),
                 ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(),
-                 lambda m, Xtr, ytr: m.fit(Xtr, ytr),
-                 lambda m, Xte: m.predict(Xte), n_snps * 2 + 1),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), n_snps * 2 + 1),
             ]
             for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
                 t0 = time.time()
@@ -960,6 +952,66 @@ def main():
             print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
 
         all_results[trait] = trait_res
+
+        # ── 最终部署: 全量数据重训 + 保存模型 ──
+        print(f"\n  Deploying models on full dataset ({len(y)} samples) ...")
+        deploy_dir = OUTPUT_DIR / "deployed_models" / trait
+        deploy_dir.mkdir(parents=True, exist_ok=True)
+
+        # GWAS on full data (for deployment — informative prior, not CV evaluation)
+        gidx_full = gwas_select(X_all, y, n_snps)
+        X_full = X_all[:, gidx_full]
+        sc_full = StandardScaler().fit(X_full)
+        X_full_s = sc_full.fit_transform(X_full).astype(np.float32)
+
+        deployment_meta = {
+            'gwas_indices': gidx_full.tolist(),
+            'n_snps': n_snps,
+            'trad_names': trad_names,
+            'dl_base_names': dl_base_names,
+        }
+
+        # Traditional models — fit on full data, save with pickle
+        for tname in trad_names:
+            tmodel = None
+            if tname == 'RRBLUP':
+                tmodel = RRBLUP().fit(X_full_s, y)
+            elif tname == 'GBLUP':
+                G_full = X_full_s @ X_full_s.T / n_snps
+                tmodel = GBLUP().fit(G_full, y)
+            elif tname == 'XGBoost':
+                tmodel = XGBoostModel(n_estimators=300).fit(X_full_s, y)
+            elif tname == 'ElasticNet':
+                tmodel = ElasticNetModel().fit(X_full_s, y)
+            elif tname == 'GWAS_RRBLUP':
+                tmodel = GWASWeightedRRBLUP().fit(X_full_s, y)
+            pickle.dump(tmodel, open(deploy_dir / f"{tname}.pkl", 'wb'))
+            print(f"    [saved] {tname}.pkl")
+
+        # DL models
+        for mname in dl_base_names + ['FusionNet']:
+            model = create_model(mname, n_snps)
+            model = train_torch_model(
+                model, X_full_s, y, X_full_s, y,
+                epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
+            torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
+            print(f"    [saved] {mname}.pt")
+
+        # Stacking meta-learners
+        X_meta_dl = np.column_stack([oof_dl[m] for m in dl_base_names])
+        meta_dl = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+        meta_dl.fit(X_meta_dl, y)
+        pickle.dump(meta_dl, open(deploy_dir / "Stacking_DL_meta.pkl", 'wb'))
+
+        X_meta_all = np.column_stack([oof_trad[m] for m in trad_names] +
+                                      [oof_dl[m] for m in dl_base_names])
+        meta_all = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+        meta_all.fit(X_meta_all, y)
+        pickle.dump(meta_all, open(deploy_dir / "Stacking_All_meta.pkl", 'wb'))
+
+        pickle.dump(sc_full, open(deploy_dir / "scaler.pkl", 'wb'))
+        pickle.dump(deployment_meta, open(deploy_dir / "deployment_meta.pkl", 'wb'))
+        print(f"    [saved] Stacking meta-learners, scaler, deployment_meta")
 
         with open(OUTPUT_DIR / "ensemble_intermediate.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
