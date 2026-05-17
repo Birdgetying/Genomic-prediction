@@ -47,6 +47,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 RANDOM_SEED = 42
 N_FOLDS = 5
 GWAS_TOP_K = 3000
+MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # True=仅1个性状x2折本地测试, False=完整实验
@@ -420,6 +421,13 @@ def gwas_select(X, y, top_k):
     return np.argsort(np.abs(num / denom))[-top_k:]
 
 
+def maf_filter(X, threshold=MAF_THRESHOLD):
+    """预过滤稀有位点: 剔除 MAF < threshold 的 SNP (per-fold, no leakage)."""
+    af = X.mean(axis=0) / 2.0
+    maf = np.minimum(af, 1.0 - af)
+    return np.where(maf >= threshold)[0]
+
+
 # ============================================================================
 # 模型工厂
 # ============================================================================
@@ -536,6 +544,12 @@ def main():
             Xtr_raw, Xte_raw = X_all[tr], X_all[te]
             ytr, yte = y[tr], y[te]
 
+            # MAF pre-filter on TRAINING data only — remove rare variants
+            maf_idx = maf_filter(Xtr_raw)
+            if len(maf_idx) >= n_snps:
+                Xtr_raw = Xtr_raw[:, maf_idx]
+                Xte_raw = Xte_raw[:, maf_idx]
+
             # GWAS selection on TRAINING data only — no leakage
             gidx = gwas_select(Xtr_raw, ytr, n_snps)
             Xtr = Xtr_raw[:, gidx]
@@ -617,8 +631,14 @@ def main():
         deploy_dir = OUTPUT_DIR / "deployed_models" / trait
         deploy_dir.mkdir(parents=True, exist_ok=True)
 
-        # GWAS on full data (for deployment only — informative prior, not CV evaluation)
-        gidx_full = gwas_select(X_all, y, n_snps)
+        # MAF pre-filter + GWAS on full data (for deployment)
+        maf_full = maf_filter(X_all)
+        if len(maf_full) >= n_snps:
+            X_all_f = X_all[:, maf_full]
+            gidx_f = gwas_select(X_all_f, y, n_snps)
+            gidx_full = maf_full[gidx_f]  # map back to original X_all column indices
+        else:
+            gidx_full = gwas_select(X_all, y, n_snps)
         X_full = X_all[:, gidx_full]
         sc_full = StandardScaler().fit(X_full)
         X_full_s = sc_full.fit_transform(X_full).astype(np.float32)

@@ -8,9 +8,9 @@
 #   将下方 -q gpu 改为 -q fat, -gpgpu 1 改为 -n 16 -m "fnode206"
 #   同时取消 export CUDA_VISIBLE_DEVICES="" 的注释
 # ============================================================================
-#JSUB -q fat
-#JSUB -n 16
-#JSUB -m fnode206
+#JSUB -q gpu
+#JSUB -n 4
+#JSUB -gpgpu 1
 #JSUB -J rice_ensemble
 #JSUB -o logs/rice_ensemble_%J.out
 #JSUB -e logs/rice_ensemble_%J.err
@@ -24,9 +24,9 @@ module load pytorch-2.3.0_py311
 echo "Module loaded: pytorch-2.3.0_py311"
 
 # GPU模式: export CUDA_VISIBLE_DEVICES=0
-# Fat节点模式 (当前): export CUDA_VISIBLE_DEVICES="" (禁用CUDA)
-export CUDA_VISIBLE_DEVICES=""
-# export CUDA_VISIBLE_DEVICES=0
+# Fat节点模式: export CUDA_VISIBLE_DEVICES="" (禁用CUDA)
+# export CUDA_VISIBLE_DEVICES=""
+export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
 export CUDA_LAUNCH_BLOCKING=0
 
