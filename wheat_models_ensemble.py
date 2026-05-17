@@ -23,7 +23,7 @@ import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import RidgeCV, Ridge, ElasticNetCV
+from sklearn.linear_model import RidgeCV, ElasticNetCV
 from scipy.stats import pearsonr
 import xgboost as xgb
 
@@ -66,6 +66,10 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 QUICK_TEST = True  # 命令行 --full 覆盖
 
+TYPE_TRAD = 'Traditional'
+TYPE_DL = 'DL'
+TYPE_ENS = 'Ensemble'
+
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
@@ -85,7 +89,6 @@ def load_phenotypes(phenotype_path):
     n_samples = len(df)
     print(f"  表型文件: {n_samples} 样本, {df.shape[1]} 列")
 
-    # 自动检测数值列作为性状
     traits = {}
     for col in df.columns:
         if col.lower() in ('sample', 'id', 'name', 'accession', 'line'):
@@ -137,7 +140,7 @@ def load_vcf_genotypes(vcf_path, max_variants, min_samples):
             genotypes.append(gt_numeric)
             variant_count += 1
 
-    X = np.array(genotypes, dtype=np.float32).T  # (variants, samples) -> (samples, variants)
+    X = np.array(genotypes, dtype=np.float32).T
     print(f"    提取 {variant_count} 个变异位点, 矩阵 {X.shape}")
     return X
 
@@ -276,7 +279,9 @@ def predict_torch_model(model, X):
     Xt = torch.FloatTensor(X).to(DEVICE)
     model.eval()
     with torch.no_grad():
-        return model(Xt).squeeze().cpu().numpy()
+        preds = model(Xt).squeeze().cpu().numpy()
+    model.cpu()
+    return preds
 
 
 # ============================================================================
@@ -316,7 +321,7 @@ class XGBoostModel:
             'n_estimators': n_estimators, 'max_depth': max_depth,
             'learning_rate': lr, 'subsample': 0.8, 'colsample_bytree': 0.8,
             'reg_alpha': 0.1, 'reg_lambda': 1.0,
-            'random_state': RANDOM_SEED, 'n_jobs': -1, 'verbosity': 0
+            'random_state': RANDOM_SEED, 'n_jobs': 8, 'verbosity': 0
         }
 
     def fit(self, X, y):
@@ -334,7 +339,7 @@ class ElasticNetModel:
         self.model = ElasticNetCV(
             l1_ratio=[.1, .5, .7, .9, .95, 1],
             alphas=np.logspace(-4, 2, 20),
-            cv=3, random_state=RANDOM_SEED, max_iter=5000, n_jobs=-1
+            cv=3, random_state=RANDOM_SEED, max_iter=5000, n_jobs=8
         )
 
     def fit(self, X, y):
@@ -370,38 +375,17 @@ class GWASWeightedRRBLUP:
 # 传统模型 Stacking (Ridge 元学习器, 嵌套 CV 防泄露)
 # ============================================================================
 
-def evaluate_traditional_stacking(X, y, G_mat, cv_folds=5):
-    """嵌套 CV 评估传统模型 Stacking (无数据泄露)"""
-    trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
-    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_SEED)
-    oof = {m: np.zeros(len(y)) for m in trad_names}
+def evaluate_traditional_stacking(oof_trad, y):
+    """复用主循环 OOF 预测, 仅做元学习器嵌套 CV 评估 (无重复训练)"""
+    trad_names = list(oof_trad.keys())
+    X_meta = np.column_stack([oof_trad[m] for m in trad_names])
 
-    for fi, (tr, te) in enumerate(kf.split(X)):
-        Xtr, Xte = X[tr], X[te]
-        ytr, yte = y[tr], y[te]
-
-        sc = StandardScaler()
-        Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
-        Xte_s = sc.transform(Xte).astype(np.float32)
-
-        # 5 base models
-        oof['RRBLUP'][te] = RRBLUP().fit(Xtr_s, ytr).predict(Xte_s)
-        oof['GBLUP'][te] = GBLUP().fit(
-            G_mat[tr][:, tr], ytr).predict(G_mat[te][:, tr])
-        oof['XGBoost'][te] = XGBoostModel(n_estimators=300).fit(
-            Xtr_s, ytr).predict(Xte_s)
-        oof['ElasticNet'][te] = ElasticNetModel().fit(Xtr_s, ytr).predict(Xte_s)
-        oof['GWAS_RRBLUP'][te] = GWASWeightedRRBLUP().fit(
-            Xtr_s, ytr).predict(Xte_s)
-
-    # 元学习器: 嵌套 CV
     meta = RidgeCV(alphas=np.logspace(-3, 3, 20), fit_intercept=True, cv=5)
-    X_meta = np.column_stack([oof[m] for m in trad_names])
     meta.fit(X_meta, y)
 
-    kf2 = KFold(n_splits=min(5, cv_folds), shuffle=True, random_state=RANDOM_SEED)
+    kf = KFold(n_splits=min(5, len(trad_names)), shuffle=True, random_state=RANDOM_SEED)
     sp = np.zeros(len(y))
-    for tr, te in kf2.split(X_meta):
+    for tr, te in kf.split(X_meta):
         m = RidgeCV(alphas=np.logspace(-3, 3, 20), fit_intercept=True, cv=3)
         m.fit(X_meta[tr], y[tr])
         sp[te] = m.predict(X_meta[te])
@@ -804,7 +788,6 @@ def main():
     print("Wheat Genomic Prediction — FGN+EFM+MICNN Ensemble System")
     print(f"{'='*80}")
 
-    # GPU 信息
     if DEVICE.type == 'cuda':
         print(f"\nGPU: {torch.cuda.get_device_name(0)}")
         print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
@@ -818,10 +801,7 @@ def main():
     dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2']
     dl_ensemble_names = ['FusionNet']
     dl_names = dl_base_names + dl_ensemble_names
-    all_names = trad_names + dl_names  # 传统在前, DL在后
-
-    # Stacking base: 传统 5 + DL 6 = 11
-    stacking_base_names = trad_names + dl_base_names
+    all_names = trad_names + dl_names
 
     traits_run = trait_names[:1] if QUICK_TEST else trait_names
     folds_run = min(2, N_FOLDS) if QUICK_TEST else N_FOLDS
@@ -841,7 +821,7 @@ def main():
         y = y.astype(np.float32)
 
         # GWAS 筛选
-        k = min(GWAS_TOP_K, X_all.shape[1] - 50)
+        k = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
         if X_all.shape[1] > k:
             gidx = gwas_select(X_all, y, k)
             X_sel = X_all[:, gidx]
@@ -874,58 +854,35 @@ def main():
             Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
             Xte_s = sc.transform(Xte).astype(np.float32)
 
-            fold_preds = {}
-
-            # ── 传统模型 (sklearn) ──
-            t0 = time.time()
-            rr = RRBLUP().fit(Xtr_s, ytr)
-            p_rr = rr.predict(Xte_s)
-            results['RRBLUP']['preds'].extend(p_rr.tolist())
-            results['RRBLUP']['targets'].extend(yte.tolist())
-            results['RRBLUP']['time'] += time.time() - t0
-            if fi == 0: results['RRBLUP']['params'] = n_snps + 1
-            fold_preds['RRBLUP'] = p_rr; oof_trad['RRBLUP'][te] = p_rr
-            print(f"    {'RRBLUP':<16s} R2={r2_score(yte, p_rr):+.4f}")
-
-            t0 = time.time()
-            gb = GBLUP().fit(G_mat[tr][:, tr], ytr)
-            p_gb = gb.predict(G_mat[te][:, tr])
-            results['GBLUP']['preds'].extend(p_gb.tolist())
-            results['GBLUP']['targets'].extend(yte.tolist())
-            results['GBLUP']['time'] += time.time() - t0
-            if fi == 0: results['GBLUP']['params'] = len(tr) + 1
-            fold_preds['GBLUP'] = p_gb; oof_trad['GBLUP'][te] = p_gb
-            print(f"    {'GBLUP':<16s} R2={r2_score(yte, p_gb):+.4f}")
-
-            t0 = time.time()
-            xm = XGBoostModel(n_estimators=300).fit(Xtr_s, ytr)
-            p_xg = xm.predict(Xte_s)
-            results['XGBoost']['preds'].extend(p_xg.tolist())
-            results['XGBoost']['targets'].extend(yte.tolist())
-            results['XGBoost']['time'] += time.time() - t0
-            if fi == 0: results['XGBoost']['params'] = 300 * 6 * 2
-            fold_preds['XGBoost'] = p_xg; oof_trad['XGBoost'][te] = p_xg
-            print(f"    {'XGBoost':<16s} R2={r2_score(yte, p_xg):+.4f}")
-
-            t0 = time.time()
-            en = ElasticNetModel().fit(Xtr_s, ytr)
-            p_en = en.predict(Xte_s)
-            results['ElasticNet']['preds'].extend(p_en.tolist())
-            results['ElasticNet']['targets'].extend(yte.tolist())
-            results['ElasticNet']['time'] += time.time() - t0
-            if fi == 0: results['ElasticNet']['params'] = n_snps + 1
-            fold_preds['ElasticNet'] = p_en; oof_trad['ElasticNet'][te] = p_en
-            print(f"    {'ElasticNet':<16s} R2={r2_score(yte, p_en):+.4f}")
-
-            t0 = time.time()
-            gw = GWASWeightedRRBLUP().fit(Xtr_s, ytr)
-            p_gw = gw.predict(Xte_s)
-            results['GWAS_RRBLUP']['preds'].extend(p_gw.tolist())
-            results['GWAS_RRBLUP']['targets'].extend(yte.tolist())
-            results['GWAS_RRBLUP']['time'] += time.time() - t0
-            if fi == 0: results['GWAS_RRBLUP']['params'] = n_snps * 2 + 1
-            fold_preds['GWAS_RRBLUP'] = p_gw; oof_trad['GWAS_RRBLUP'][te] = p_gw
-            print(f"    {'GWAS_RRBLUP':<16s} R2={r2_score(yte, p_gw):+.4f}")
+            # ── 传统模型 ──
+            trad_configs = [
+                ('RRBLUP', lambda: RRBLUP(), lambda m, Xtr, ytr: m.fit(Xtr, ytr),
+                 lambda m, Xte: m.predict(Xte), n_snps + 1),
+                ('GBLUP', lambda: GBLUP(),
+                 lambda m, Xtr, ytr: m.fit(G_mat[tr][:, tr], ytr),
+                 lambda m, Xte: m.predict(G_mat[te][:, tr]), len(tr) + 1),
+                ('XGBoost', lambda: XGBoostModel(n_estimators=300),
+                 lambda m, Xtr, ytr: m.fit(Xtr, ytr),
+                 lambda m, Xte: m.predict(Xte), 300 * 6 * 2),
+                ('ElasticNet', lambda: ElasticNetModel(),
+                 lambda m, Xtr, ytr: m.fit(Xtr, ytr),
+                 lambda m, Xte: m.predict(Xte), n_snps + 1),
+                ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(),
+                 lambda m, Xtr, ytr: m.fit(Xtr, ytr),
+                 lambda m, Xte: m.predict(Xte), n_snps * 2 + 1),
+            ]
+            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
+                t0 = time.time()
+                tmodel = build_fn()
+                fit_fn(tmodel, Xtr_s, ytr)
+                preds = pred_fn(tmodel, Xte_s)
+                results[tname]['preds'].extend(preds.tolist())
+                results[tname]['targets'].extend(yte.tolist())
+                results[tname]['time'] += time.time() - t0
+                if fi == 0:
+                    results[tname]['params'] = param_count
+                oof_trad[tname][te] = preds
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
 
             # ── DL 模型 (PyTorch) ──
             for mi, mname in enumerate(dl_names):
@@ -949,7 +906,6 @@ def main():
 
                 if mname in dl_base_names:
                     oof_dl[mname][te] = preds
-                    fold_preds[mname] = preds
 
                 dl_models[mname] = create_model(mname, n_snps)
 
@@ -969,7 +925,7 @@ def main():
             tag = " [Trad]" if mname in trad_names else " [DL]"
             trait_res[mname] = {
                 'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                'Type': 'Traditional' if mname in trad_names else 'DL',
+                'Type': TYPE_TRAD if mname in trad_names else TYPE_DL,
                 'Time': results[mname]['time']/folds_run}
             print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} {rmse_v:8.4f} "
                   f"{results[mname]['time']/folds_run:7.1f}s")
@@ -980,7 +936,7 @@ def main():
             sr_dl = stacking_evaluate(oof_dl, y, n_folds=min(5, folds_run))
             trait_res['Stacking (DL)'] = {
                 'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
-                'RMSE': 0.0, 'Type': 'Ensemble',
+                'RMSE': 0.0, 'Type': TYPE_ENS,
                 'Meta_weights': sr_dl['Meta_weights'], 'Base_models': sr_dl['Base_models']}
             print(f"  {'Stacking (DL)':<24s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f}")
 
@@ -989,17 +945,17 @@ def main():
             sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
             trait_res['Stacking (All)'] = {
                 'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
-                'RMSE': 0.0, 'Type': 'Ensemble',
+                'RMSE': 0.0, 'Type': TYPE_ENS,
                 'Meta_weights': sr_all['Meta_weights'], 'Base_models': sr_all['Base_models']}
             print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
             weights_str = dict(zip(sr_all['Base_models'], [f'{w:.3f}' for w in sr_all['Meta_weights']]))
             print(f"    All weights: {weights_str}")
 
-            # 传统 Stacking
-            tsr = evaluate_traditional_stacking(X_sel, y, G_mat, cv_folds=folds_run)
+            # 传统 Stacking — 复用主循环 OOF, 仅元学习器评估
+            tsr = evaluate_traditional_stacking(oof_trad, y)
             trait_res['Trad Ensemble'] = {
                 'R2': tsr['R2'], 'Correlation': tsr['Correlation'],
-                'RMSE': 0.0, 'Type': 'Ensemble',
+                'RMSE': 0.0, 'Type': TYPE_ENS,
                 'Meta_weights': tsr['Meta_weights'], 'Base_models': tsr['Base_models']}
             print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
 
@@ -1029,7 +985,7 @@ def main():
         for m in eval_models:
             rs = summ[m]['R2']
             if rs:
-                mtype = all_results[traits_run[0]][m].get('Type', 'DL')
+                mtype = all_results[traits_run[0]][m].get('Type', TYPE_DL)
                 print(f"  {m:<20s} {mtype:<12s} {np.mean(rs):10.4f} {np.mean(summ[m]['Corr']):10.4f} "
                       f"{np.max(rs):10.4f} {np.min(rs):10.4f}")
 
@@ -1085,7 +1041,7 @@ def main():
         ax2.set_xlabel('Mean R² across traits', fontsize=12)
         ax2.set_title('Overall Model Ranking', fontsize=14, fontweight='bold')
         for b, v, m in zip(bars, vals, ns):
-            mtype = all_results[traits_run[0]][m].get('Type', 'DL')
+            mtype = all_results[traits_run[0]][m].get('Type', TYPE_DL)
             label = f'{v:.4f} [{mtype[0]}]'
             ax2.text(b.get_width() + 0.005, b.get_y() + b.get_height()/2,
                      label, va='center', fontsize=7.5, fontweight='bold')
