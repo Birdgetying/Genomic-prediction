@@ -8,3 +8,4 @@
 !requirements.txt
 !rice_models_ensemble.py
 !submit_rice_ensemble.jsub
+!plot_ensemble_comparison.py
