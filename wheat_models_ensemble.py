@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from genomic_nn_models import (FGNEncoder, PreFGN, pretrain_prefgn, pretrain_prefgn_v2)
+from deep_kernel_gp import GenomicEncoder, DeepKernelGP, train_dkgp
 
 import matplotlib
 matplotlib.use('Agg')
@@ -797,6 +798,16 @@ def create_model(name, n_snps, overrides=None):
         return PreFGN(n_snps=n_snps, hidden=o.get('hidden', 64),
                       dropout=o.get('dropout', 0.35),
                       marker_types=o.get('marker_types'))
+    if name == 'DeepKernelGP':
+        encoder = GenomicEncoder(n_snps=n_snps,
+                                 latent_dim=o.get('latent_dim', 24),
+                                 hidden1=o.get('hidden1', 256),
+                                 hidden2=o.get('hidden2', 128),
+                                 dropout=o.get('dropout', 0.3))
+        return DeepKernelGP(encoder,
+                            outputscale=o.get('outputscale', 1.0),
+                            lengthscale=o.get('lengthscale', 1.0),
+                            noise=o.get('noise', 0.1))
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -874,6 +885,30 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             model = FusionNet(n_snps=n_snps, hidden_dim=overrides['hidden_dim'],
                               dropout=overrides['dropout'])
             bs = 64
+        elif model_name == 'DeepKernelGP':
+            overrides = {
+                'latent_dim': trial.suggest_categorical('latent_dim', [16, 24, 32]),
+                'hidden1': trial.suggest_categorical('hidden1', [128, 256]),
+                'hidden2': trial.suggest_categorical('hidden2', [64, 128]),
+                'dropout': trial.suggest_float('dropout', 0.1, 0.4),
+                'lr': trial.suggest_float('lr', 1e-3, 1e-2, log=True),
+                'epochs': trial.suggest_int('epochs', 150, 300),
+                'patience': trial.suggest_int('patience', 10, 25),
+            }
+            encoder = GenomicEncoder(
+                n_snps=n_snps, latent_dim=overrides['latent_dim'],
+                hidden1=overrides['hidden1'], hidden2=overrides['hidden2'],
+                dropout=overrides['dropout'])
+            model = DeepKernelGP(encoder)
+            model = train_dkgp(model, X_tr, y_tr,
+                               epochs=overrides['epochs'],
+                               lr=overrides['lr'],
+                               patience=overrides['patience'],
+                               verbose=False)
+            model.fit(torch.FloatTensor(X_tr), torch.FloatTensor(y_tr))
+            mean, _ = model.predict(torch.FloatTensor(X_val))
+            preds = mean.cpu().numpy()
+            return float(r2_score(y_val, preds))
         else:
             raise ValueError(f"Unknown model for tuning: {model_name}")
 
@@ -962,7 +997,7 @@ def main():
 
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
     dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2',
-                     'FGN v3', 'EFM v3', 'PreFGN']
+                     'FGN v3', 'EFM v3', 'PreFGN', 'DeepKernelGP']
     MARKER_TYPE_MODELS = {'FGN v3', 'PreFGN'}
     dl_ensemble_names = ['FusionNet']
     extra_names = ['ResFGN']
@@ -1098,14 +1133,24 @@ def main():
                     pretrain_prefgn_v2(dl_models[mname], Xtr_s, epochs=50,
                                        lr=1e-3, patience=10)
 
-                bs = 64 if mname == 'FusionNet' else 128
-                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-                wd = tp.get('weight_decay', 1e-3)
-                pat = tp.get('patience', 30)
-                model = train_torch_model(
-                    dl_models[mname], Xtr_s, ytr,
-                    epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                preds = predict_torch_model(model, Xte_s)
+                if mname == 'DeepKernelGP':
+                    model = train_dkgp(dl_models[mname], Xtr_s, ytr,
+                                       epochs=tp.get('epochs', 200),
+                                       lr=tp.get('lr', 5e-3),
+                                       patience=tp.get('patience', 15),
+                                       verbose=False)
+                    model.fit(torch.FloatTensor(Xtr_s), torch.FloatTensor(ytr))
+                    mean, _ = model.predict(torch.FloatTensor(Xte_s))
+                    preds = mean.cpu().numpy()
+                else:
+                    bs = 64 if mname == 'FusionNet' else 128
+                    lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+                    wd = tp.get('weight_decay', 1e-3)
+                    pat = tp.get('patience', 30)
+                    model = train_torch_model(
+                        dl_models[mname], Xtr_s, ytr,
+                        epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+                    preds = predict_torch_model(model, Xte_s)
                 elapsed = time.time() - t0
 
                 results[mname]['preds'].extend(preds.tolist())
@@ -1251,14 +1296,23 @@ def main():
                 pretrain_prefgn_v2(model, X_full_s, epochs=50,
                                    lr=1e-3, patience=10)
 
-            model = train_torch_model(
-                model, X_full_s, y,
-                epochs=300,
-                batch_size=64 if mname == 'FusionNet' else 128,
-                lr=tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3),
-                weight_decay=tp.get('weight_decay', 1e-3),
-                patience=tp.get('patience', 30))
-            torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
+            if mname == 'DeepKernelGP':
+                model = train_dkgp(model, X_full_s, y,
+                                   epochs=tp.get('epochs', 200),
+                                   lr=tp.get('lr', 5e-3),
+                                   patience=tp.get('patience', 15),
+                                   verbose=False)
+                model.fit(torch.FloatTensor(X_full_s), torch.FloatTensor(y))
+                torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
+            else:
+                model = train_torch_model(
+                    model, X_full_s, y,
+                    epochs=300,
+                    batch_size=64 if mname == 'FusionNet' else 128,
+                    lr=tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3),
+                    weight_decay=tp.get('weight_decay', 1e-3),
+                    patience=tp.get('patience', 30))
+                torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             print(f"    [saved] {mname}.pt")
 
         # ResFGN deployment
@@ -1334,6 +1388,7 @@ def main():
             'FGN v2': '#F57C00', 'EFM v2': '#FBC02D', 'MICNN v2': '#E64A19',
             'FGN v3': '#BF360C', 'EFM v3': '#F9A825',
             'PreFGN': '#00BCD4',
+            'DeepKernelGP': '#4CAF50',
             'FusionNet': '#E91E63',
             'Stacking (DL)': '#C62828', 'Stacking (All)': '#B71C1C',
             'Trad Ensemble': '#1565C0',
