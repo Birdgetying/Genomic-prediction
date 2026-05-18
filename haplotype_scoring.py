@@ -24,11 +24,10 @@ import numpy as np
 from scipy.stats import pearsonr
 
 
-# 变异类型功能权重 (与 HaplotypeScorer.FUNCTIONAL_WEIGHTS 对齐)
 VARIANT_TYPE_WEIGHTS = {
-    0: 1.0,   # SNP — 基准权重
-    1: 3.5,   # INDEL — 可能破坏阅读框
-    2: 3.0,   # SV — 结构变异, 影响大
+    0: 1.0,   # SNP
+    1: 3.5,   # INDEL
+    2: 3.0,   # SV
 }
 
 DEFAULT_WINDOW = 50      # LD 剪枝滑动窗口 (标记数)
@@ -70,22 +69,18 @@ def compute_haplotype_scores(X, y, variant_types=None, maf=None):
     """
     p = X.shape[1]
 
-    # 1. 功能权重
     if variant_types is not None:
         func_w = np.array([VARIANT_TYPE_WEIGHTS.get(int(vt), 1.0) for vt in variant_types])
     else:
         func_w = np.ones(p)
 
-    # 2. 稀有度权重: -log10(maf) for rare variants, 下限 1.0 for common
     if maf is None:
         af = X.mean(axis=0) / 2.0
         maf = np.minimum(af, 1.0 - af)
     rarity_w = np.maximum(-np.log10(np.maximum(maf, MIN_MAF)), 1.0)
 
-    # 3. 效应量 (绝对值, 来自快速单变量扫描)
     effects = _compute_univariate_effects(X, y)
 
-    # 综合得分
     scores = func_w * rarity_w * (1.0 + effects)
 
     return scores, {'func': func_w, 'rarity': rarity_w, 'effect': effects}
@@ -108,25 +103,21 @@ def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRE
         keep_idx: 保留的标记索引 (按得分排序)
     """
     p = X.shape[1]
-    # 按得分降序排列 → 高分标记优先保留
     order = np.argsort(-scores)
     kept = []
-    # 跟踪每个已保留标记的位置, 用于快速窗口查询
     kept_positions = []
 
     for idx in order:
-        pos = idx
-        # 检查与窗口内已保留标记的 LD
         redundant = False
         for kp in kept_positions:
-            if abs(pos - kp) <= window:
-                r = pearsonr(X[:, pos], X[:, kp])[0]
+            if abs(idx - kp) <= window:
+                r = pearsonr(X[:, idx], X[:, kp])[0]
                 if r ** 2 > r2_thresh:
                     redundant = True
                     break
         if not redundant:
             kept.append(idx)
-            kept_positions.append(pos)
+            kept_positions.append(idx)
 
     return np.array(kept, dtype=int)
 
@@ -152,60 +143,40 @@ def haplotype_select(X, y, k, variant_types=None, window=DEFAULT_WINDOW,
     scores, _ = compute_haplotype_scores(X, y, variant_types, maf)
     pruned = ld_prune_markers(X, scores, window, r2_thresh)
 
-    # 剪枝后若不足 k 个, 从剩余标记中补足
     if len(pruned) < k:
         remaining = np.setdiff1d(np.argsort(-scores), pruned)
         need = k - len(pruned)
         pruned = np.concatenate([pruned, remaining[:need]])
 
-    # 按得分取 top k
     top_k = pruned[np.argsort(-scores[pruned])[:k]]
     return np.sort(top_k)
 
 
 def hybrid_select(X, y, k, variant_types=None, gwas_frac=0.6,
                   window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
-    """混合筛选: GWAS top (gwas_frac * k) + HaploScore top ((1-gwas_frac) * k)
-
-    GWAS 捕获线性加性信号, HaploScore 捕获功能/稀有度信号。
-    合并后去重, 不足 k 则从各自剩余中补足。
-
-    Args:
-        X: (n, p) 基因型矩阵
-        y: (n,) 表型向量
-        k: 目标标记数
-        variant_types: (p,) 标记类型
-        gwas_frac: GWAS 标记占比 (0.0-1.0)
-
-    Returns:
-        selected: (k,) 选中标记的列索引
-    """
+    """GWAS top (gwas_frac*k) + HaploScore ((1-gwas_frac)*k), deduped."""
     n_gwas = int(k * gwas_frac)
     n_hap = k - n_gwas
 
-    # GWAS 部分 (标准 p-value 筛选)
-    from scipy.stats import pearsonr as pr
-    pvals = np.ones(X.shape[1])
     y_c = y - y.mean()
-    for j in range(X.shape[1]):
-        if X[:, j].std() > 0:
-            r, pv = pr(X[:, j], y_c)
-            pvals[j] = pv
-    gwas_top = np.argsort(pvals)[:n_gwas * 2]  # 取 2× 做缓冲
+    X_c = X - X.mean(axis=0)
+    num = np.dot(y_c, X_c)
+    denom = np.std(y_c) * len(y) * np.sqrt(np.sum(X_c ** 2, axis=0) + 1e-12)
+    gwas_top = np.argsort(np.abs(num / denom))[-n_gwas * 2:]
 
-    # HaploScore 部分
     hap_top = haplotype_select(X, y, n_hap * 2, variant_types, window, r2_thresh)
 
-    # 合并: 先取 GWAS top n_gwas, 再取 HaploScore 中不重复的
-    combined = list(gwas_top[:n_gwas])
+    combined = list(gwas_top[-n_gwas:])
+    combined_set = set(combined)
     for idx in hap_top:
-        if idx not in combined and len(combined) < k:
+        if idx not in combined_set and len(combined) < k:
             combined.append(idx)
+            combined_set.add(idx)
 
-    # 不足则从 GWAS 剩余补
     if len(combined) < k:
         for idx in gwas_top:
-            if idx not in combined and len(combined) < k:
+            if idx not in combined_set and len(combined) < k:
                 combined.append(idx)
+                combined_set.add(idx)
 
     return np.sort(np.array(combined[:k], dtype=int))

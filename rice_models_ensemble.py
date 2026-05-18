@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from genomic_nn_models import (FGNEncoder, PreFGN, pretrain_prefgn, pretrain_prefgn_v2)
 from deep_kernel_gp import GenomicEncoder, DeepKernelGP, train_dkgp
+from haplotype_scoring import haplotype_select, hybrid_select
 
 import matplotlib
 matplotlib.use('Agg')
@@ -51,6 +52,8 @@ RANDOM_SEED = 42
 N_FOLDS = 5
 GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
+MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
+HAPLO_GWAS_FRAC = 0.6     # hybrid 模式下 GWAS 标记占比
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 TYPE_TRAD = 'Traditional'
@@ -870,16 +873,32 @@ def main():
                 Xtr_raw = Xtr_raw[:, maf_idx]
                 Xte_raw = Xte_raw[:, maf_idx]
 
-            gidx = gwas_select(Xtr_raw, ytr, n_snps)
-            Xtr = Xtr_raw[:, gidx]
-            Xte = Xte_raw[:, gidx]
+            # ── 传统模型: GWAS 标记筛选 ──
+            gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr_gwas = Xtr_raw[:, gidx_gwas]
+            Xte_gwas = Xte_raw[:, gidx_gwas]
 
-            sc = StandardScaler()
-            Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
-            Xte_s = sc.transform(Xte).astype(np.float32)
+            sc_gwas = StandardScaler()
+            Xtr_s = sc_gwas.fit_transform(Xtr_gwas).astype(np.float32)
+            Xte_s = sc_gwas.transform(Xte_gwas).astype(np.float32)
 
             G_fold_train = Xtr_s @ Xtr_s.T / n_snps
             G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
+
+            # ── DL 模型: 可配置标记筛选 (单倍型打分 / 混合 / GWAS) ──
+            if MARKER_SELECTOR == 'haplotype':
+                gidx_dl = haplotype_select(Xtr_raw, ytr, n_snps)
+            elif MARKER_SELECTOR == 'hybrid':
+                gidx_dl = hybrid_select(Xtr_raw, ytr, n_snps,
+                                        gwas_frac=HAPLO_GWAS_FRAC)
+            else:
+                gidx_dl = gidx_gwas  # 默认使用 GWAS
+            Xtr_dl = Xtr_raw[:, gidx_dl]
+            Xte_dl = Xte_raw[:, gidx_dl]
+
+            sc_dl = StandardScaler()
+            Xtr_dl_s = sc_dl.fit_transform(Xtr_dl).astype(np.float32)
+            Xte_dl_s = sc_dl.transform(Xte_dl).astype(np.float32)
 
             # ── 传统模型 ──
             trad_configs = [
@@ -921,17 +940,17 @@ def main():
                 tp = tuned_params.get(mname, {})
 
                 if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn_v2(dl_models[mname], Xtr_s, epochs=50,
+                    pretrain_prefgn_v2(dl_models[mname], Xtr_dl_s, epochs=50,
                                        lr=1e-3, patience=10)
 
                 if mname == 'DeepKernelGP':
-                    model = train_dkgp(dl_models[mname], Xtr_s, ytr,
+                    model = train_dkgp(dl_models[mname], Xtr_dl_s, ytr,
                                        epochs=tp.get('epochs', 200),
                                        lr=tp.get('lr', 5e-3),
                                        patience=tp.get('patience', 15),
                                        verbose=False)
-                    model.fit(torch.FloatTensor(Xtr_s), torch.FloatTensor(ytr))
-                    mean, _ = model.predict(torch.FloatTensor(Xte_s))
+                    model.fit(torch.FloatTensor(Xtr_dl_s), torch.FloatTensor(ytr))
+                    mean, _ = model.predict(torch.FloatTensor(Xte_dl_s))
                     preds = mean.cpu().numpy()
                 else:
                     bs = 64 if mname == 'FusionNet' else 128
@@ -939,9 +958,9 @@ def main():
                     wd = tp.get('weight_decay', 1e-3)
                     pat = tp.get('patience', 30)
                     model = train_torch_model(
-                        dl_models[mname], Xtr_s, ytr,
+                        dl_models[mname], Xtr_dl_s, ytr,
                         epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                    preds = predict_torch_model(model, Xte_s)
+                    preds = predict_torch_model(model, Xte_dl_s)
                 elapsed = time.time() - t0
 
                 results[mname]['preds'].extend(preds.tolist())
@@ -956,13 +975,13 @@ def main():
                 dl_models[mname] = create_model(mname, n_snps,
                                                   overrides=tuned_params.get(mname))
 
-            # ── ResFGN: Ridge + FusionNet residual learning ──
+            # ── ResFGN: Ridge + FusionNet residual learning (DL markers) ──
             t0 = time.time()
             ridge, res_model = fit_resfgn_components(
-                Xtr_s, ytr, n_snps, cv=3,
+                Xtr_dl_s, ytr, n_snps, cv=3,
                 fusion_overrides=tuned_params.get('FusionNet'))
-            pred_te_ridge = ridge.predict(Xte_s)
-            res_pred = predict_torch_model(res_model, Xte_s)
+            pred_te_ridge = ridge.predict(Xte_dl_s)
+            res_pred = predict_torch_model(res_model, Xte_dl_s)
             final_pred = pred_te_ridge + res_pred
             elapsed = time.time() - t0
             if fi == 0:
@@ -1037,60 +1056,75 @@ def main():
             shutil.rmtree(deploy_dir)
         deploy_dir.mkdir(parents=True, exist_ok=True)
 
+        # ── 传统模型: GWAS 标记 ──
         maf_full = maf_filter(X_all)
         if len(maf_full) >= n_snps:
             gidx_f = gwas_select(X_all[:, maf_full], y, n_snps)
-            gidx_full = maf_full[gidx_f]
+            gidx_gwas = maf_full[gidx_f]
         else:
-            gidx_full = gwas_select(X_all, y, n_snps)
-        X_full = X_all[:, gidx_full]
-        sc_full = StandardScaler()
-        X_full_s = sc_full.fit_transform(X_full).astype(np.float32)
+            gidx_gwas = gwas_select(X_all, y, n_snps)
+        X_gwas = X_all[:, gidx_gwas]
+        sc_gwas = StandardScaler()
+        X_gwas_s = sc_gwas.fit_transform(X_gwas).astype(np.float32)
+
+        # ── DL 模型: 可配置标记筛选 ──
+        if MARKER_SELECTOR == 'haplotype':
+            gidx_dl = haplotype_select(X_all, y, n_snps)
+        elif MARKER_SELECTOR == 'hybrid':
+            gidx_dl = hybrid_select(X_all, y, n_snps,
+                                    gwas_frac=HAPLO_GWAS_FRAC)
+        else:
+            gidx_dl = gidx_gwas
+        X_dl = X_all[:, gidx_dl]
+        sc_dl = StandardScaler()
+        X_dl_s = sc_dl.fit_transform(X_dl).astype(np.float32)
 
         deployment_meta = {
-            'gwas_indices': gidx_full.tolist(),
+            'gwas_indices': gidx_gwas.tolist(),
+            'dl_indices': gidx_dl.tolist(),
             'n_snps': n_snps,
             'trad_names': trad_names,
             'dl_base_names': dl_base_names,
+            'marker_selector': MARKER_SELECTOR,
         }
 
-        # Traditional models
+        # Traditional models — fit on GWAS markers
         for tname in trad_names:
             tmodel = None
             if tname == 'RRBLUP':
-                tmodel = RRBLUP().fit(X_full_s, y)
+                tmodel = RRBLUP().fit(X_gwas_s, y)
             elif tname == 'GBLUP':
-                G_full = X_full_s @ X_full_s.T / n_snps
+                G_full = X_gwas_s @ X_gwas_s.T / n_snps
                 tmodel = GBLUP().fit(G_full, y)
             elif tname == 'XGBoost':
-                tmodel = XGBoostModel(n_estimators=300).fit(X_full_s, y)
+                tmodel = XGBoostModel(n_estimators=300).fit(X_gwas_s, y)
             elif tname == 'ElasticNet':
-                tmodel = ElasticNetModel().fit(X_full_s, y)
+                tmodel = ElasticNetModel().fit(X_gwas_s, y)
             elif tname == 'GWAS_RRBLUP':
-                tmodel = GWASWeightedRRBLUP().fit(X_full_s, y)
+                tmodel = GWASWeightedRRBLUP().fit(X_gwas_s, y)
             pickle.dump(tmodel, open(deploy_dir / f"{tname}.pkl", 'wb'))
             print(f"    [saved] {tname}.pkl")
 
-        # DL models
+        # DL models — fit on DL markers
         for mname in dl_base_names + ['FusionNet']:
             tp = tuned_params.get(mname, {})
             model = create_model(mname, n_snps, overrides=tp)
 
             if mname == 'PreFGN' and not quick_test:
-                pretrain_prefgn_v2(model, X_full_s, epochs=50,
+                pretrain_prefgn_v2(model, X_dl_s, epochs=50,
                                    lr=1e-3, patience=10)
 
             if mname == 'DeepKernelGP':
-                model = train_dkgp(model, X_full_s, y,
+                model = train_dkgp(model, X_dl_s, y,
                                    epochs=tp.get('epochs', 200),
                                    lr=tp.get('lr', 5e-3),
                                    patience=tp.get('patience', 15),
                                    verbose=False)
-                model.fit(torch.FloatTensor(X_full_s), torch.FloatTensor(y))
+                model.fit(torch.FloatTensor(X_dl_s), torch.FloatTensor(y))
                 torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             else:
                 model = train_torch_model(
-                    model, X_full_s, y,
+                    model, X_dl_s, y,
                     epochs=300,
                     batch_size=64 if mname == 'FusionNet' else 128,
                     lr=tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3),
@@ -1099,9 +1133,9 @@ def main():
                 torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             print(f"    [saved] {mname}.pt")
 
-        # ResFGN deployment
+        # ResFGN deployment (DL markers)
         ridge_full, res_model_full = fit_resfgn_components(
-            X_full_s, y, n_snps, cv=5,
+            X_dl_s, y, n_snps, cv=5,
             fusion_overrides=tuned_params.get('FusionNet'))
         pickle.dump(ridge_full, open(deploy_dir / "ResFGN_ridge.pkl", 'wb'))
         torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fusion.pt")
@@ -1121,9 +1155,10 @@ def main():
         pickle.dump(meta_all, open(deploy_dir / "Stacking_All_meta.pkl", 'wb'))
         deployment_meta['meta_all_coef'] = meta_all.coef_.tolist()
 
-        pickle.dump(sc_full, open(deploy_dir / "scaler.pkl", 'wb'))
+        pickle.dump(sc_gwas, open(deploy_dir / "scaler_gwas.pkl", 'wb'))
+        pickle.dump(sc_dl, open(deploy_dir / "scaler_dl.pkl", 'wb'))
         pickle.dump(deployment_meta, open(deploy_dir / "deployment_meta.pkl", 'wb'))
-        print(f"    [saved] Stacking meta-learners, scaler, deployment_meta")
+        print(f"    [saved] Stacking meta-learners, scalers, deployment_meta")
 
         with open(OUTPUT_DIR / "ensemble_intermediate.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)

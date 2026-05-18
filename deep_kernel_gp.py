@@ -160,6 +160,9 @@ def train_dkgp(model, X_train, y_train, epochs=200, lr=5e-3, patience=15,
         opt, mode='min', factor=0.5, patience=8)
 
     best_state, best_loss, wait = None, float('inf'), 0
+    # Deterministic eval pass for monitoring — only every N epochs to avoid
+    # computing a second Cholesky (O(n³)) every step.
+    eval_every = 50
 
     for epoch in range(epochs):
         model.train()
@@ -175,14 +178,11 @@ def train_dkgp(model, X_train, y_train, epochs=200, lr=5e-3, patience=15,
         torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
         opt.step()
 
-        # eval-mode NLL for monitoring (dropout off, deterministic)
-        model.eval()
-        with torch.no_grad():
-            total_loss = model.marginal_nll(X_t, y_t).item()
-        scheduler.step(total_loss)
+        current_loss = loss.item()
+        scheduler.step(current_loss)
 
-        if total_loss < best_loss:
-            best_loss = total_loss
+        if current_loss < best_loss:
+            best_loss = current_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             wait = 0
         else:
@@ -192,8 +192,11 @@ def train_dkgp(model, X_train, y_train, epochs=200, lr=5e-3, patience=15,
                     print(f"    DKL early stop @ epoch {epoch+1}, NLL={best_loss:.4f}")
                 break
 
-        if verbose and (epoch + 1) % 50 == 0:
-            print(f"    DKL epoch {epoch+1:3d}: NLL={total_loss:.4f}, "
+        if verbose and (epoch + 1) % eval_every == 0:
+            model.eval()
+            with torch.no_grad():
+                eval_nll = model.marginal_nll(X_t, y_t).item()
+            print(f"    DKL epoch {epoch+1:3d}: NLL={eval_nll:.4f}, "
                   f"l={model.log_lengthscale.exp():.3f}, "
                   f"sf={model.log_outputscale.exp():.3f}, "
                   f"sn={model.log_noise.exp():.3f}")
