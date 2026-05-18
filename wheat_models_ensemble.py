@@ -783,7 +783,8 @@ def create_model(name, n_snps, overrides=None):
         return MICNNv2(n_snps=n_snps, hidden=40, dropout=0.35, spp_bins=(1, 2, 4))
     if name == 'FGN v3':
         return FGNv3(n_snps=n_snps, hidden=o.get('hidden', 48),
-                     dropout=o.get('dropout', 0.35))
+                     dropout=o.get('dropout', 0.35),
+                     marker_types=o.get('marker_types'))
     if name == 'EFM v3':
         return EFMv3(n_snps=n_snps, k=o.get('k', 4),
                      hidden=o.get('hidden', 64),
@@ -962,6 +963,7 @@ def main():
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
     dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2',
                      'FGN v3', 'EFM v3', 'PreFGN']
+    MARKER_TYPE_MODELS = {'FGN v3', 'PreFGN'}
     dl_ensemble_names = ['FusionNet']
     extra_names = ['ResFGN']
     dl_names = dl_base_names + dl_ensemble_names
@@ -1008,9 +1010,6 @@ def main():
                 pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
                 print(f"    {tune_name}: val R²={best_r2:.4f}  [{pstr}]")
 
-        # Store variant types for models that use them
-        tuned_params['_vt'] = vt_all
-
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
                    for m in all_names}
@@ -1022,8 +1021,8 @@ def main():
         dl_models = {}
         for mname in dl_names:
             o = {}
-            if mname in ('FGN v3', 'PreFGN'):
-                o['marker_types'] = vt_all  # will be subset per-fold
+            if mname in MARKER_TYPE_MODELS:
+                o['marker_types'] = vt_all
             dl_models[mname] = create_model(mname, n_snps, overrides=o)
 
         for fi, (tr, te) in enumerate(kf.split(X_all)):
@@ -1048,12 +1047,8 @@ def main():
             Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
             Xte_s = sc.transform(Xte).astype(np.float32)
 
-            # Update marker_types for this fold's GWAS selection
-            for mname in ('FGN v3', 'PreFGN'):
-                if hasattr(dl_models[mname], 'encoder') and \
-                   hasattr(dl_models[mname].encoder, '_marker_type_idx'):
-                    dl_models[mname].encoder._marker_type_idx = torch.as_tensor(
-                        vt_fold, dtype=torch.long)
+            for mname in MARKER_TYPE_MODELS:
+                dl_models[mname].encoder.set_marker_types(vt_fold)
 
             # GRM computed on fold-specific markers
             G_fold_train = Xtr_s @ Xtr_s.T / n_snps
@@ -1124,7 +1119,7 @@ def main():
 
                 # Re-create fresh model for next fold with variant types
                 o = tuned_params.get(mname, {}) or {}
-                if mname in ('FGN v3', 'PreFGN'):
+                if mname in MARKER_TYPE_MODELS:
                     o = dict(o, marker_types=vt_fold)
                 dl_models[mname] = create_model(mname, n_snps, overrides=o)
 
@@ -1246,7 +1241,7 @@ def main():
         # DL models
         for mname in dl_base_names + ['FusionNet']:
             tp = tuned_params.get(mname, {}) or {}
-            if mname in ('FGN v3', 'PreFGN'):
+            if mname in MARKER_TYPE_MODELS:
                 tp = dict(tp, marker_types=vt_full)
             model = create_model(mname, n_snps, overrides=tp)
 

@@ -94,7 +94,6 @@ class FGNEncoder(nn.Module):
 
         # 变异类型编码 (SNP/INDEL/SV), None 表示不使用
         if marker_types is not None:
-            # marker_types 可以是 numpy array 或 tensor, 记录每个标记的类型 (0/1/2)
             n_types = int(max(marker_types) + 1) if hasattr(marker_types, '__len__') else 3
             self.type_embed = nn.Parameter(torch.zeros(n_types))
             self.register_buffer('_marker_type_idx',
@@ -102,6 +101,13 @@ class FGNEncoder(nn.Module):
         else:
             self.type_embed = None
             self._marker_type_idx = None
+
+    def set_marker_types(self, marker_types):
+        """更新变异类型索引 (per-fold GWAS 筛选后调用)."""
+        if self.type_embed is None:
+            raise RuntimeError("set_marker_types() called but type_embed is None — "
+                               "construct with marker_types first")
+        self._marker_type_idx = torch.as_tensor(marker_types, dtype=torch.long)
 
     def forward(self, x):
         # 注入变异类型偏置
