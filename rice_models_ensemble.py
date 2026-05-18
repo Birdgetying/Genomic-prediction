@@ -615,8 +615,8 @@ def evaluate_traditional_stacking(oof_trad, y):
 # 模型工厂
 # ============================================================================
 
-def create_model(name, n_snps):
-    """按名称创建单个模型"""
+def create_model(name, n_snps, overrides=None):
+    """按名称创建单个模型。overrides: 可选超参覆盖 dict"""
     if name == 'FGN':
         return FourierGenomicNet(n_snps=n_snps, hidden=64, dropout=0.35)
     if name == 'EFM':
@@ -630,11 +630,16 @@ def create_model(name, n_snps):
     if name == 'MICNN v2':
         return MICNNv2(n_snps=n_snps, hidden=40, dropout=0.35, spp_bins=(1, 2, 4))
     if name == 'FGN v3':
-        return FGNv3(n_snps=n_snps, hidden=48, dropout=0.35)
+        return FGNv3(n_snps=n_snps, hidden=overrides.get('hidden', 48) if overrides else 48,
+                     dropout=overrides.get('dropout', 0.35) if overrides else 0.35)
     if name == 'EFM v3':
-        return EFMv3(n_snps=n_snps, k=4, hidden=64, dropout=0.35)
+        return EFMv3(n_snps=n_snps, k=overrides.get('k', 4) if overrides else 4,
+                     hidden=overrides.get('hidden', 64) if overrides else 64,
+                     dropout=overrides.get('dropout', 0.35) if overrides else 0.35)
     if name == 'FusionNet':
-        return FusionNet(n_snps=n_snps, hidden_dim=48, dropout=0.35)
+        return FusionNet(n_snps=n_snps,
+                         hidden_dim=overrides.get('hidden_dim', 48) if overrides else 48,
+                         dropout=overrides.get('dropout', 0.35) if overrides else 0.35)
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -645,16 +650,92 @@ def create_model(name, n_snps):
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
 
-def fit_resfgn_components(X, y, n_snps, cv=3):
+def fit_resfgn_components(X, y, n_snps, cv=3, fgn_overrides=None):
     """Train RidgeCV + FGNv3 on Ridge residuals. Returns (ridge, fgn_model)."""
+    o = fgn_overrides or {}
     ridge = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=cv)
     ridge.fit(X, y)
     residuals = y - ridge.predict(X)
-    fgn = FGNv3(n_snps=n_snps, hidden=48, dropout=0.35).to(DEVICE)
+    fgn = FGNv3(n_snps=n_snps,
+                hidden=o.get('hidden', 48),
+                dropout=o.get('dropout', 0.35)).to(DEVICE)
     fgn = train_torch_model(
         fgn, X, residuals,
-        epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
+        epochs=300, batch_size=128,
+        lr=o.get('lr', 2e-3),
+        weight_decay=o.get('weight_decay', 1e-3),
+        patience=o.get('patience', 30))
     return ridge, fgn
+
+
+def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
+    """Optuna tune a model on given data. Returns (best_params, best_val_r2)."""
+    try:
+        import optuna
+    except ImportError:
+        print(f"    [SKIP] Optuna not installed, using defaults for {model_name}")
+        return {}, 0.0
+
+    n_val = max(16, int(len(y_train) * 0.2))
+    rng = np.random.RandomState(42)
+    idx = rng.permutation(len(y_train))
+    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+    X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
+    X_val, y_val = X_train[val_idx], y_train[val_idx]
+
+    def objective(trial):
+        if model_name == 'FGN v3':
+            overrides = {
+                'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
+                'dropout': trial.suggest_float('dropout', 0.2, 0.5),
+                'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
+                'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+                'patience': trial.suggest_int('patience', 20, 50),
+            }
+            model = FGNv3(n_snps=n_snps, hidden=overrides['hidden'],
+                          dropout=overrides['dropout'])
+            bs = 128
+        elif model_name == 'EFM v3':
+            overrides = {
+                'k': trial.suggest_categorical('k', [3, 4, 6]),
+                'hidden': trial.suggest_categorical('hidden', [48, 64, 96]),
+                'dropout': trial.suggest_float('dropout', 0.2, 0.5),
+                'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
+                'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+            }
+            model = EFMv3(n_snps=n_snps, k=overrides['k'],
+                          hidden=overrides['hidden'], dropout=overrides['dropout'])
+            bs = 128
+        elif model_name == 'FusionNet':
+            overrides = {
+                'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48, 64]),
+                'dropout': trial.suggest_float('dropout', 0.2, 0.5),
+                'lr': trial.suggest_float('lr', 5e-4, 3e-3, log=True),
+                'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+                'patience': trial.suggest_int('patience', 20, 50),
+            }
+            model = FusionNet(n_snps=n_snps, hidden_dim=overrides['hidden_dim'],
+                              dropout=overrides['dropout'])
+            bs = 64
+        else:
+            return 0.0
+
+        model = train_torch_model(
+            model, X_tr, y_tr,
+            epochs=300, batch_size=bs,
+            lr=overrides.get('lr', 2e-3),
+            weight_decay=overrides.get('weight_decay', 1e-3),
+            patience=overrides.get('patience', 30))
+        preds = predict_torch_model(model, X_val)
+        return float(r2_score(y_val, preds))
+
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    return study.best_params, study.best_value
 
 
 def stacking_evaluate(oof_preds_dict, targets, n_folds=5):
@@ -734,6 +815,26 @@ def main():
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> "
               f"{n_snps} GWAS-selected (per-fold, no leakage)")
 
+        # ── AutoML tuning (full mode only, on held-out data before CV) ──
+        tuned_params = {}
+        if not quick_test:
+            print(f"\n  [AutoML] Tuning hyperparams for new models...")
+            maf_tune = maf_filter(X_all)
+            if len(maf_tune) >= n_snps:
+                gidx_t = gwas_select(X_all[:, maf_tune], y, n_snps)
+                X_tune = X_all[:, maf_tune][:, gidx_t]
+            else:
+                X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
+            sc_tune = StandardScaler()
+            X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
+
+            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet']:
+                best_p, best_r2 = tune_model_hyperparams(
+                    tune_name, X_tune_s, y, n_snps, n_trials=15)
+                tuned_params[tune_name] = best_p
+                pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
+                print(f"    {tune_name}: val R²={best_r2:.4f}  [{pstr}]")
+
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
                    for m in all_names}
@@ -800,11 +901,14 @@ def main():
                     results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
 
                 t0 = time.time()
-                bs = 64 if mname == 'FusionNet' else 128
-                lr = 1e-3 if mname == 'FusionNet' else 2e-3
+                tp = tuned_params.get(mname, {})
+                bs = tp.get('batch_size', 64 if mname == 'FusionNet' else 128)
+                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+                wd = tp.get('weight_decay', 1e-3)
+                pat = tp.get('patience', 30)
                 model = train_torch_model(
                     dl_models[mname], Xtr_s, ytr,
-                    epochs=300, batch_size=bs, lr=lr, weight_decay=1e-3, patience=30)
+                    epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
                 preds = predict_torch_model(model, Xte_s)
                 elapsed = time.time() - t0
 
@@ -817,11 +921,14 @@ def main():
                 if mname in dl_base_names:
                     oof_dl[mname][te] = preds
 
-                dl_models[mname] = create_model(mname, n_snps)
+                dl_models[mname] = create_model(mname, n_snps,
+                                                  overrides=tuned_params.get(mname))
 
             # ── ResFGN: Ridge + FGNv3 residual learning ──
             t0 = time.time()
-            ridge, res_model = fit_resfgn_components(Xtr_s, ytr, n_snps, cv=3)
+            ridge, res_model = fit_resfgn_components(
+                Xtr_s, ytr, n_snps, cv=3,
+                fgn_overrides=tuned_params.get('FGN v3'))
             pred_te_ridge = ridge.predict(Xte_s)
             res_pred = predict_torch_model(res_model, Xte_s)
             final_pred = pred_te_ridge + res_pred
@@ -932,15 +1039,22 @@ def main():
 
         # DL models
         for mname in dl_base_names + ['FusionNet']:
-            model = create_model(mname, n_snps)
+            tp = tuned_params.get(mname, {})
+            model = create_model(mname, n_snps, overrides=tp)
             model = train_torch_model(
                 model, X_full_s, y,
-                epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
+                epochs=300,
+                batch_size=tp.get('batch_size', 64 if mname == 'FusionNet' else 128),
+                lr=tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3),
+                weight_decay=tp.get('weight_decay', 1e-3),
+                patience=tp.get('patience', 30))
             torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             print(f"    [saved] {mname}.pt")
 
         # ResFGN deployment
-        ridge_full, res_model_full = fit_resfgn_components(X_full_s, y, n_snps, cv=5)
+        ridge_full, res_model_full = fit_resfgn_components(
+            X_full_s, y, n_snps, cv=5,
+            fgn_overrides=tuned_params.get('FGN v3'))
         pickle.dump(ridge_full, open(deploy_dir / "ResFGN_ridge.pkl", 'wb'))
         torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fgn.pt")
         print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fgn.pt")
