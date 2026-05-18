@@ -709,7 +709,6 @@ def main():
                 print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
 
             # ── DL 模型 ──
-            fold_preds = {}
             for mi, mname in enumerate(dl_names):
                 if fi == 0:
                     results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
@@ -731,17 +730,8 @@ def main():
 
                 if mname in dl_base_names:
                     oof_dl[mname][te] = preds
-                    fold_preds[mname] = preds
 
                 dl_models[mname] = create_model(mname, n_snps)
-
-            # Weighted average (DL only)
-            w = np.array([max(0.001, r2_score(yte, fold_preds[m])) for m in dl_base_names])
-            w = w / w.sum()
-            wavg = np.zeros(len(yte))
-            for mi, mname in enumerate(dl_base_names):
-                wavg += w[mi] * fold_preds[mname]
-            print(f"    {'WeightedAvg':<16s} R2={r2_score(yte, wavg):+.4f}")
 
         # ── 性状汇总 ──
         print(f"\n  {'-'*70}")
