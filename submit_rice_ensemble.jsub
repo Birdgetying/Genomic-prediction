@@ -58,6 +58,7 @@ done
 
 # 完整实验 (--full 覆盖 QUICK_TEST)
 echo ""
+mkdir -p logs
 echo "Starting ensemble experiment (full mode)..."
 python -u rice_models_ensemble.py --full 2>&1 | tee "logs/rice_ensemble_$(date +%Y%m%d_%H%M%S).log"
 EXIT_CODE=${PIPESTATUS[0]}

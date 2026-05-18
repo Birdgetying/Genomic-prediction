@@ -70,6 +70,7 @@ done
 
 # 完整实验
 echo ""
+mkdir -p logs
 echo "Starting wheat ensemble experiment (full mode)..."
 python -u wheat_models_ensemble.py --full 2>&1 | tee "logs/wheat_ensemble_$(date +%Y%m%d_%H%M%S).log"
 EXIT_CODE=${PIPESTATUS[0]}

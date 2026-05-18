@@ -15,7 +15,7 @@ Rice Genomic Prediction — FGN + EFM + MICNN Ensemble
 对照: 保留 FGN/EFM/MICNN 原版作为基线
 """
 
-import json, time, pickle
+import json, time, pickle, shutil
 import numpy as np
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
@@ -988,6 +988,8 @@ def main():
         # ── 最终部署: 全量数据重训 + 保存模型 ──
         print(f"\n  Deploying models on full dataset ({len(y)} samples) ...")
         deploy_dir = OUTPUT_DIR / "deployed_models" / trait
+        if deploy_dir.exists():
+            shutil.rmtree(deploy_dir)
         deploy_dir.mkdir(parents=True, exist_ok=True)
 
         maf_full = maf_filter(X_all)
