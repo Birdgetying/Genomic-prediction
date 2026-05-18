@@ -34,10 +34,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from genomic_nn_models import (FGNEncoder, PreFGN, pretrain_prefgn, pretrain_prefgn_v2)
 from deep_kernel_gp import GenomicEncoder, DeepKernelGP, train_dkgp
 from haplotype_scoring import haplotype_select, hybrid_select
+from plot_wheat_results import generate_visualization
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
 import warnings
@@ -64,7 +62,7 @@ N_FOLDS = 5
 GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
 MAX_VARIANTS_PER_TYPE = 15000  # 每种变异类型最多加载标记数
-MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
+MARKER_SELECTOR = 'hybrid'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
 HAPLO_GWAS_FRAC = 0.6     # hybrid 模式下 GWAS 标记占比
 
 # GPU
@@ -1026,7 +1024,7 @@ def main():
 
         n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> "
-              f"{n_snps} GWAS-selected (per-fold, no leakage)")
+              f"{n_snps} {MARKER_SELECTOR}-selected (per-fold, no leakage)")
 
         # ── AutoML tuning (full mode only, on held-out data before CV) ──
         tuned_params = {}
@@ -1379,7 +1377,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     # 总结 & 可视化
     # ══════════════════════════════════════════════════════════════════════
-    if not QUICK_TEST and len(traits_run) > 1:
+    if not QUICK_TEST:
         print(f"\n{'='*80}")
         print("OVERALL SUMMARY")
         print(f"{'='*80}")
@@ -1410,63 +1408,12 @@ def main():
             print(f"    {i:2d}. {m:<22s} [{mtype}]  {r:.4f}{marker}")
 
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        with open(OUTPUT_DIR / f"ensemble_final_{ts}.json", 'w') as f:
+        final_json = OUTPUT_DIR / f"ensemble_final_{ts}.json"
+        with open(final_json, 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
 
-        # ── 可视化 ──
-        # 颜色方案: 传统=蓝色系, DL=暖色系, Ensemble=红/粉
-        model_colors = {
-            'RRBLUP': '#90CAF9', 'GBLUP': '#64B5F6', 'XGBoost': '#42A5F5',
-            'ElasticNet': '#2196F3', 'GWAS_RRBLUP': '#1E88E5',
-            'FGN': '#FFB74D', 'EFM': '#FFD54F', 'MICNN': '#FF8A65',
-            'FGN v2': '#F57C00', 'EFM v2': '#FBC02D', 'MICNN v2': '#E64A19',
-            'FGN v3': '#BF360C', 'EFM v3': '#F9A825',
-            'PreFGN': '#00BCD4',
-            'DeepKernelGP': '#4CAF50',
-            'FusionNet': '#E91E63',
-            'Stacking (DL)': '#C62828', 'Stacking (All)': '#B71C1C',
-            'Trad Ensemble': '#1565C0',
-            'ResFGN': '#2E7D32',
-        }
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 14))
-
-        # 子图1: 各性状 R² 柱状图
-        x = np.arange(len(traits_run))
-        n_models = len(eval_models)
-        w = 0.8 / n_models
-        for i, m in enumerate(eval_models):
-            rs = [all_results[t][m]['R2'] for t in traits_run if m in all_results[t]]
-            offset = (i - n_models/2 + 0.5) * w
-            ax1.bar(x + offset, rs, w, label=m, color=model_colors.get(m, '#999'),
-                    alpha=0.88, edgecolor='white', linewidth=0.3)
-        ax1.set_ylabel('R²', fontsize=12)
-        ax1.set_title('Wheat Genomic Prediction — All Models Comparison (5-fold CV R²)',
-                      fontsize=14, fontweight='bold')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels([t[:22] for t in traits_run], rotation=45, ha='right', fontsize=8)
-        ax1.legend(ncol=5, fontsize=6.5, loc='lower left')
-        ax1.axhline(0, c='k', lw=0.5)
-        ax1.grid(axis='y', alpha=0.25)
-
-        # 子图2: 总体排名
-        ns = [m for m, _ in ranked]
-        vals = [np.mean(summ[m]['R2']) for m in ns]
-        bar_colors = [model_colors.get(m, '#999') for m in ns]
-        bars = ax2.barh(ns, vals, color=bar_colors, alpha=0.88, edgecolor='white', linewidth=0.3)
-        ax2.set_xlabel('Mean R² across traits', fontsize=12)
-        ax2.set_title('Overall Model Ranking', fontsize=14, fontweight='bold')
-        for b, v, m in zip(bars, vals, ns):
-            mtype = all_results[traits_run[0]][m].get('Type', TYPE_DL)
-            label = f'{v:.4f} [{mtype[0]}]'
-            ax2.text(b.get_width() + 0.005, b.get_y() + b.get_height()/2,
-                     label, va='center', fontsize=7.5, fontweight='bold')
-        ax2.grid(axis='x', alpha=0.25)
-        ax2.invert_yaxis()
-
-        plt.tight_layout()
-        plt.savefig(OUTPUT_DIR / f"ensemble_comparison_{ts}.png", dpi=180, bbox_inches='tight')
-        plt.close()
+        # ── 可视化 (委托给 plot_wheat_results) ──
+        generate_visualization(final_json)
 
         print(f"\nResults saved to: {OUTPUT_DIR}")
         print(f"Total time: {(time.time()-total_t0)/60:.1f} min")

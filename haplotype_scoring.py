@@ -21,7 +21,6 @@ LD 剪枝: 滑动窗口内保留得分最高的标记, 窗口大小由 r² 阈�
 """
 
 import numpy as np
-from scipy.stats import pearsonr
 
 
 VARIANT_TYPE_WEIGHTS = {
@@ -87,32 +86,23 @@ def compute_haplotype_scores(X, y, variant_types=None, maf=None):
 
 
 def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
-    """LD 剪枝: 滑动窗口内保留得分最高的标记
+    """LD 剪枝: 滑动窗口内保留得分最高的标记"""
+    n, p = X.shape
+    # Pre-center + normalize columns for fast r = dot(x_j, x_k)
+    X_c = X - X.mean(axis=0, keepdims=True)
+    X_n = X_c / (np.linalg.norm(X_c, axis=0, keepdims=True) + 1e-12)
 
-    遍历标记, 在窗口内检查与已保留标记的 r²:
-    - 若 r² > r2_thresh → 跳过 (该 LD block 已被更高分标记代表)
-    - 否则 → 保留
-
-    Args:
-        X: (n, p) 基因型矩阵
-        scores: (p,) 每个标记的得分
-        window: 滑动窗口大小 (标记数)
-        r2_thresh: 剔除阈值
-
-    Returns:
-        keep_idx: 保留的标记索引 (按得分排序)
-    """
-    p = X.shape[1]
     order = np.argsort(-scores)
     kept = []
     kept_positions = []
 
     for idx in order:
         redundant = False
+        xj = X_n[:, idx]
         for kp in kept_positions:
             if abs(idx - kp) <= window:
-                r = pearsonr(X[:, idx], X[:, kp])[0]
-                if r ** 2 > r2_thresh:
+                r = np.dot(xj, X_n[:, kp])
+                if r * r > r2_thresh:
                     redundant = True
                     break
         if not redundant:
@@ -124,24 +114,20 @@ def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRE
 
 def haplotype_select(X, y, k, variant_types=None, window=DEFAULT_WINDOW,
                      r2_thresh=DEFAULT_R2_THRESH):
-    """单倍型启发标记筛选: 打分 → LD 剪枝 → 取 top k
-
-    Args:
-        X: (n, p) 基因型矩阵
-        y: (n,) 表型向量
-        k: 保留的标记数
-        variant_types: (p,) 标记类型, None 则全为 SNP
-        window: LD 剪枝窗口
-        r2_thresh: LD 剪枝 r² 阈值
-
-    Returns:
-        selected: (k,) 选中标记的列索引
-    """
+    """单倍型启发标记筛选: 打分 → 预选候选集 → LD 剪枝 → 取 top k"""
     af = X.mean(axis=0) / 2.0
     maf = np.minimum(af, 1.0 - af)
 
     scores, _ = compute_haplotype_scores(X, y, variant_types, maf)
-    pruned = ld_prune_markers(X, scores, window, r2_thresh)
+
+    # Pre-select top candidates to keep LD pruning feasible (original p can be 100K+)
+    n_candidates = min(3 * k, X.shape[1])
+    cand_idx = np.argsort(-scores)[:n_candidates]
+    X_cand = X[:, cand_idx]
+    scores_cand = scores[cand_idx]
+
+    pruned_sub = ld_prune_markers(X_cand, scores_cand, window, r2_thresh)
+    pruned = cand_idx[pruned_sub]
 
     if len(pruned) < k:
         remaining = np.setdiff1d(np.argsort(-scores), pruned)

@@ -52,7 +52,7 @@ RANDOM_SEED = 42
 N_FOLDS = 5
 GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
-MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
+MARKER_SELECTOR = 'haplotype'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
 HAPLO_GWAS_FRAC = 0.6     # hybrid 模式下 GWAS 标记占比
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -833,7 +833,7 @@ def main():
 
         n_snps = min(GWAS_TOP_K, X_all.shape[1] - 50)
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> "
-              f"{n_snps} GWAS-selected (per-fold, no leakage)")
+              f"{n_snps} {MARKER_SELECTOR}-selected (per-fold, no leakage)")
 
         # ── AutoML tuning (full mode only, on held-out data before CV) ──
         tuned_params = {}
