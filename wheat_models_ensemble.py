@@ -70,6 +70,7 @@ QUICK_TEST = True  # 命令行 --full 覆盖
 TYPE_TRAD = 'Traditional'
 TYPE_DL = 'DL'
 TYPE_ENS = 'Ensemble'
+TYPE_HYBRID = 'Hybrid'
 
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
@@ -810,6 +811,19 @@ def create_model(name, n_snps):
 
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
+
+def fit_resfgn_components(X, y, n_snps, cv=3):
+    """Train RidgeCV + FGNv3 on Ridge residuals. Returns (ridge, fgn_model)."""
+    ridge = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=cv)
+    ridge.fit(X, y)
+    residuals = y - ridge.predict(X)
+    fgn = FGNv3(n_snps=n_snps, hidden=48, dropout=0.35).to(DEVICE)
+    fgn = train_torch_model(
+        fgn, X, residuals,
+        epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
+    return ridge, fgn
+
+
 def stacking_evaluate(oof_preds_dict, targets, n_folds=5):
     """Stacking: 各模型OOF预测作为元特征, RidgeCV融合"""
     base_names = list(oof_preds_dict.keys())
@@ -991,28 +1005,20 @@ def main():
 
                 dl_models[mname] = create_model(mname, n_snps)
 
-            # ── ResFGN: Ridge 捕获加性主效应, FGN v3 学残差 ──
-            if 'ResFGN' in extra_names:
-                t0 = time.time()
-                ridge = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=3)
-                ridge.fit(Xtr_s, ytr)
-                pred_tr_ridge = ridge.predict(Xtr_s)
-                residuals = ytr - pred_tr_ridge
-                res_model = FGNv3(n_snps=n_snps, hidden=48, dropout=0.35).to(DEVICE)
-                res_model = train_torch_model(
-                    res_model, Xtr_s, residuals,
-                    epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
-                res_pred = predict_torch_model(res_model, Xte_s)
-                pred_te_ridge = ridge.predict(Xte_s)
-                final_pred = pred_te_ridge + res_pred
-                elapsed = time.time() - t0
-                if fi == 0:
-                    results['ResFGN']['params'] = (n_snps + 1 +
-                        sum(p.numel() for p in res_model.parameters()))
-                results['ResFGN']['preds'].extend(final_pred.tolist())
-                results['ResFGN']['targets'].extend(yte.tolist())
-                results['ResFGN']['time'] += elapsed
-                print(f"    {'ResFGN':<16s} R2={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
+            # ── ResFGN: Ridge + FGNv3 residual learning ──
+            t0 = time.time()
+            ridge, res_model = fit_resfgn_components(Xtr_s, ytr, n_snps, cv=3)
+            pred_te_ridge = ridge.predict(Xte_s)
+            res_pred = predict_torch_model(res_model, Xte_s)
+            final_pred = pred_te_ridge + res_pred
+            elapsed = time.time() - t0
+            if fi == 0:
+                results['ResFGN']['params'] = (n_snps + 1 +
+                    sum(p.numel() for p in res_model.parameters()))
+            results['ResFGN']['preds'].extend(final_pred.tolist())
+            results['ResFGN']['targets'].extend(yte.tolist())
+            results['ResFGN']['time'] += elapsed
+            print(f"    {'ResFGN':<16s} R2={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
 
         # ── 性状汇总 ──
         print(f"\n  {'-'*70}")
@@ -1030,7 +1036,7 @@ def main():
             if mname in trad_names:
                 tag, mtype = " [Trad]", TYPE_TRAD
             elif mname == 'ResFGN':
-                tag, mtype = " [Hybrid]", 'Hybrid'
+                tag, mtype = " [Hybrid]", TYPE_HYBRID
             else:
                 tag, mtype = " [DL]", TYPE_DL
             trait_res[mname] = {
@@ -1119,19 +1125,11 @@ def main():
             torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             print(f"    [saved] {mname}.pt")
 
-        # ResFGN deployment: Ridge + FGNv3 on residuals
-        if 'ResFGN' in extra_names:
-            ridge_full = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
-            ridge_full.fit(X_full_s, y)
-            pred_full = ridge_full.predict(X_full_s)
-            residuals_full = y - pred_full
-            res_model_full = FGNv3(n_snps=n_snps, hidden=48, dropout=0.35).to(DEVICE)
-            res_model_full = train_torch_model(
-                res_model_full, X_full_s, residuals_full,
-                epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
-            pickle.dump(ridge_full, open(deploy_dir / "ResFGN_ridge.pkl", 'wb'))
-            torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fgn.pt")
-            print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fgn.pt")
+        # ResFGN deployment
+        ridge_full, res_model_full = fit_resfgn_components(X_full_s, y, n_snps, cv=5)
+        pickle.dump(ridge_full, open(deploy_dir / "ResFGN_ridge.pkl", 'wb'))
+        torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fgn.pt")
+        print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fgn.pt")
 
         # Stacking meta-learners
         X_meta_dl = np.column_stack([oof_dl[m] for m in dl_base_names])
