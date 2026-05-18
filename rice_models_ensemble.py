@@ -20,8 +20,9 @@ import numpy as np
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import RidgeCV
+from sklearn.linear_model import RidgeCV, ElasticNetCV
 from scipy.stats import pearsonr
+import xgboost as xgb
 
 import torch
 import torch.nn as nn
@@ -50,6 +51,10 @@ GWAS_TOP_K = 3000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+TYPE_TRAD = 'Traditional'
+TYPE_DL = 'DL'
+TYPE_ENS = 'Ensemble'
+
 # True=仅1个性状x2折本地测试, False=完整实验
 # 命令行: python rice_models_ensemble.py --full  覆盖为完整模式
 QUICK_TEST = True
@@ -69,17 +74,23 @@ TRAITS = [
 # 训练工具
 # ============================================================================
 
-def train_torch_model(model, X_train, y_train, X_val, y_val,
+def train_torch_model(model, X_train, y_train,
                       epochs=300, batch_size=128, lr=1e-3, weight_decay=1e-4,
-                      patience=30):
+                      patience=30, val_ratio=0.15):
     model = model.to(DEVICE)
-    Xt = torch.FloatTensor(X_train).to(DEVICE)
-    yt = torch.FloatTensor(y_train).to(DEVICE)
-    Xv = torch.FloatTensor(X_val).to(DEVICE)
-    yv = torch.FloatTensor(y_val).to(DEVICE)
+    n_total = len(X_train)
+    n_val = max(1, int(n_total * val_ratio))
+    rng = np.random.RandomState(RANDOM_SEED)
+    idx = rng.permutation(n_total)
+    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+
+    Xt = torch.FloatTensor(X_train[tr_idx]).to(DEVICE)
+    yt = torch.FloatTensor(y_train[tr_idx]).to(DEVICE)
+    Xv = torch.FloatTensor(X_train[val_idx]).to(DEVICE)
+    yv = torch.FloatTensor(y_train[val_idx]).to(DEVICE)
 
     dl = DataLoader(TensorDataset(Xt, yt),
-                    batch_size=min(batch_size, len(X_train)), shuffle=True)
+                    batch_size=min(batch_size, len(tr_idx)), shuffle=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=15)
@@ -429,6 +440,111 @@ def maf_filter(X, threshold=MAF_THRESHOLD):
 
 
 # ============================================================================
+# 传统模型 (RRBLUP, GBLUP, XGBoost, ElasticNet, GWAS_RRBLUP)
+# ============================================================================
+
+class RRBLUP:
+    def __init__(self):
+        self.model = RidgeCV(alphas=np.logspace(-3, 3, 30))
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class GBLUP:
+    def __init__(self):
+        self.model = RidgeCV(alphas=np.logspace(-3, 3, 20))
+
+    def fit(self, G_train, y_train):
+        self.model.fit(G_train, y_train)
+        return self
+
+    def predict(self, G_test_train):
+        return self.model.predict(G_test_train)
+
+
+class XGBoostModel:
+    def __init__(self, n_estimators=500, max_depth=6, lr=0.05):
+        self.params = {
+            'n_estimators': n_estimators, 'max_depth': max_depth,
+            'learning_rate': lr, 'subsample': 0.8, 'colsample_bytree': 0.8,
+            'reg_alpha': 0.1, 'reg_lambda': 1.0,
+            'random_state': RANDOM_SEED, 'n_jobs': 8, 'verbosity': 0
+        }
+
+    def fit(self, X, y):
+        self.model = xgb.XGBRegressor(**self.params)
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class ElasticNetModel:
+    def __init__(self):
+        self.model = ElasticNetCV(
+            l1_ratio=[.1, .5, .7, .9, .95, 1],
+            alphas=np.logspace(-4, 2, 20),
+            cv=3, random_state=RANDOM_SEED, max_iter=5000, n_jobs=8
+        )
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+
+class GWASWeightedRRBLUP:
+    def __init__(self):
+        self.weights = None
+        self.model = RidgeCV(alphas=np.logspace(-3, 3, 30))
+
+    def fit(self, X, y):
+        y_c = y - y.mean()
+        X_c = X - X.mean(axis=0)
+        denom = np.std(y_c) * len(y) * np.sqrt(np.sum(X_c ** 2, axis=0) + 1e-12)
+        self.weights = np.abs(np.dot(y_c, X_c) / denom)
+        self.weights = self.weights / self.weights.mean()
+        X_weighted = X * self.weights[None, :]
+        self.model.fit(X_weighted, y)
+        return self
+
+    def predict(self, X):
+        X_weighted = X * self.weights[None, :]
+        return self.model.predict(X_weighted)
+
+
+def evaluate_traditional_stacking(oof_trad, y):
+    trad_names = list(oof_trad.keys())
+    X_meta = np.column_stack([oof_trad[m] for m in trad_names])
+
+    meta = RidgeCV(alphas=np.logspace(-3, 3, 20), fit_intercept=True, cv=5)
+    meta.fit(X_meta, y)
+
+    kf = KFold(n_splits=min(5, len(trad_names)), shuffle=True, random_state=RANDOM_SEED)
+    sp = np.zeros(len(y))
+    for tr, te in kf.split(X_meta):
+        m = RidgeCV(alphas=np.logspace(-3, 3, 20), fit_intercept=True, cv=3)
+        m.fit(X_meta[tr], y[tr])
+        sp[te] = m.predict(X_meta[te])
+
+    return {
+        'R2': float(r2_score(y, sp)),
+        'Correlation': float(pearsonr(y, sp)[0]),
+        'Meta_weights': meta.coef_.tolist(),
+        'Meta_intercept': float(meta.intercept_),
+        'Base_models': trad_names
+    }
+
+
+# ============================================================================
 # 模型工厂
 # ============================================================================
 
@@ -504,9 +620,10 @@ def main():
         trait_data = json.load(f)
     print(f"  Genotype: {G.shape}")
 
-    base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2']
-    ensemble_names = ['FusionNet']
-    all_names = base_names + ensemble_names
+    trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
+    dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2']
+    dl_names = dl_base_names + ['FusionNet']
+    all_names = trad_names + dl_names
 
     traits_run = TRAITS[:1] if quick_test else TRAITS
     folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
@@ -534,10 +651,10 @@ def main():
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
                    for m in all_names}
-        oof = {m: np.zeros(len(y)) for m in base_names}
+        oof_trad = {m: np.zeros(len(y)) for m in trad_names}
+        oof_dl = {m: np.zeros(len(y)) for m in dl_base_names}
 
-        # models are re-created per fold with same n_snps (constant input dim)
-        models = {m: create_model(m, n_snps) for m in all_names}
+        dl_models = {m: create_model(m, n_snps) for m in dl_names}
 
         for fi, (tr, te) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fi+1}/{folds_run} ---")
@@ -557,17 +674,52 @@ def main():
             Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
             Xte_s = sc.transform(Xte).astype(np.float32)
 
-            fold_preds = {}
+            G_fold_train = Xtr_s @ Xtr_s.T / n_snps
+            G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
 
-            for mi, mname in enumerate(all_names):
+            # ── 传统模型 ──
+            trad_configs = [
+                ('RRBLUP', lambda: RRBLUP(),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), n_snps + 1),
+                ('GBLUP', lambda: GBLUP(),
+                 lambda m, _x, yt: m.fit(G_fold_train, yt),
+                 lambda m, _x: m.predict(G_fold_te_tr), len(tr) + 1),
+                ('XGBoost', lambda: XGBoostModel(n_estimators=300),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), 300 * 6 * 2),
+                ('ElasticNet', lambda: ElasticNetModel(),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), n_snps + 1),
+                ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(),
+                 lambda m, Xs, yt: m.fit(Xs, yt),
+                 lambda m, Xs: m.predict(Xs), n_snps * 2 + 1),
+            ]
+            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
+                t0 = time.time()
+                tmodel = build_fn()
+                fit_fn(tmodel, Xtr_s, ytr)
+                preds = pred_fn(tmodel, Xte_s)
+                results[tname]['preds'].extend(preds.tolist())
+                results[tname]['targets'].extend(yte.tolist())
+                results[tname]['time'] += time.time() - t0
                 if fi == 0:
-                    results[mname]['params'] = sum(p.numel() for p in models[mname].parameters())
+                    results[tname]['params'] = param_count
+                oof_trad[tname][te] = preds
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
+
+            # ── DL 模型 ──
+            fold_preds = {}
+            for mi, mname in enumerate(dl_names):
+                if fi == 0:
+                    results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
 
                 t0 = time.time()
                 bs = 64 if mname == 'FusionNet' else 128
+                lr = 1e-3 if mname == 'FusionNet' else 2e-3
                 model = train_torch_model(
-                    models[mname], Xtr_s, ytr, Xte_s, yte,
-                    epochs=300, batch_size=bs, lr=2e-3, weight_decay=1e-3, patience=30)
+                    dl_models[mname], Xtr_s, ytr,
+                    epochs=300, batch_size=bs, lr=lr, weight_decay=1e-3, patience=30)
                 preds = predict_torch_model(model, Xte_s)
                 elapsed = time.time() - t0
 
@@ -577,25 +729,25 @@ def main():
                 fold_r2 = r2_score(yte, preds)
                 print(f"    {mname:<16s} R2={fold_r2:+.4f}  ({elapsed:.1f}s)")
 
-                if mname in base_names:
-                    oof[mname][te] = preds
+                if mname in dl_base_names:
+                    oof_dl[mname][te] = preds
                     fold_preds[mname] = preds
 
-                models[mname] = create_model(mname, n_snps)
+                dl_models[mname] = create_model(mname, n_snps)
 
-            # Weighted average
-            w = np.array([max(0.001, r2_score(yte, fold_preds[m])) for m in base_names])
+            # Weighted average (DL only)
+            w = np.array([max(0.001, r2_score(yte, fold_preds[m])) for m in dl_base_names])
             w = w / w.sum()
             wavg = np.zeros(len(yte))
-            for mi, mname in enumerate(base_names):
+            for mi, mname in enumerate(dl_base_names):
                 wavg += w[mi] * fold_preds[mname]
             print(f"    {'WeightedAvg':<16s} R2={r2_score(yte, wavg):+.4f}")
 
         # ── 性状汇总 ──
-        print(f"\n  {'-'*65}")
-        print(f"  {trait} Final Results:")
-        print(f"  {'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Params':>8s} {'Time':>7s}")
-        print(f"  {'-'*65}")
+        print(f"\n  {'-'*70}")
+        print(f"  {trait} Final Results (5-fold CV):")
+        print(f"  {'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}")
+        print(f"  {'-'*70}")
 
         trait_res = {}
         for mname in all_names:
@@ -604,23 +756,42 @@ def main():
             r2_v = float(r2_score(t, p))
             corr_v = float(pearsonr(t, p)[0])
             rmse_v = float(np.sqrt(np.mean((p-t)**2)))
+            tag = " [Trad]" if mname in trad_names else " [DL]"
             trait_res[mname] = {
                 'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                'Params': results[mname]['params'],
+                'Type': TYPE_TRAD if mname in trad_names else TYPE_DL,
                 'Time': results[mname]['time']/folds_run}
-            print(f"  {mname:<16s} {r2_v:8.4f} {corr_v:8.4f} {rmse_v:8.4f} "
-                  f"{results[mname]['params']:8,} {results[mname]['time']/folds_run:7.1f}s")
+            print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} {rmse_v:8.4f} "
+                  f"{results[mname]['time']/folds_run:7.1f}s")
 
-        # Stacking
+        # ── 集成 ──
         if folds_run >= 3:
-            sr = stacking_evaluate(oof, y, n_folds=min(5, folds_run))
-            trait_res['Stacking'] = {
-                'R2': sr['R2'], 'Correlation': sr['Correlation'],
-                'RMSE': 0.0, 'Params': 0, 'Time': 0.0,
-                'Meta_weights': sr['Meta_weights'], 'Base_models': sr['Base_models']}
-            print(f"  {'Stacking':<16s} {sr['R2']:8.4f} {sr['Correlation']:8.4f}")
-            weights_str = dict(zip(sr['Base_models'], [f'{w:.3f}' for w in sr['Meta_weights']]))
-            print(f"    weights: {weights_str}")
+            # Stacking (DL): 仅 DL 6 基础模型
+            sr_dl = stacking_evaluate(oof_dl, y, n_folds=min(5, folds_run))
+            trait_res['Stacking (DL)'] = {
+                'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
+                'RMSE': 0.0, 'Type': TYPE_ENS,
+                'Meta_weights': sr_dl['Meta_weights'], 'Base_models': sr_dl['Base_models']}
+            print(f"  {'Stacking (DL)':<24s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f}")
+
+            # Stacking (All): 传统 5 + DL 6 = 11 基础模型
+            oof_all = {**oof_trad, **oof_dl}
+            sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
+            trait_res['Stacking (All)'] = {
+                'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
+                'RMSE': 0.0, 'Type': TYPE_ENS,
+                'Meta_weights': sr_all['Meta_weights'], 'Base_models': sr_all['Base_models']}
+            print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
+            weights_str = dict(zip(sr_all['Base_models'], [f'{w:.3f}' for w in sr_all['Meta_weights']]))
+            print(f"    All weights: {weights_str}")
+
+            # Trad Ensemble: 仅传统 5 模型 Stacking
+            tsr = evaluate_traditional_stacking(oof_trad, y)
+            trait_res['Trad Ensemble'] = {
+                'R2': tsr['R2'], 'Correlation': tsr['Correlation'],
+                'RMSE': 0.0, 'Type': TYPE_ENS,
+                'Meta_weights': tsr['Meta_weights'], 'Base_models': tsr['Base_models']}
+            print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
 
         all_results[trait] = trait_res
 
@@ -642,27 +813,53 @@ def main():
         deployment_meta = {
             'gwas_indices': gidx_full.tolist(),
             'n_snps': n_snps,
-            'base_names': base_names,
+            'trad_names': trad_names,
+            'dl_base_names': dl_base_names,
         }
 
-        for mname in base_names + ['FusionNet']:
+        # Traditional models
+        for tname in trad_names:
+            tmodel = None
+            if tname == 'RRBLUP':
+                tmodel = RRBLUP().fit(X_full_s, y)
+            elif tname == 'GBLUP':
+                G_full = X_full_s @ X_full_s.T / n_snps
+                tmodel = GBLUP().fit(G_full, y)
+            elif tname == 'XGBoost':
+                tmodel = XGBoostModel(n_estimators=300).fit(X_full_s, y)
+            elif tname == 'ElasticNet':
+                tmodel = ElasticNetModel().fit(X_full_s, y)
+            elif tname == 'GWAS_RRBLUP':
+                tmodel = GWASWeightedRRBLUP().fit(X_full_s, y)
+            pickle.dump(tmodel, open(deploy_dir / f"{tname}.pkl", 'wb'))
+            print(f"    [saved] {tname}.pkl")
+
+        # DL models
+        for mname in dl_base_names + ['FusionNet']:
             model = create_model(mname, n_snps)
             model = train_torch_model(
-                model, X_full_s, y, X_full_s, y,
+                model, X_full_s, y,
                 epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
             torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             print(f"    [saved] {mname}.pt")
 
-        # Stacking meta-learner on full OOF
-        X_meta = np.column_stack([oof[m] for m in base_names])
-        meta_learner = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
-        meta_learner.fit(X_meta, y)
-        pickle.dump(meta_learner, open(deploy_dir / "Stacking_meta.pkl", 'wb'))
-        deployment_meta['meta_coef'] = meta_learner.coef_.tolist()
-        deployment_meta['meta_intercept'] = float(meta_learner.intercept_)
+        # Stacking meta-learners
+        X_meta_dl = np.column_stack([oof_dl[m] for m in dl_base_names])
+        meta_dl = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+        meta_dl.fit(X_meta_dl, y)
+        pickle.dump(meta_dl, open(deploy_dir / "Stacking_DL_meta.pkl", 'wb'))
+        deployment_meta['meta_dl_coef'] = meta_dl.coef_.tolist()
+
+        X_meta_all = np.column_stack([oof_trad[m] for m in trad_names]
+                                     + [oof_dl[m] for m in dl_base_names])
+        meta_all = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+        meta_all.fit(X_meta_all, y)
+        pickle.dump(meta_all, open(deploy_dir / "Stacking_All_meta.pkl", 'wb'))
+        deployment_meta['meta_all_coef'] = meta_all.coef_.tolist()
+
         pickle.dump(sc_full, open(deploy_dir / "scaler.pkl", 'wb'))
         pickle.dump(deployment_meta, open(deploy_dir / "deployment_meta.pkl", 'wb'))
-        print(f"    [saved] Stacking_meta.pkl, scaler.pkl, deployment_meta.pkl")
+        print(f"    [saved] Stacking meta-learners, scaler, deployment_meta")
 
         with open(OUTPUT_DIR / "ensemble_intermediate.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
@@ -681,42 +878,44 @@ def main():
                     summ[m]['R2'].append(all_results[t][m]['R2'])
                     summ[m]['Corr'].append(all_results[t][m].get('Correlation', 0))
 
-        print(f"\n  {'Model':<16s} {'Mean R2':>10s} {'Mean Corr':>10s} {'Best':>10s} {'Worst':>10s}")
-        print(f"  {'-'*60}")
+        print(f"\n  {'Model':<24s} {'Type':>12s} {'Mean R2':>10s} {'Mean Corr':>10s} {'Best':>10s} {'Worst':>10s}")
+        print(f"  {'-'*80}")
         for m in eval_models:
             rs = summ[m]['R2']
             if rs:
-                print(f"  {m:<16s} {np.mean(rs):10.4f} {np.mean(summ[m]['Corr']):10.4f} "
+                mtype = all_results[traits_run[0]][m].get('Type', 'DL')
+                print(f"  {m:<24s} {mtype:>12s} {np.mean(rs):10.4f} {np.mean(summ[m]['Corr']):10.4f} "
                       f"{np.max(rs):10.4f} {np.min(rs):10.4f}")
 
         ranked = sorted([(m, np.mean(summ[m]['R2'])) for m in eval_models],
                         key=lambda x: x[1], reverse=True)
         print("\n  Ranking:")
         for i, (m, r) in enumerate(ranked, 1):
-            print(f"    {i}. {m}: {r:.4f}")
+            mtype = all_results[traits_run[0]][m].get('Type', 'DL')
+            print(f"    {i:2d}. [{mtype:>11s}] {m}: {r:.4f}")
 
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         with open(OUTPUT_DIR / f"ensemble_final_{ts}.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
 
         # 画图
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
-        colors = ['#2196F3','#4CAF50','#FF9800','#03A9F4','#8BC34A','#FFB74D','#E91E63','#9C27B0','#00BCD4']
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 13))
+        colors = plt.cm.tab20(np.linspace(0, 1, len(eval_models)))
         for i, m in enumerate(eval_models):
             rs = [all_results[t][m]['R2'] for t in traits_run if m in all_results[t]]
-            ax1.bar(np.arange(len(traits_run)) + (i-len(eval_models)/2+0.5)*0.1,
-                    rs, 0.1, label=m, color=colors[i%len(colors)], alpha=0.85)
+            ax1.bar(np.arange(len(traits_run)) + (i-len(eval_models)/2+0.5)*0.08,
+                    rs, 0.08, label=m, color=colors[i], alpha=0.85)
         ax1.set_ylabel('R2')
         ax1.set_title('Rice Genomic Prediction -- Ensemble System (5-fold CV)')
         ax1.set_xticks(np.arange(len(traits_run)))
         ax1.set_xticklabels([t[:15] for t in traits_run], rotation=45, ha='right')
-        ax1.legend(ncol=3, fontsize=7)
+        ax1.legend(ncol=3, fontsize=6)
         ax1.axhline(0, c='k', lw=0.5)
         ax1.grid(axis='y', alpha=0.3)
 
         ns = [m for m,_ in ranked]
-        bc = [colors[eval_models.index(m)%len(colors)] for m in ns]
-        bars = ax2.barh([m[:25] for m in ns], [np.mean(summ[m]['R2']) for m in ns], color=bc, alpha=0.85)
+        bc = [colors[eval_models.index(m)] for m in ns]
+        bars = ax2.barh([m[:30] for m in ns], [np.mean(summ[m]['R2']) for m in ns], color=bc, alpha=0.85)
         ax2.set_xlabel('Mean R2')
         ax2.set_title('Overall Ranking')
         for b, v in zip(bars, [np.mean(summ[m]['R2']) for m in ns]):

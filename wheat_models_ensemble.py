@@ -230,17 +230,23 @@ def load_all_wheat_data():
 # 训练工具
 # ============================================================================
 
-def train_torch_model(model, X_train, y_train, X_val, y_val,
+def train_torch_model(model, X_train, y_train,
                       epochs=300, batch_size=128, lr=1e-3, weight_decay=1e-4,
-                      patience=30):
+                      patience=30, val_ratio=0.15):
     model = model.to(DEVICE)
-    Xt = torch.FloatTensor(X_train).to(DEVICE)
-    yt = torch.FloatTensor(y_train).to(DEVICE)
-    Xv = torch.FloatTensor(X_val).to(DEVICE)
-    yv = torch.FloatTensor(y_val).to(DEVICE)
+    n_total = len(X_train)
+    n_val = max(1, int(n_total * val_ratio))
+    rng = np.random.RandomState(RANDOM_SEED)
+    idx = rng.permutation(n_total)
+    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+
+    Xt = torch.FloatTensor(X_train[tr_idx]).to(DEVICE)
+    yt = torch.FloatTensor(y_train[tr_idx]).to(DEVICE)
+    Xv = torch.FloatTensor(X_train[val_idx]).to(DEVICE)
+    yv = torch.FloatTensor(y_train[val_idx]).to(DEVICE)
 
     dl = DataLoader(TensorDataset(Xt, yt),
-                    batch_size=min(batch_size, len(X_train)), shuffle=True)
+                    batch_size=min(batch_size, len(tr_idx)), shuffle=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=15)
@@ -897,7 +903,7 @@ def main():
                 bs = 64 if mname == 'FusionNet' else 128
                 lr = 1e-3 if mname == 'FusionNet' else 2e-3
                 model = train_torch_model(
-                    dl_models[mname], Xtr_s, ytr, Xte_s, yte,
+                    dl_models[mname], Xtr_s, ytr,
                     epochs=300, batch_size=bs, lr=lr, weight_decay=1e-3, patience=30)
                 preds = predict_torch_model(model, Xte_s)
                 elapsed = time.time() - t0
@@ -1008,7 +1014,7 @@ def main():
         for mname in dl_base_names + ['FusionNet']:
             model = create_model(mname, n_snps)
             model = train_torch_model(
-                model, X_full_s, y, X_full_s, y,
+                model, X_full_s, y,
                 epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
             torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             print(f"    [saved] {mname}.pt")
