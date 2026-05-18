@@ -161,9 +161,10 @@ def gwas_select_fast(X, y, top_k):
 # ============================================================================
 # Cross-Validation
 # ============================================================================
-def evaluate_all_models(X_all, y, G_mat, trait_name):
-    """5-fold CV for all models on a single trait."""
+def evaluate_all_models(X_all, y, trait_name):
+    """5-fold CV for all models on a single trait. GWAS per-fold, no leakage."""
     n = len(y)
+    n_snps_sel = min(GWAS_TOP_K, X_all.shape[1] - 50)
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
 
     model_names = [
@@ -175,12 +176,21 @@ def evaluate_all_models(X_all, y, G_mat, trait_name):
     for fi, (tr, te) in enumerate(kf.split(X_all)):
         print(f"    Fold {fi+1}/{N_FOLDS} ...", end=" ", flush=True)
 
-        Xtr, Xte = X_all[tr], X_all[te]
+        Xtr_raw, Xte_raw = X_all[tr], X_all[te]
         ytr, yte = y[tr], y[te]
+
+        # GWAS on training data only
+        gidx = gwas_select_fast(Xtr_raw, ytr, n_snps_sel)
+        Xtr = Xtr_raw[:, gidx]
+        Xte = Xte_raw[:, gidx]
 
         sc = StandardScaler()
         Xtr_s = sc.fit_transform(Xtr)
         Xte_s = sc.transform(Xte)
+
+        # GRM from per-fold selected markers
+        G_tr = Xtr_s @ Xtr_s.T / n_snps_sel
+        G_te_tr = Xte_s @ Xtr_s.T / n_snps_sel
 
         fold_preds = {}
 
@@ -188,9 +198,9 @@ def evaluate_all_models(X_all, y, G_mat, trait_name):
         rr = RRBLUP().fit(Xtr_s, ytr)
         fold_preds['RRBLUP'] = rr.predict(Xte_s)
 
-        # GBLUP
-        gb = GBLUP().fit(G_mat[tr][:, tr], ytr)
-        fold_preds['GBLUP'] = gb.predict(G_mat[te][:, tr])
+        # GBLUP — per-fold GRM from GWAS-selected markers
+        gb = GBLUP().fit(G_tr, ytr)
+        fold_preds['GBLUP'] = gb.predict(G_te_tr)
 
         # XGBoost
         xm = XGBoostModel(n_estimators=300).fit(Xtr_s, ytr)
@@ -213,8 +223,10 @@ def evaluate_all_models(X_all, y, G_mat, trait_name):
             X_itr = Xtr_s[itr]; X_ite = Xtr_s[ite]
             y_itr = ytr[itr]
             oof_preds['RRBLUP'][ite] = RRBLUP().fit(X_itr, y_itr).predict(X_ite)
-            oof_preds['GBLUP'][ite] = GBLUP().fit(
-                G_mat[tr][itr][:, itr], y_itr).predict(G_mat[tr][ite][:, itr])
+            # Per-fold GRM for inner CV
+            G_itr = X_itr @ X_itr.T / n_snps_sel
+            G_ite_itr = X_ite @ X_itr.T / n_snps_sel
+            oof_preds['GBLUP'][ite] = GBLUP().fit(G_itr, y_itr).predict(G_ite_itr)
             oof_preds['XGBoost'][ite] = XGBoostModel(n_estimators=300).fit(
                 X_itr, y_itr).predict(X_ite)
             oof_preds['ElasticNet'][ite] = ElasticNetModel().fit(
@@ -264,11 +276,10 @@ def main():
     print("\nLoading preprocessed data ...")
     data = np.load(DATA_DIR / "genotype_matrix.npz", allow_pickle=True)
     G = data['G']
-    G_matrix = data['G_matrix']
     sample_names = list(data['sample_names'])
     with open(DATA_DIR / "trait_data.json") as f:
         trait_data = json.load(f)
-    print(f"  Genotype: {G.shape}, G-matrix: {G_matrix.shape}")
+    print(f"  Genotype: {G.shape}")
 
     all_results = {}
     t0_trait = time.time()
@@ -282,15 +293,11 @@ def main():
         idxs = td['genotype_indices']
         y = np.array(td['values'])
         X_all = G[idxs]
-        G_mat = G_matrix[idxs][:, idxs]
+        n_snps_sel = min(GWAS_TOP_K, X_all.shape[1] - 50)
+        print(f"  {len(y)} samples, {X_all.shape[1]} markers → "
+              f"{n_snps_sel} GWAS-selected per-fold (no leakage)")
 
-        # GWAS selection for models that need it
-        k = min(GWAS_TOP_K, X_all.shape[1] - 50)
-        gidx = gwas_select_fast(X_all, y, k)
-        X_sel = X_all[:, gidx]
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {X_sel.shape[1]} GWAS-selected")
-
-        res = evaluate_all_models(X_sel, y, G_mat, trait)
+        res = evaluate_all_models(X_all, y, trait)
         all_results[trait] = res
 
         print(f"\n  {'Model':<20s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s}")

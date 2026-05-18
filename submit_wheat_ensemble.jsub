@@ -6,7 +6,7 @@
 # GPU模式: -q gpu, -gpgpu 1
 # ============================================================================
 #JSUB -q gpu
-#JSUB -n 4
+#JSUB -n 2
 #JSUB -gpgpu 1
 #JSUB -J wheat_ensemble
 #JSUB -o logs/wheat_ensemble_%J.out

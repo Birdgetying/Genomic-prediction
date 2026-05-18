@@ -9,7 +9,7 @@
 #   同时取消 export CUDA_VISIBLE_DEVICES="" 的注释
 # ============================================================================
 #JSUB -q gpu
-#JSUB -n 4
+#JSUB -n 2
 #JSUB -gpgpu 1
 #JSUB -J rice_ensemble
 #JSUB -o logs/rice_ensemble_%J.out
