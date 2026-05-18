@@ -617,6 +617,7 @@ def evaluate_traditional_stacking(oof_trad, y):
 
 def create_model(name, n_snps, overrides=None):
     """按名称创建单个模型。overrides: 可选超参覆盖 dict"""
+    o = overrides or {}
     if name == 'FGN':
         return FourierGenomicNet(n_snps=n_snps, hidden=64, dropout=0.35)
     if name == 'EFM':
@@ -630,16 +631,16 @@ def create_model(name, n_snps, overrides=None):
     if name == 'MICNN v2':
         return MICNNv2(n_snps=n_snps, hidden=40, dropout=0.35, spp_bins=(1, 2, 4))
     if name == 'FGN v3':
-        return FGNv3(n_snps=n_snps, hidden=overrides.get('hidden', 48) if overrides else 48,
-                     dropout=overrides.get('dropout', 0.35) if overrides else 0.35)
+        return FGNv3(n_snps=n_snps, hidden=o.get('hidden', 48),
+                     dropout=o.get('dropout', 0.35))
     if name == 'EFM v3':
-        return EFMv3(n_snps=n_snps, k=overrides.get('k', 4) if overrides else 4,
-                     hidden=overrides.get('hidden', 64) if overrides else 64,
-                     dropout=overrides.get('dropout', 0.35) if overrides else 0.35)
+        return EFMv3(n_snps=n_snps, k=o.get('k', 4),
+                     hidden=o.get('hidden', 64),
+                     dropout=o.get('dropout', 0.35))
     if name == 'FusionNet':
         return FusionNet(n_snps=n_snps,
-                         hidden_dim=overrides.get('hidden_dim', 48) if overrides else 48,
-                         dropout=overrides.get('dropout', 0.35) if overrides else 0.35)
+                         hidden_dim=o.get('hidden_dim', 48),
+                         dropout=o.get('dropout', 0.35))
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -718,7 +719,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
                               dropout=overrides['dropout'])
             bs = 64
         else:
-            return 0.0
+            raise ValueError(f"Unknown model for tuning: {model_name}")
 
         model = train_torch_model(
             model, X_tr, y_tr,
@@ -902,7 +903,7 @@ def main():
 
                 t0 = time.time()
                 tp = tuned_params.get(mname, {})
-                bs = tp.get('batch_size', 64 if mname == 'FusionNet' else 128)
+                bs = 64 if mname == 'FusionNet' else 128
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                 wd = tp.get('weight_decay', 1e-3)
                 pat = tp.get('patience', 30)
@@ -1044,7 +1045,7 @@ def main():
             model = train_torch_model(
                 model, X_full_s, y,
                 epochs=300,
-                batch_size=tp.get('batch_size', 64 if mname == 'FusionNet' else 128),
+                batch_size=64 if mname == 'FusionNet' else 128,
                 lr=tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3),
                 weight_decay=tp.get('weight_decay', 1e-3),
                 patience=tp.get('patience', 30))
