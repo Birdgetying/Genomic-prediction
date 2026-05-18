@@ -649,6 +649,172 @@ class FGNv3(nn.Module):
         return self.head(torch.cat([fp, tp], dim=1))
 
 
+# ============================================================================
+# PreFGN — 自监督预训练频域基因组网络
+# 阶段1: 掩码标记重建 (masked autoencoder on genotype)
+# 阶段2: 表型微调 (用预训练编码器 + 回归头)
+# ============================================================================
+
+class FGNEncoder(nn.Module):
+    """FGN 编码器: BN → FFT → FreqSE → FreqConv → pool (不含回归头)"""
+    def __init__(self, n_snps, hidden=64, dropout=0.35):
+        super().__init__()
+        self.n_freq = n_snps // 2 + 1
+        self.bn = nn.BatchNorm1d(n_snps)
+        se_hidden = max(4, self.n_freq // 8)
+        self.freq_se = nn.Sequential(
+            nn.Linear(self.n_freq, se_hidden), nn.GELU(),
+            nn.Linear(se_hidden, self.n_freq), nn.Sigmoid())
+        self.freq_conv = nn.Sequential(
+            nn.Conv1d(1, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(hidden, hidden, 5, padding=2), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.snp_gate = nn.Sequential(nn.Linear(n_snps, 1), nn.Sigmoid())
+        self.time_conv = nn.Sequential(
+            nn.Conv1d(1, hidden // 2, 21, padding=10), nn.BatchNorm1d(hidden // 2),
+            nn.GELU(), nn.Dropout(dropout * 0.5))
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.out_dim = hidden + hidden // 2
+
+    def forward(self, x):
+        x = self.bn(x)
+        xc = torch.fft.rfft(x, dim=1)
+        mag = xc.abs()
+        se_w = self.freq_se(mag.mean(dim=0, keepdim=True))
+        mag_w = mag * se_w
+        fp = self.pool(self.freq_conv(mag_w.unsqueeze(1))).squeeze(-1)
+        g = self.snp_gate(x)
+        tp = self.pool(self.time_conv((x * g).unsqueeze(1))).squeeze(-1)
+        return torch.cat([fp, tp], dim=1)
+
+
+class PreFGN(nn.Module):
+    """自监督预训练 + 频域编码 + 表型微调"""
+    def __init__(self, n_snps, hidden=64, dropout=0.35):
+        super().__init__()
+        enc_out = hidden + hidden // 2  # FGNEncoder output dim = 1.5*hidden
+        self.encoder = FGNEncoder(n_snps, hidden, dropout)
+        self.decoder = nn.Sequential(
+            nn.Linear(enc_out, hidden * 2), nn.GELU(),
+            nn.Linear(hidden * 2, n_snps))  # 重建标准化基因型
+        self.head = nn.Sequential(
+            nn.Linear(enc_out, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden // 2, 1))
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.head(z)
+
+    def reconstruct(self, x_masked):
+        z = self.encoder(x_masked)
+        return self.decoder(z)
+
+
+def pretrain_prefgn(model, X, epochs=50, lr=1e-3, batch_size=128,
+                    mask_ratio=0.2, patience=10):
+    """阶段1: 掩码标记重建预训练 (MSE loss)"""
+    model = model.to(DEVICE)
+    dataset = TensorDataset(torch.FloatTensor(X))
+    dl = DataLoader(dataset, batch_size=min(batch_size, len(X)), shuffle=True)
+    opt = torch.optim.AdamW(
+        list(model.encoder.parameters()) + list(model.decoder.parameters()), lr=lr)
+    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='min', factor=0.5, patience=5)
+
+    best_state, best_loss, wait = None, float('inf'), 0
+    for _ in range(epochs):
+        model.train()
+        total_loss = 0
+        for (xb,) in dl:
+            xb = xb.to(DEVICE)
+            mask = torch.rand_like(xb) > mask_ratio
+            x_masked = xb.clone()
+            x_masked[~mask] = 0.0  # 标准化后均值=0 作为 mask token
+            recon = model.reconstruct(x_masked)
+            loss = F.mse_loss(recon[~mask], xb[~mask])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += loss.item() * len(xb)
+        avg_loss = total_loss / len(X)
+        sch.step(avg_loss)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model.cpu()
+
+
+# ============================================================================
+# LD-GCN — LD 图卷积网络
+# 用 LD (Linkage Disequilibrium) 矩阵构建 SNP 图, GCN 传播信息
+# ============================================================================
+
+class GCNLayer(nn.Module):
+    """图卷积层: H' = A_norm @ H @ W + residual"""
+    def __init__(self, dim, dropout=0.2):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        self.do = nn.Dropout(dropout)
+        self.act = nn.GELU()
+
+    def forward(self, h, adj):
+        """h: (B, M, dim), adj: (M, M) normalized adjacency"""
+        h_agg = torch.einsum('ij,bjd->bid', adj, h)
+        return self.do(self.act(self.norm(self.linear(h_agg))))
+
+
+class LDGCN(nn.Module):
+    """LD 图卷积网络: 用 LD 作为图结构先验的基因组预测"""
+
+    def __init__(self, n_snps, hidden=64, dropout=0.35, n_layers=2, k_neighbors=15):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(1, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(dropout * 0.5))
+        self.gcn_layers = nn.ModuleList(
+            [GCNLayer(hidden, dropout * 0.5) for _ in range(n_layers)])
+        self.pool_bn = nn.BatchNorm1d(hidden)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+        self.register_buffer('adj', torch.eye(n_snps))
+        self.k_neighbors = k_neighbors
+
+    @staticmethod
+    def build_adjacency(X, k=15):
+        """从训练基因型构建 LD 归一化邻接矩阵"""
+        corr = np.corrcoef(X.T)
+        corr_abs = np.abs(corr)
+        np.fill_diagonal(corr_abs, 0)
+        adj = np.zeros_like(corr_abs)
+        for i in range(corr_abs.shape[0]):
+            top_k_idx = np.argpartition(corr_abs[i], -(k + 1))[-(k + 1):]
+            adj[i, top_k_idx] = corr_abs[i, top_k_idx]
+        adj = np.maximum(adj, adj.T)
+        adj = adj + np.eye(adj.shape[0])
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.maximum(adj.sum(axis=1), 1e-12)))
+        adj_norm = D_inv_sqrt @ adj @ D_inv_sqrt
+        return torch.tensor(adj_norm, dtype=torch.float32)
+
+    def forward(self, x):
+        h = self.input_proj(x.unsqueeze(-1))
+        for gcn in self.gcn_layers:
+            h = gcn(h, self.adj) + h
+        h = h.mean(dim=1)
+        h = self.pool_bn(h.unsqueeze(-1)).squeeze(-1)
+        return self.head(h)
+
+
 class DilatedInceptionBlock(nn.Module):
     """带空洞卷积的Inception"""
     def __init__(self, in_ch, out_ch, dropout=0.3):
@@ -808,6 +974,13 @@ def create_model(name, n_snps, overrides=None):
         return FusionNet(n_snps=n_snps,
                          hidden_dim=o.get('hidden_dim', 48),
                          dropout=o.get('dropout', 0.35))
+    if name == 'PreFGN':
+        return PreFGN(n_snps=n_snps, hidden=o.get('hidden', 64),
+                      dropout=o.get('dropout', 0.35))
+    if name == 'LD-GCN':
+        return LDGCN(n_snps=n_snps, hidden=o.get('hidden', 64),
+                     dropout=o.get('dropout', 0.35),
+                     k_neighbors=o.get('k_neighbors', 15))
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -885,6 +1058,20 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             model = FusionNet(n_snps=n_snps, hidden_dim=overrides['hidden_dim'],
                               dropout=overrides['dropout'])
             bs = 64
+        elif model_name == 'LD-GCN':
+            overrides = {
+                'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
+                'dropout': trial.suggest_float('dropout', 0.2, 0.5),
+                'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
+                'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+                'patience': trial.suggest_int('patience', 20, 50),
+                'k_neighbors': trial.suggest_int('k_neighbors', 10, 30),
+            }
+            model = LDGCN(n_snps=n_snps, hidden=overrides['hidden'],
+                          dropout=overrides['dropout'],
+                          k_neighbors=overrides['k_neighbors'])
+            model.adj = LDGCN.build_adjacency(X_tr, k=overrides['k_neighbors'])
+            bs = 128
         else:
             raise ValueError(f"Unknown model for tuning: {model_name}")
 
@@ -973,7 +1160,7 @@ def main():
 
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
     dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2',
-                     'FGN v3', 'EFM v3']
+                     'FGN v3', 'EFM v3', 'PreFGN', 'LD-GCN']
     dl_ensemble_names = ['FusionNet']
     extra_names = ['ResFGN']
     dl_names = dl_base_names + dl_ensemble_names
@@ -1013,7 +1200,7 @@ def main():
             sc_tune = StandardScaler()
             X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
 
-            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet']:
+            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet', 'LD-GCN']:
                 best_p, best_r2 = tune_model_hyperparams(
                     tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
@@ -1089,6 +1276,16 @@ def main():
 
                 t0 = time.time()
                 tp = tuned_params.get(mname, {})
+
+                # PreFGN: 掩码重建预训练 (阶段1)
+                if mname == 'PreFGN' and not QUICK_TEST:
+                    pretrain_prefgn(dl_models[mname], Xtr_s, epochs=50,
+                                    lr=1e-3, mask_ratio=0.2, patience=10)
+                # LD-GCN: 构建 LD 邻接矩阵
+                if mname == 'LD-GCN':
+                    dl_models[mname].adj = LDGCN.build_adjacency(
+                        Xtr_s, k=tp.get('k_neighbors', 15)).to(DEVICE)
+
                 bs = 64 if mname == 'FusionNet' else 128
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                 wd = tp.get('weight_decay', 1e-3)
@@ -1228,6 +1425,14 @@ def main():
         for mname in dl_base_names + ['FusionNet']:
             tp = tuned_params.get(mname, {})
             model = create_model(mname, n_snps, overrides=tp)
+
+            if mname == 'PreFGN' and not QUICK_TEST:
+                pretrain_prefgn(model, X_full_s, epochs=50,
+                                lr=1e-3, mask_ratio=0.2, patience=10)
+            if mname == 'LD-GCN':
+                model.adj = LDGCN.build_adjacency(
+                    X_full_s, k=tp.get('k_neighbors', 15)).to(DEVICE)
+
             model = train_torch_model(
                 model, X_full_s, y,
                 epochs=300,
@@ -1310,6 +1515,7 @@ def main():
             'FGN': '#FFB74D', 'EFM': '#FFD54F', 'MICNN': '#FF8A65',
             'FGN v2': '#F57C00', 'EFM v2': '#FBC02D', 'MICNN v2': '#E64A19',
             'FGN v3': '#BF360C', 'EFM v3': '#F9A825',
+            'PreFGN': '#00BCD4', 'LD-GCN': '#009688',
             'FusionNet': '#E91E63',
             'Stacking (DL)': '#C62828', 'Stacking (All)': '#B71C1C',
             'Trad Ensemble': '#1565C0',
