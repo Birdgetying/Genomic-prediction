@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from genomic_nn_models import (FGNEncoder, PreFGN, pretrain_prefgn, LDGCN)
+from genomic_nn_models import (FGNEncoder, PreFGN, pretrain_prefgn, pretrain_prefgn_v2)
 
 import matplotlib
 matplotlib.use('Agg')
@@ -48,7 +48,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 RANDOM_SEED = 42
 N_FOLDS = 5
-GWAS_TOP_K = 3000
+GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -353,8 +353,6 @@ class FGNv3(nn.Module):
         return self.head(self.encoder(x))
 
 
-LDGCN_adj = LDGCN.build_adjacency
-
 
 class DilatedInceptionBlock(nn.Module):
     """带空洞卷积的Inception: k7(标准), k15(标准), k7d2(空洞), k7d4(空洞)"""
@@ -624,10 +622,6 @@ def create_model(name, n_snps, overrides=None):
     if name == 'PreFGN':
         return PreFGN(n_snps=n_snps, hidden=o.get('hidden', 64),
                       dropout=o.get('dropout', 0.35))
-    if name == 'LD-GCN':
-        return LDGCN(n_snps=n_snps, hidden=o.get('hidden', 64),
-                     dropout=o.get('dropout', 0.35),
-                     k_neighbors=o.get('k_neighbors', 15))
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -638,22 +632,22 @@ def create_model(name, n_snps, overrides=None):
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
 
-def fit_resfgn_components(X, y, n_snps, cv=3, fgn_overrides=None):
-    """Train RidgeCV + FGNv3 on Ridge residuals. Returns (ridge, fgn_model)."""
-    o = fgn_overrides or {}
+def fit_resfgn_components(X, y, n_snps, cv=3, fusion_overrides=None):
+    """Train RidgeCV + FusionNet on Ridge residuals. Returns (ridge, fusion_model)."""
+    o = fusion_overrides or {}
     ridge = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=cv)
     ridge.fit(X, y)
     residuals = y - ridge.predict(X)
-    fgn = FGNv3(n_snps=n_snps,
-                hidden=o.get('hidden', 48),
-                dropout=o.get('dropout', 0.35)).to(DEVICE)
-    fgn = train_torch_model(
-        fgn, X, residuals,
-        epochs=300, batch_size=128,
-        lr=o.get('lr', 2e-3),
+    fusion = FusionNet(n_snps=n_snps,
+                       hidden_dim=o.get('hidden_dim', 48),
+                       dropout=o.get('dropout', 0.35)).to(DEVICE)
+    fusion = train_torch_model(
+        fusion, X, residuals,
+        epochs=300, batch_size=64,
+        lr=o.get('lr', 1e-3),
         weight_decay=o.get('weight_decay', 1e-3),
         patience=o.get('patience', 30))
-    return ridge, fgn
+    return ridge, fusion
 
 
 def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
@@ -705,20 +699,6 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             model = FusionNet(n_snps=n_snps, hidden_dim=overrides['hidden_dim'],
                               dropout=overrides['dropout'])
             bs = 64
-        elif model_name == 'LD-GCN':
-            overrides = {
-                'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
-                'dropout': trial.suggest_float('dropout', 0.2, 0.5),
-                'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
-                'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
-                'patience': trial.suggest_int('patience', 20, 50),
-                'k_neighbors': trial.suggest_int('k_neighbors', 10, 30),
-            }
-            model = LDGCN(n_snps=n_snps, hidden=overrides['hidden'],
-                          dropout=overrides['dropout'],
-                          k_neighbors=overrides['k_neighbors'])
-            model.adj = LDGCN.build_adjacency(X_tr, k=overrides['k_neighbors'])
-            bs = 128
         else:
             raise ValueError(f"Unknown model for tuning: {model_name}")
 
@@ -789,7 +769,7 @@ def main():
 
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
     dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2',
-                     'FGN v3', 'EFM v3', 'PreFGN', 'LD-GCN']
+                     'FGN v3', 'EFM v3', 'PreFGN']
     extra_names = ['ResFGN']
     dl_names = dl_base_names + ['FusionNet']
     all_names = trad_names + dl_names + extra_names
@@ -830,7 +810,7 @@ def main():
             sc_tune = StandardScaler()
             X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
 
-            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet', 'LD-GCN']:
+            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet']:
                 best_p, best_r2 = tune_model_hyperparams(
                     tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
@@ -906,11 +886,8 @@ def main():
                 tp = tuned_params.get(mname, {})
 
                 if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn(dl_models[mname], Xtr_s, epochs=50,
-                                    lr=1e-3, mask_ratio=0.2, patience=10)
-                if mname == 'LD-GCN':
-                    dl_models[mname].adj = LDGCN.build_adjacency(
-                        Xtr_s, k=tp.get('k_neighbors', 15)).to(DEVICE)
+                    pretrain_prefgn_v2(dl_models[mname], Xtr_s, epochs=50,
+                                       lr=1e-3, patience=10)
 
                 bs = 64 if mname == 'FusionNet' else 128
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
@@ -934,11 +911,11 @@ def main():
                 dl_models[mname] = create_model(mname, n_snps,
                                                   overrides=tuned_params.get(mname))
 
-            # ── ResFGN: Ridge + FGNv3 residual learning ──
+            # ── ResFGN: Ridge + FusionNet residual learning ──
             t0 = time.time()
             ridge, res_model = fit_resfgn_components(
                 Xtr_s, ytr, n_snps, cv=3,
-                fgn_overrides=tuned_params.get('FGN v3'))
+                fusion_overrides=tuned_params.get('FusionNet'))
             pred_te_ridge = ridge.predict(Xte_s)
             res_pred = predict_torch_model(res_model, Xte_s)
             final_pred = pred_te_ridge + res_pred
@@ -1053,11 +1030,8 @@ def main():
             model = create_model(mname, n_snps, overrides=tp)
 
             if mname == 'PreFGN' and not quick_test:
-                pretrain_prefgn(model, X_full_s, epochs=50,
-                                lr=1e-3, mask_ratio=0.2, patience=10)
-            if mname == 'LD-GCN':
-                model.adj = LDGCN.build_adjacency(
-                    X_full_s, k=tp.get('k_neighbors', 15)).to(DEVICE)
+                pretrain_prefgn_v2(model, X_full_s, epochs=50,
+                                   lr=1e-3, patience=10)
 
             model = train_torch_model(
                 model, X_full_s, y,
@@ -1072,10 +1046,10 @@ def main():
         # ResFGN deployment
         ridge_full, res_model_full = fit_resfgn_components(
             X_full_s, y, n_snps, cv=5,
-            fgn_overrides=tuned_params.get('FGN v3'))
+            fusion_overrides=tuned_params.get('FusionNet'))
         pickle.dump(ridge_full, open(deploy_dir / "ResFGN_ridge.pkl", 'wb'))
-        torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fgn.pt")
-        print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fgn.pt")
+        torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fusion.pt")
+        print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fusion.pt")
 
         # Stacking meta-learners
         X_meta_dl = np.column_stack([oof_dl[m] for m in dl_base_names])

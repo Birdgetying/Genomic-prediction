@@ -1,5 +1,5 @@
 """
-共享基因组神经网络模型 — PreFGN / LD-GCN
+共享基因组神经网络模型 — PreFGN / FGNEncoder
 
 被 wheat_models_ensemble.py 和 rice_models_ensemble.py 导入使用。
 """
@@ -67,8 +67,12 @@ def early_stop_restore(model, opt, scheduler_fn, loss_fn, forward_fn,
 # ============================================================================
 
 class FGNEncoder(nn.Module):
-    """BN → FFT → FreqSE → FreqConv + SNP gate → TimeConv → concat output"""
-    def __init__(self, n_snps, hidden=64, dropout=0.35):
+    """BN → FFT → FreqSE → FreqConv + SNP gate → TimeConv → concat output
+
+    marker_types: optional (n_snps,) int tensor [0=SNP, 1=INDEL, 2=SV].
+                  Adds a learnable per-type bias before BN.
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, marker_types=None):
         super().__init__()
         self.n_freq = n_snps // 2 + 1
         self.bn = nn.BatchNorm1d(n_snps)
@@ -88,7 +92,21 @@ class FGNEncoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.out_dim = hidden + hidden // 2
 
+        # 变异类型编码 (SNP/INDEL/SV), None 表示不使用
+        if marker_types is not None:
+            # marker_types 可以是 numpy array 或 tensor, 记录每个标记的类型 (0/1/2)
+            n_types = int(max(marker_types) + 1) if hasattr(marker_types, '__len__') else 3
+            self.type_embed = nn.Parameter(torch.zeros(n_types))
+            self.register_buffer('_marker_type_idx',
+                                 torch.as_tensor(marker_types, dtype=torch.long))
+        else:
+            self.type_embed = None
+            self._marker_type_idx = None
+
     def forward(self, x):
+        # 注入变异类型偏置
+        if self.type_embed is not None and self._marker_type_idx is not None:
+            x = x + self.type_embed[self._marker_type_idx]
         x = self.bn(x)
         xc = torch.fft.rfft(x, dim=1)
         mag = xc.abs()
@@ -106,10 +124,10 @@ class FGNEncoder(nn.Module):
 
 class PreFGN(nn.Module):
     """阶段1: 掩码标记重建 → 阶段2: 表型微调"""
-    def __init__(self, n_snps, hidden=64, dropout=0.35):
+    def __init__(self, n_snps, hidden=64, dropout=0.35, marker_types=None):
         super().__init__()
         enc_out = hidden + hidden // 2
-        self.encoder = FGNEncoder(n_snps, hidden, dropout)
+        self.encoder = FGNEncoder(n_snps, hidden, dropout, marker_types)
         self.decoder = nn.Sequential(
             nn.Linear(enc_out, hidden * 2), nn.GELU(),
             nn.Linear(hidden * 2, n_snps))
@@ -130,7 +148,7 @@ class PreFGN(nn.Module):
 
 
 def pretrain_prefgn(model, X, epochs=50, lr=1e-3, mask_ratio=0.2, patience=10):
-    """阶段1: 掩码重建预训练。复用 early_stop_restore。"""
+    """阶段1: 掩码重建预训练 (独立随机掩码, 原始版本 — 保留兼容)"""
     model = model.to(DEVICE)
     X_t = torch.FloatTensor(X)
     dl = DataLoader(TensorDataset(X_t),
@@ -154,100 +172,54 @@ def pretrain_prefgn(model, X, epochs=50, lr=1e-3, mask_ratio=0.2, patience=10):
                               dl, epochs, patience, DEVICE).cpu()
 
 
+def pretrain_prefgn_v2(model, X, epochs=50, lr=1e-3, patience=10,
+                       mask_block=(3, 15), mask_frac=0.2, noise_std=0.05):
+    """阶段1 v2: 块掩码 + 高斯噪声去噪。
+
+    - 随机选择起始位置, 掩码连续 mask_block 个 SNP (模拟 LD 块缺失)
+    - 对未掩码位置加高斯噪声
+    - 损失 = 0.7 × MSE(掩码位置) + 0.3 × MSE(所有位置)
+    """
+    model = model.to(DEVICE)
+    X_t = torch.FloatTensor(X)
+    dl = DataLoader(TensorDataset(X_t),
+                    batch_size=min(128, len(X)), shuffle=True)
+
+    opt = torch.optim.AdamW(model.pretrainable_params(), lr=lr)
+    n_snps = X.shape[1]
+    bl, bh = mask_block
+
+    def forward_block_masked(batch, m):
+        xb = batch[0].to(DEVICE)
+        # 创建块掩码
+        mask = torch.ones_like(xb, dtype=torch.bool)
+        n_mask_target = int(n_snps * mask_frac)
+        n_masked = 0
+        while n_masked < n_mask_target:
+            start = torch.randint(0, max(1, n_snps - bl), (1,)).item()
+            end = min(start + torch.randint(bl, bh + 1, (1,)).item(), n_snps)
+            mask[:, start:end] = False
+            n_masked += (end - start)
+
+        x_masked = xb.clone()
+        x_masked[~mask] = 0.0
+        # 对未掩码位置加高斯噪声
+        noise = torch.randn_like(xb) * noise_std
+        x_masked[mask] = x_masked[mask] + noise[mask]
+
+        recon = m.reconstruct(x_masked)
+        loss_masked = F.mse_loss(recon[~mask], xb[~mask])
+        loss_all = F.mse_loss(recon, xb)
+        return 0.7 * loss_masked + 0.3 * loss_all
+
+    def sched(opt_):
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt_, mode='min', factor=0.5, patience=5)
+
+    return early_stop_restore(model, opt, sched, None, forward_block_masked,
+                              dl, epochs, patience, DEVICE).cpu()
+
+
 # ============================================================================
-# LD-GCN — LD 图卷积网络 (稀疏邻接矩阵)
+# LD-GCN 已移除 (LD 图卷积极不适应基因组预测任务)
 # ============================================================================
-
-class GCNLayer(nn.Module):
-    """稀疏图卷积: H' = A_sparse @ H @ W + residual"""
-    def __init__(self, dim, dropout=0.2):
-        super().__init__()
-        self.linear = nn.Linear(dim, dim)
-        self.norm = nn.LayerNorm(dim)
-        self.do = nn.Dropout(dropout)
-        self.act = nn.GELU()
-
-    def forward(self, h, adj):
-        """h: (B, M, dim), adj: (M, M) sparse COO tensor"""
-        B, M, D = h.shape
-        h_2d = h.permute(1, 0, 2).reshape(M, B * D)
-        h_agg_2d = torch.sparse.mm(adj, h_2d)
-        h_agg = h_agg_2d.reshape(M, B, D).permute(1, 0, 2)
-        return self.do(self.act(self.norm(self.linear(h_agg))))
-
-
-class LDGCN(nn.Module):
-    """LD 图卷积网络: LD 图结构作为归纳偏置"""
-
-    def __init__(self, n_snps, hidden=64, dropout=0.35, n_layers=2, k_neighbors=15):
-        super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.Linear(1, hidden), nn.LayerNorm(hidden), nn.GELU(),
-            nn.Dropout(dropout * 0.5))
-        self.gcn_layers = nn.ModuleList(
-            [GCNLayer(hidden, dropout * 0.5) for _ in range(n_layers)])
-        self.pool_bn = nn.BatchNorm1d(hidden)
-        self.head = nn.Sequential(
-            nn.Linear(hidden, hidden * 2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, 1))
-        self.register_buffer('adj', torch.sparse_coo_tensor(
-            torch.zeros(2, 0, dtype=torch.long),
-            torch.zeros(0), (n_snps, n_snps)).coalesce())
-        self._k_neighbors = k_neighbors
-
-    @staticmethod
-    def build_adjacency(X, k=15):
-        """从训练基因型构建 LD 归一化稀疏邻接矩阵 (float32 COO)"""
-        X_f = X.astype(np.float32)
-        # 内联标准化计算相关: corr = (X_std.T @ X_std) / (N-1)
-        X_c = X_f - X_f.mean(axis=0, keepdims=True)
-        std = np.sqrt(np.maximum((X_c ** 2).sum(axis=0), 1e-12))
-        X_s = X_c / std
-        corr = (X_s.T @ X_s) / max(X_f.shape[0] - 1, 1)
-        corr_abs = np.abs(corr)
-        np.fill_diagonal(corr_abs, 0)
-
-        rows, cols, vals = [], [], []
-        for i in range(corr_abs.shape[0]):
-            top = np.argpartition(corr_abs[i], -(k + 1))[-(k + 1):]
-            for j in top:
-                if corr_abs[i, j] > 0:
-                    rows.append(i); cols.append(j)
-                    vals.append(corr_abs[i, j])
-
-        n = corr_abs.shape[0]
-        idx = torch.tensor([rows, cols], dtype=torch.long)
-        val = torch.tensor(vals, dtype=torch.float32)
-        adj_raw = torch.sparse_coo_tensor(idx, val, (n, n)).coalesce()
-
-        # 对称化: adj = max(A, A^T)
-        adj_sym = adj_raw + adj_raw.transpose(0, 1)
-        adj_sym = adj_sym.coalesce()
-        # 去重 (max 变为 sum 后减半):
-        adj_sym.values().div_(2.0)
-
-        # 添加自环 + 对称归一化: D^{-1/2} (A+I) D^{-1/2}
-        deg = torch.sparse.sum(adj_sym, dim=1).to_dense() + 1.0
-        d_inv_sqrt = 1.0 / torch.sqrt(torch.clamp(deg, min=1e-12))
-
-        new_idx = adj_sym.indices().clone()
-        new_val = adj_sym.values().clone()
-        # 归一化: val_{ij} *= d_inv_sqrt[i] * d_inv_sqrt[j]
-        new_val *= d_inv_sqrt[new_idx[0]] * d_inv_sqrt[new_idx[1]]
-
-        # 添加自环 (eye normalized to d_inv_sqrt^2 中对角贡献)
-        diag_idx = torch.arange(n).unsqueeze(0).repeat(2, 1)
-        diag_val = d_inv_sqrt ** 2
-        all_idx = torch.cat([new_idx, diag_idx], dim=1)
-        all_val = torch.cat([new_val, diag_val], dim=0)
-
-        return torch.sparse_coo_tensor(all_idx, all_val, (n, n)).coalesce()
-
-    def forward(self, x):
-        h = self.input_proj(x.unsqueeze(-1))
-        for gcn in self.gcn_layers:
-            h = gcn(h, self.adj) + h
-        h = h.mean(dim=1)
-        h = self.pool_bn(h.unsqueeze(-1)).squeeze(-1)
-        return self.head(h)

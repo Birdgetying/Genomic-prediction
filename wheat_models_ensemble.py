@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from genomic_nn_models import (FGNEncoder, PreFGN, pretrain_prefgn, LDGCN)
+from genomic_nn_models import (FGNEncoder, PreFGN, pretrain_prefgn, pretrain_prefgn_v2)
 
 import matplotlib
 matplotlib.use('Agg')
@@ -59,7 +59,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 RANDOM_SEED = 42
 N_FOLDS = 5
-GWAS_TOP_K = 3000
+GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
 MAX_VARIANTS_PER_TYPE = 15000  # 每种变异类型最多加载标记数
 
@@ -184,7 +184,8 @@ def load_all_wheat_data():
     ]
 
     X_parts = []
-    for vtype, vpath in vcf_configs:
+    variant_type_ids = []
+    for vtype_id, (vtype, vpath) in enumerate(vcf_configs):
         print(f"  [{vtype}] {os.path.basename(vpath)}")
         if not os.path.exists(vpath):
             print(f"    WARNING: 文件不存在, 跳过")
@@ -192,6 +193,7 @@ def load_all_wheat_data():
         try:
             X_v = load_vcf_genotypes(vpath, MAX_VARIANTS_PER_TYPE, min_samples)
             X_parts.append(X_v)
+            variant_type_ids.append(np.full(X_v.shape[1], vtype_id, dtype=np.int32))
         except Exception as e:
             print(f"    ERROR: {e}, 跳过")
 
@@ -199,7 +201,10 @@ def load_all_wheat_data():
         raise RuntimeError("未能加载任何 VCF 数据!")
 
     X_all = np.hstack(X_parts)
+    vt_all = np.concatenate(variant_type_ids)
     print(f"\n  合并基因型矩阵: {X_all.shape} (samples x total_markers)")
+    print(f"  变异类型分布: SNP={int(np.sum(vt_all==0))}, "
+          f"INDEL={int(np.sum(vt_all==1))}, SV={int(np.sum(vt_all==2))}")
 
     # 4. 为每个性状准备数据
     print("\n[4/4] Preparing trait-specific data ...")
@@ -208,6 +213,7 @@ def load_all_wheat_data():
         n_common = min(len(y_full), X_all.shape[0])
         y_t = y_full[:n_common]
         X_t = X_all[:n_common]
+        vt_t = vt_all.copy()
 
         # 移除 NaN
         mask_t = mask[:n_common]
@@ -219,11 +225,12 @@ def load_all_wheat_data():
         keep = vars_per_marker >= var_thresh
         if keep.sum() < X_t.shape[1]:
             X_t = X_t[:, keep]
+            vt_t = vt_t[keep]
             print(f"  {tname}: {X_t.shape} (过滤低方差后)  y∈[{y_t.min():.3f}, {y_t.max():.3f}]")
         else:
             print(f"  {tname}: {X_t.shape}  y∈[{y_t.min():.3f}, {y_t.max():.3f}]")
 
-        trait_data[tname] = (X_t.astype(np.float32), y_t.astype(np.float32))
+        trait_data[tname] = (X_t.astype(np.float32), y_t.astype(np.float32), vt_t)
 
     return trait_data
 
@@ -613,9 +620,9 @@ class EFMv3(nn.Module):
 
 class FGNv3(nn.Module):
     """FGN v3: Freq SE + SNP gate + BN — composes FGNEncoder + regression head"""
-    def __init__(self, n_snps, hidden=48, dropout=0.35):
+    def __init__(self, n_snps, hidden=48, dropout=0.35, marker_types=None):
         super().__init__()
-        self.encoder = FGNEncoder(n_snps, hidden, dropout)
+        self.encoder = FGNEncoder(n_snps, hidden, dropout, marker_types)
         total = self.encoder.out_dim
         self.head = nn.Sequential(
             nn.Linear(total, hidden*2), nn.GELU(), nn.Dropout(dropout),
@@ -624,10 +631,6 @@ class FGNv3(nn.Module):
 
     def forward(self, x):
         return self.head(self.encoder(x))
-
-
-# Fast path: LD-GCN adjacency helper (re-exported for per-fold call)
-LDGCN_adj = LDGCN.build_adjacency
 
 
 class DilatedInceptionBlock(nn.Module):
@@ -791,11 +794,8 @@ def create_model(name, n_snps, overrides=None):
                          dropout=o.get('dropout', 0.35))
     if name == 'PreFGN':
         return PreFGN(n_snps=n_snps, hidden=o.get('hidden', 64),
-                      dropout=o.get('dropout', 0.35))
-    if name == 'LD-GCN':
-        return LDGCN(n_snps=n_snps, hidden=o.get('hidden', 64),
-                     dropout=o.get('dropout', 0.35),
-                     k_neighbors=o.get('k_neighbors', 15))
+                      dropout=o.get('dropout', 0.35),
+                      marker_types=o.get('marker_types'))
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -806,22 +806,22 @@ def create_model(name, n_snps, overrides=None):
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
 
-def fit_resfgn_components(X, y, n_snps, cv=3, fgn_overrides=None):
-    """Train RidgeCV + FGNv3 on Ridge residuals. Returns (ridge, fgn_model)."""
-    o = fgn_overrides or {}
+def fit_resfgn_components(X, y, n_snps, cv=3, fusion_overrides=None):
+    """Train RidgeCV + FusionNet on Ridge residuals. Returns (ridge, fusion_model)."""
+    o = fusion_overrides or {}
     ridge = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=cv)
     ridge.fit(X, y)
     residuals = y - ridge.predict(X)
-    fgn = FGNv3(n_snps=n_snps,
-                hidden=o.get('hidden', 48),
-                dropout=o.get('dropout', 0.35)).to(DEVICE)
-    fgn = train_torch_model(
-        fgn, X, residuals,
-        epochs=300, batch_size=128,
-        lr=o.get('lr', 2e-3),
+    fusion = FusionNet(n_snps=n_snps,
+                       hidden_dim=o.get('hidden_dim', 48),
+                       dropout=o.get('dropout', 0.35)).to(DEVICE)
+    fusion = train_torch_model(
+        fusion, X, residuals,
+        epochs=300, batch_size=64,
+        lr=o.get('lr', 1e-3),
         weight_decay=o.get('weight_decay', 1e-3),
         patience=o.get('patience', 30))
-    return ridge, fgn
+    return ridge, fusion
 
 
 def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
@@ -873,20 +873,6 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             model = FusionNet(n_snps=n_snps, hidden_dim=overrides['hidden_dim'],
                               dropout=overrides['dropout'])
             bs = 64
-        elif model_name == 'LD-GCN':
-            overrides = {
-                'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
-                'dropout': trial.suggest_float('dropout', 0.2, 0.5),
-                'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
-                'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
-                'patience': trial.suggest_int('patience', 20, 50),
-                'k_neighbors': trial.suggest_int('k_neighbors', 10, 30),
-            }
-            model = LDGCN(n_snps=n_snps, hidden=overrides['hidden'],
-                          dropout=overrides['dropout'],
-                          k_neighbors=overrides['k_neighbors'])
-            model.adj = LDGCN.build_adjacency(X_tr, k=overrides['k_neighbors'])
-            bs = 128
         else:
             raise ValueError(f"Unknown model for tuning: {model_name}")
 
@@ -975,7 +961,7 @@ def main():
 
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
     dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2',
-                     'FGN v3', 'EFM v3', 'PreFGN', 'LD-GCN']
+                     'FGN v3', 'EFM v3', 'PreFGN']
     dl_ensemble_names = ['FusionNet']
     extra_names = ['ResFGN']
     dl_names = dl_base_names + dl_ensemble_names
@@ -995,7 +981,7 @@ def main():
         print(f"  TRAIT [{t_idx+1}/{len(traits_run)}]: {trait}")
         print(f"{'='*80}")
 
-        X_all, y = trait_data[trait]
+        X_all, y, vt_all = trait_data[trait]
         y = y.astype(np.float32)
 
         n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
@@ -1015,12 +1001,15 @@ def main():
             sc_tune = StandardScaler()
             X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
 
-            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet', 'LD-GCN']:
+            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet']:
                 best_p, best_r2 = tune_model_hyperparams(
                     tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
                 pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
                 print(f"    {tune_name}: val R²={best_r2:.4f}  [{pstr}]")
+
+        # Store variant types for models that use them
+        tuned_params['_vt'] = vt_all
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
@@ -1029,7 +1018,13 @@ def main():
         oof_trad = {m: np.zeros(len(y)) for m in trad_names}
         oof_dl = {m: np.zeros(len(y)) for m in dl_base_names}
 
-        dl_models = {m: create_model(m, n_snps) for m in dl_names}
+        # Create models with variant type info where available
+        dl_models = {}
+        for mname in dl_names:
+            o = {}
+            if mname in ('FGN v3', 'PreFGN'):
+                o['marker_types'] = vt_all  # will be subset per-fold
+            dl_models[mname] = create_model(mname, n_snps, overrides=o)
 
         for fi, (tr, te) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fi+1}/{folds_run} ---")
@@ -1040,14 +1035,25 @@ def main():
             if len(maf_idx) >= n_snps:
                 Xtr_raw = Xtr_raw[:, maf_idx]
                 Xte_raw = Xte_raw[:, maf_idx]
+                vt_maf = vt_all[maf_idx]
+            else:
+                vt_maf = vt_all
 
             gidx = gwas_select(Xtr_raw, ytr, n_snps)
             Xtr = Xtr_raw[:, gidx]
             Xte = Xte_raw[:, gidx]
+            vt_fold = vt_maf[gidx]
 
             sc = StandardScaler()
             Xtr_s = sc.fit_transform(Xtr).astype(np.float32)
             Xte_s = sc.transform(Xte).astype(np.float32)
+
+            # Update marker_types for this fold's GWAS selection
+            for mname in ('FGN v3', 'PreFGN'):
+                if hasattr(dl_models[mname], 'encoder') and \
+                   hasattr(dl_models[mname].encoder, '_marker_type_idx'):
+                    dl_models[mname].encoder._marker_type_idx = torch.as_tensor(
+                        vt_fold, dtype=torch.long)
 
             # GRM computed on fold-specific markers
             G_fold_train = Xtr_s @ Xtr_s.T / n_snps
@@ -1094,12 +1100,8 @@ def main():
 
                 # PreFGN: 掩码重建预训练 (阶段1)
                 if mname == 'PreFGN' and not QUICK_TEST:
-                    pretrain_prefgn(dl_models[mname], Xtr_s, epochs=50,
-                                    lr=1e-3, mask_ratio=0.2, patience=10)
-                # LD-GCN: 构建 LD 邻接矩阵
-                if mname == 'LD-GCN':
-                    dl_models[mname].adj = LDGCN.build_adjacency(
-                        Xtr_s, k=tp.get('k_neighbors', 15)).to(DEVICE)
+                    pretrain_prefgn_v2(dl_models[mname], Xtr_s, epochs=50,
+                                       lr=1e-3, patience=10)
 
                 bs = 64 if mname == 'FusionNet' else 128
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
@@ -1120,14 +1122,17 @@ def main():
                 if mname in dl_base_names:
                     oof_dl[mname][te] = preds
 
-                dl_models[mname] = create_model(mname, n_snps,
-                                                  overrides=tuned_params.get(mname))
+                # Re-create fresh model for next fold with variant types
+                o = tuned_params.get(mname, {}) or {}
+                if mname in ('FGN v3', 'PreFGN'):
+                    o = dict(o, marker_types=vt_fold)
+                dl_models[mname] = create_model(mname, n_snps, overrides=o)
 
-            # ── ResFGN: Ridge + FGNv3 residual learning ──
+            # ── ResFGN: Ridge + FusionNet residual learning ──
             t0 = time.time()
             ridge, res_model = fit_resfgn_components(
                 Xtr_s, ytr, n_snps, cv=3,
-                fgn_overrides=tuned_params.get('FGN v3'))
+                fusion_overrides=tuned_params.get('FusionNet'))
             pred_te_ridge = ridge.predict(Xte_s)
             res_pred = predict_torch_model(res_model, Xte_s)
             final_pred = pred_te_ridge + res_pred
@@ -1206,8 +1211,10 @@ def main():
         if len(maf_full) >= n_snps:
             gidx_f = gwas_select(X_all[:, maf_full], y, n_snps)
             gidx_full = maf_full[gidx_f]
+            vt_full = vt_all[maf_full][gidx_f]
         else:
             gidx_full = gwas_select(X_all, y, n_snps)
+            vt_full = vt_all[gidx_full]
         X_full = X_all[:, gidx_full]
         sc_full = StandardScaler()
         X_full_s = sc_full.fit_transform(X_full).astype(np.float32)
@@ -1238,15 +1245,14 @@ def main():
 
         # DL models
         for mname in dl_base_names + ['FusionNet']:
-            tp = tuned_params.get(mname, {})
+            tp = tuned_params.get(mname, {}) or {}
+            if mname in ('FGN v3', 'PreFGN'):
+                tp = dict(tp, marker_types=vt_full)
             model = create_model(mname, n_snps, overrides=tp)
 
             if mname == 'PreFGN' and not QUICK_TEST:
-                pretrain_prefgn(model, X_full_s, epochs=50,
-                                lr=1e-3, mask_ratio=0.2, patience=10)
-            if mname == 'LD-GCN':
-                model.adj = LDGCN.build_adjacency(
-                    X_full_s, k=tp.get('k_neighbors', 15)).to(DEVICE)
+                pretrain_prefgn_v2(model, X_full_s, epochs=50,
+                                   lr=1e-3, patience=10)
 
             model = train_torch_model(
                 model, X_full_s, y,
@@ -1261,10 +1267,10 @@ def main():
         # ResFGN deployment
         ridge_full, res_model_full = fit_resfgn_components(
             X_full_s, y, n_snps, cv=5,
-            fgn_overrides=tuned_params.get('FGN v3'))
+            fusion_overrides=tuned_params.get('FusionNet'))
         pickle.dump(ridge_full, open(deploy_dir / "ResFGN_ridge.pkl", 'wb'))
-        torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fgn.pt")
-        print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fgn.pt")
+        torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fusion.pt")
+        print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fusion.pt")
 
         # Stacking meta-learners
         X_meta_dl = np.column_stack([oof_dl[m] for m in dl_base_names])
@@ -1330,7 +1336,7 @@ def main():
             'FGN': '#FFB74D', 'EFM': '#FFD54F', 'MICNN': '#FF8A65',
             'FGN v2': '#F57C00', 'EFM v2': '#FBC02D', 'MICNN v2': '#E64A19',
             'FGN v3': '#BF360C', 'EFM v3': '#F9A825',
-            'PreFGN': '#00BCD4', 'LD-GCN': '#009688',
+            'PreFGN': '#00BCD4',
             'FusionNet': '#E91E63',
             'Stacking (DL)': '#C62828', 'Stacking (All)': '#B71C1C',
             'Trad Ensemble': '#1565C0',
