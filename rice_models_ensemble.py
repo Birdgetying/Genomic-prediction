@@ -309,6 +309,72 @@ class EFMv2(nn.Module):
         return self.head(torch.cat([lo, fm, self.deep(x)], dim=1))
 
 
+class EFMv3(nn.Module):
+    """EFM v3: Sparse-gated FM + LayerNorm, k=4, top-50% SNP gate"""
+    def __init__(self, n_snps, k=4, hidden=64, dropout=0.35):
+        super().__init__()
+        self.linear = nn.Linear(n_snps, 1, bias=True)
+        self.V = nn.Parameter(torch.randn(n_snps, k) * 0.005)
+        self.fm_ln = nn.LayerNorm(k)
+        self.deep = nn.Sequential(
+            nn.Linear(n_snps, hidden*2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden*2, hidden), nn.GELU(), nn.Dropout(dropout))
+        self.head = nn.Sequential(
+            nn.Linear(1+k+hidden, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        lo = self.linear(x)
+        with torch.no_grad():
+            w = self.linear.weight.abs().squeeze()
+            thresh = torch.quantile(w, 0.5)
+            mask = (w >= thresh).float()
+        x_gated = x * mask.unsqueeze(0)
+        xv = x_gated.unsqueeze(2) * self.V.unsqueeze(0)
+        fm = 0.5 * (xv.sum(1).pow(2) - (xv.pow(2)).sum(1))
+        fm = self.fm_ln(fm)
+        return self.head(torch.cat([lo, fm, self.deep(x)], dim=1))
+
+
+class FGNv3(nn.Module):
+    """FGN v3: Freq SE + SNP gate + BN — adaptive spectral filtering, no wavelet"""
+    def __init__(self, n_snps, hidden=48, dropout=0.35):
+        super().__init__()
+        self.n_freq = n_snps // 2 + 1
+        self.bn = nn.BatchNorm1d(n_snps)
+        se_hidden = max(4, self.n_freq // 8)
+        self.freq_se = nn.Sequential(
+            nn.Linear(self.n_freq, se_hidden), nn.GELU(),
+            nn.Linear(se_hidden, self.n_freq), nn.Sigmoid())
+        self.freq_conv = nn.Sequential(
+            nn.Conv1d(1, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout*0.5),
+            nn.Conv1d(hidden, hidden, 5, padding=2), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout*0.5))
+        self.snp_gate = nn.Sequential(
+            nn.Linear(n_snps, 1), nn.Sigmoid())
+        self.time_conv = nn.Sequential(
+            nn.Conv1d(1, hidden//2, 21, padding=10), nn.BatchNorm1d(hidden//2), nn.GELU(),
+            nn.Dropout(dropout*0.5))
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        total = hidden + hidden//2
+        self.head = nn.Sequential(
+            nn.Linear(total, hidden*2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden*2, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x = self.bn(x)
+        xc = torch.fft.rfft(x, dim=1)
+        mag = xc.abs()
+        se_w = self.freq_se(mag.mean(dim=0, keepdim=True))
+        mag_w = mag * se_w
+        fp = self.pool(self.freq_conv(mag_w.unsqueeze(1))).squeeze(-1)
+        g = self.snp_gate(x)
+        tp = self.pool(self.time_conv((x * g).unsqueeze(1))).squeeze(-1)
+        return self.head(torch.cat([fp, tp], dim=1))
+
+
 class DilatedInceptionBlock(nn.Module):
     """带空洞卷积的Inception: k7(标准), k15(标准), k7d2(空洞), k7d4(空洞)"""
     def __init__(self, in_ch, out_ch, dropout=0.3):
@@ -562,6 +628,10 @@ def create_model(name, n_snps):
         return EFMv2(n_snps=n_snps, k=8, hidden=64, dropout=0.35, fm_do=0.1)
     if name == 'MICNN v2':
         return MICNNv2(n_snps=n_snps, hidden=40, dropout=0.35, spp_bins=(1, 2, 4))
+    if name == 'FGN v3':
+        return FGNv3(n_snps=n_snps, hidden=48, dropout=0.35)
+    if name == 'EFM v3':
+        return EFMv3(n_snps=n_snps, k=4, hidden=64, dropout=0.35)
     if name == 'FusionNet':
         return FusionNet(n_snps=n_snps, hidden_dim=48, dropout=0.35)
     raise ValueError(f"Unknown model: {name}")
@@ -621,9 +691,11 @@ def main():
     print(f"  Genotype: {G.shape}")
 
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
-    dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2']
+    dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2',
+                     'FGN v3', 'EFM v3']
+    extra_names = ['ResFGN']
     dl_names = dl_base_names + ['FusionNet']
-    all_names = trad_names + dl_names
+    all_names = trad_names + dl_names + extra_names
 
     traits_run = TRAITS[:1] if quick_test else TRAITS
     folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
@@ -733,6 +805,29 @@ def main():
 
                 dl_models[mname] = create_model(mname, n_snps)
 
+            # ── ResFGN: Ridge 捕获加性主效应, FGN v3 学残差 ──
+            if 'ResFGN' in extra_names:
+                t0 = time.time()
+                ridge = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=3)
+                ridge.fit(Xtr_s, ytr)
+                pred_tr_ridge = ridge.predict(Xtr_s)
+                residuals = ytr - pred_tr_ridge
+                res_model = FGNv3(n_snps=n_snps, hidden=48, dropout=0.35).to(DEVICE)
+                res_model = train_torch_model(
+                    res_model, Xtr_s, residuals,
+                    epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
+                res_pred = predict_torch_model(res_model, Xte_s)
+                pred_te_ridge = ridge.predict(Xte_s)
+                final_pred = pred_te_ridge + res_pred
+                elapsed = time.time() - t0
+                if fi == 0:
+                    results['ResFGN']['params'] = (n_snps + 1 +
+                        sum(p.numel() for p in res_model.parameters()))
+                results['ResFGN']['preds'].extend(final_pred.tolist())
+                results['ResFGN']['targets'].extend(yte.tolist())
+                results['ResFGN']['time'] += elapsed
+                print(f"    {'ResFGN':<16s} R2={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
+
         # ── 性状汇总 ──
         print(f"\n  {'-'*70}")
         print(f"  {trait} Final Results (5-fold CV):")
@@ -746,10 +841,15 @@ def main():
             r2_v = float(r2_score(t, p))
             corr_v = float(pearsonr(t, p)[0])
             rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            tag = " [Trad]" if mname in trad_names else " [DL]"
+            if mname in trad_names:
+                tag, mtype = " [Trad]", TYPE_TRAD
+            elif mname == 'ResFGN':
+                tag, mtype = " [Hybrid]", 'Hybrid'
+            else:
+                tag, mtype = " [DL]", TYPE_DL
             trait_res[mname] = {
                 'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                'Type': TYPE_TRAD if mname in trad_names else TYPE_DL,
+                'Type': mtype,
                 'Time': results[mname]['time']/folds_run}
             print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} {rmse_v:8.4f} "
                   f"{results[mname]['time']/folds_run:7.1f}s")
@@ -832,6 +932,20 @@ def main():
                 epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
             torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
             print(f"    [saved] {mname}.pt")
+
+        # ResFGN deployment: Ridge + FGNv3 on residuals
+        if 'ResFGN' in extra_names:
+            ridge_full = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+            ridge_full.fit(X_full_s, y)
+            pred_full = ridge_full.predict(X_full_s)
+            residuals_full = y - pred_full
+            res_model_full = FGNv3(n_snps=n_snps, hidden=48, dropout=0.35).to(DEVICE)
+            res_model_full = train_torch_model(
+                res_model_full, X_full_s, residuals_full,
+                epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
+            pickle.dump(ridge_full, open(deploy_dir / "ResFGN_ridge.pkl", 'wb'))
+            torch.save(res_model_full.state_dict(), deploy_dir / "ResFGN_fgn.pt")
+            print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fgn.pt")
 
         # Stacking meta-learners
         X_meta_dl = np.column_stack([oof_dl[m] for m in dl_base_names])
