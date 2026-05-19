@@ -1298,20 +1298,26 @@ RICE_TRAITS = ['Heading_date', 'Plant_height', 'Num_panicles', 'Num_effective_pa
 
 
 def load_rice_data():
-    """Load pre-processed rice data from RICE_DATA_DIR (results/rice_data/)."""
+    """Load pre-processed rice data from genotype_matrix.npz + trait_data.json."""
     print(f"\n{'='*70}\nRice Data Loading\n{'='*70}")
-    X = np.load(f"{RICE_DATA_DIR}/X_rice.npy").astype(np.float32)
-    print(f"  Genotype: {X.shape}")
+    data = np.load(RICE_DATA_DIR + "/genotype_matrix.npz", allow_pickle=True)
+    G = data['G']
+    print(f"  Genotype: {G.shape}")
+    with open(RICE_DATA_DIR + "/trait_data.json") as f:
+        trait_info = json.load(f)
     trait_data = {}
     for t in RICE_TRAITS:
-        fpath = f"{RICE_DATA_DIR}/y_{t}.npy"
-        if os.path.exists(fpath):
-            y = np.load(fpath).astype(np.float32)
-            mask = ~np.isnan(y)
-            trait_data[t] = (X[mask], y[mask])
-            print(f"  {t}: {mask.sum()} samples")
-        else: print(f"  {t}: SKIP (file not found)")
-    return trait_data if trait_data else {RICE_TRAITS[0]: (X, np.random.randn(len(X)).astype(np.float32))}
+        if t not in trait_info:
+            print(f"  {t}: SKIP (not in trait_data.json)")
+            continue
+        td = trait_info[t]
+        idxs = td['genotype_indices']
+        y = np.array(td['values']).astype(np.float32)
+        X_t = G[idxs]
+        mask = ~np.isnan(y)
+        trait_data[t] = (X_t[mask], y[mask])
+        print(f"  {t}: {mask.sum()} samples")
+    return trait_data
 
 
 def run_rice(quick_test=True):
@@ -1449,7 +1455,7 @@ def load_iranian_data(max_markers=None):
         for _ in range(8): f.readline()
         header_line = f.readline().strip().split(',')
     sample_ids = [str(c).strip() for c in header_line[N_META:] if c.strip() and c.strip() != '*']
-    df_geno = pd.read_csv(MAIZE_DATA_DIR + "/Iranian_Samples.csv", skiprows=9, header=None, nrows=nrows, low_memory=False)
+    df_geno = pd.read_csv(MAIZE_DATA_DIR + "/Iranian_Samples.csv", skiprows=8, header=None, nrows=nrows, low_memory=False)
     X_raw = df_geno.iloc[:, N_META:].values.T; del df_geno
     X_num = np.select([X_raw == '0', X_raw == '1', X_raw == '2'], [0.0, 1.0, 2.0], default=np.nan).astype(np.float32)
     del X_raw
