@@ -869,6 +869,79 @@ def stacking_evaluate(oof_preds_dict, targets, n_folds=5):
             'Base_models': base_names}
 
 
+def deploy_models(X, y, vt, n_snps, trait_name, output_dir, tuned_params, quick_test=False):
+    """Fit all models on full data and save to disk for later inference."""
+    import pickle
+    deploy_dir = output_dir / f"deployed_{trait_name}"
+    if deploy_dir.exists(): import shutil; shutil.rmtree(str(deploy_dir))
+    deploy_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n  Deploying models on full dataset ({len(y)} samples) ...")
+
+    # GWAS selection + scaling
+    gidx = gwas_select(X, y, n_snps)
+    X_f = X[:, gidx]; vt_f = vt[gidx] if vt is not None else None
+    sc_gwas = StandardScaler(); X_f_s = sc_gwas.fit_transform(X_f).astype(np.float32)
+
+    # Traditional models — fit on full data
+    G_full = X_f_s @ X_f_s.T / n_snps
+    trad_models = {'RRBLUP': (RRBLUP(), X_f_s),
+                   'GBLUP': (GBLUP(), G_full),
+                   'XGBoost': (XGBoostModel(n_estimators=300), X_f_s),
+                   'ElasticNet': (ElasticNetModel(), X_f_s),
+                   'GWAS_RRBLUP': (GWASWeightedRRBLUP(), X_f_s)}
+    for tname, (tm, X_in) in trad_models.items():
+        if tname == 'GBLUP': tm.fit(X_in, y)
+        else: tm.fit(X_in, y)
+        with open(deploy_dir / f"{tname}.pkl", 'wb') as f: pickle.dump(tm, f)
+        print(f"    [saved] {tname}.pkl")
+
+    # DL models + scaler
+    sc_dl = sc_gwas; X_dl_s = X_f_s
+    if vt_f is not None:
+        gidx_dl = gidx; sc_dl = StandardScaler(); X_dl_s = sc_dl.fit_transform(X[:, gidx_dl]).astype(np.float32)
+    with open(deploy_dir / "scaler_gwas.pkl", 'wb') as f: pickle.dump(sc_gwas, f)
+    if vt_f is not None:  # wheat has separate DL scaler
+        with open(deploy_dir / "scaler_dl.pkl", 'wb') as f: pickle.dump(sc_dl, f)
+
+    for mname in DL_NAMES:
+        tp = tuned_params.get(mname, {}) if tuned_params else {}
+        if vt_f is not None and mname in MARKER_TYPE_MODELS:
+            model = create_model(mname, n_snps, overrides=dict(tp, marker_types=vt_f))
+        else:
+            model = create_model(mname, n_snps, overrides=tp)
+        if mname == 'PreFGN' and not quick_test:
+            pretrain_prefgn_v2(model, X_dl_s, epochs=50, lr=1e-3, patience=10)
+        if mname == 'DeepKernelGP':
+            model = train_dkgp(model, X_dl_s, y, epochs=tp.get('epochs', 200),
+                               lr=tp.get('lr', 5e-3), patience=tp.get('patience', 15), verbose=False)
+            model.fit(torch.FloatTensor(X_dl_s), torch.FloatTensor(y))
+        else:
+            bs = 64 if mname == 'FusionNet' else 128
+            lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+            wd = tp.get('weight_decay', 1e-3); pat = tp.get('patience', 30)
+            model = train_torch_model(model, X_dl_s, y, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+        torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
+        print(f"    [saved] {mname}.pt")
+
+    # ResFGN
+    ridge, res_model = fit_resfgn_components(X_dl_s, y, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet') if tuned_params else None)
+    with open(deploy_dir / "ResFGN_ridge.pkl", 'wb') as f: pickle.dump(ridge, f)
+    torch.save(res_model.state_dict(), deploy_dir / "ResFGN_fusion.pt")
+    print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fusion.pt")
+
+    # Stacking meta-learners — fit on OOF (approximation: fit on full data, save)
+    meta_all = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+    meta_trad = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+    with open(deploy_dir / "Stacking_meta_all.pkl", 'wb') as f: pickle.dump(meta_all, f)
+    with open(deploy_dir / "Stacking_meta_trad.pkl", 'wb') as f: pickle.dump(meta_trad, f)
+
+    # Deployment metadata
+    meta = {'trait': trait_name, 'n_snps': n_snps, 'gwas_indices': gidx.tolist(),
+            'n_samples': len(y), 'models': list(trad_models.keys()) + DL_NAMES + ['ResFGN']}
+    with open(deploy_dir / "deployment_meta.json", 'w') as f: json.dump(meta, f, indent=2)
+    print(f"    [saved] Stacking meta-learners, scalers, deployment_meta")
+
+
 def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
     try: import optuna
     except ImportError: print(f"    [SKIP] Optuna not installed, using defaults"); return {}, 0.0
@@ -975,11 +1048,14 @@ def load_wheat_data():
         try:
             vcf = cyvcf2.VCF(vpath)
             n_vcf = len(vcf.samples); actual_n = min(min_samples, n_vcf)
-            genotypes = []
+            genotypes = []; variant_count = 0
             for variant in vcf:
                 gt = variant.gt_types
                 if len(gt) >= actual_n:
-                    genotypes.append(np.clip(gt[:actual_n], 0, 2).astype(np.int8))
+                    gt_arr = np.where(gt[:actual_n] == 3, 0, np.clip(gt[:actual_n], 0, 2)).astype(np.int8)
+                    genotypes.append(gt_arr)
+                    variant_count += 1
+                    if variant_count >= WHEAT_MAX_VARIANTS_PER_TYPE: break
             X_v = np.array(genotypes, dtype=np.float32).T
             X_parts.append(X_v)
             variant_type_ids.append(np.full(X_v.shape[1], vtype_id, dtype=np.int32))
@@ -1061,33 +1137,38 @@ def run_wheat(quick_test=True):
             if len(maf_idx) >= n_snps: Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]; vt_maf = vt_all[maf_idx]
             else: vt_maf = vt_all
 
-            # GWAS selection (shared by trad and DL when MARKER_SELECTOR='gwas')
-            if MARKER_SELECTOR == 'haplotype':
-                gidx_dl = haplotype_select(Xtr_raw, ytr, n_snps, vt_maf)
-            elif MARKER_SELECTOR == 'hybrid':
-                gidx_dl = hybrid_select(Xtr_raw, ytr, n_snps, vt_maf, gwas_frac=HAPLO_GWAS_FRAC)
-            else:
-                gidx_dl = gwas_select(Xtr_raw, ytr, n_snps)
-
-            Xtr_gwas = Xtr_raw[:, gidx_dl]; Xte_gwas = Xte_raw[:, gidx_dl]
-            vt_dl = vt_maf[gidx_dl]
-
-            sc_gwas = StandardScaler(); Xtr_gwas_s = sc_gwas.fit_transform(Xtr_gwas).astype(np.float32)
-            Xte_gwas_s = sc_gwas.transform(Xte_gwas).astype(np.float32)
-            G_fold_train = Xtr_gwas_s @ Xtr_gwas_s.T / n_snps
-            G_fold_te_tr = Xte_gwas_s @ Xtr_gwas_s.T / n_snps
+            # Traditional models: ALWAYS use GWAS markers
+            gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr_trad = Xtr_raw[:, gidx_gwas]; Xte_trad = Xte_raw[:, gidx_gwas]
+            sc_trad = StandardScaler(); Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
+            Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
+            G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps
+            G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
 
             trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr))
             for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
                 t0 = time.time(); tmodel = build_fn()
-                fit_fn(tmodel, Xtr_gwas_s, ytr)
-                preds = pred_fn(tmodel, Xte_gwas_s)
+                fit_fn(tmodel, Xtr_trad_s, ytr)
+                preds = pred_fn(tmodel, Xte_trad_s)
                 results[tname]['preds'].extend(preds.tolist())
                 results[tname]['targets'].extend(yte.tolist())
                 results[tname]['time'] += time.time() - t0
                 if fi == 0: results[tname]['params'] = param_count
                 oof_trad[tname][te] = preds
                 print(f"    {tname:<16s} R²={r2_score(yte, preds):+.4f}")
+
+            # DL markers: configurable via MARKER_SELECTOR
+            if MARKER_SELECTOR == 'haplotype':
+                gidx_dl = haplotype_select(Xtr_raw, ytr, n_snps, vt_maf)
+            elif MARKER_SELECTOR == 'hybrid':
+                gidx_dl = hybrid_select(Xtr_raw, ytr, n_snps, vt_maf, gwas_frac=HAPLO_GWAS_FRAC)
+            else:
+                gidx_dl = gidx_gwas  # reuse GWAS selection
+
+            Xtr_dl = Xtr_raw[:, gidx_dl]; Xte_dl = Xte_raw[:, gidx_dl]
+            vt_dl = vt_maf[gidx_dl]
+            sc_dl = StandardScaler(); Xtr_dl_s = sc_dl.fit_transform(Xtr_dl).astype(np.float32)
+            Xte_dl_s = sc_dl.transform(Xte_dl).astype(np.float32)
 
             # DL models
             for mi, mname in enumerate(DL_NAMES):
@@ -1097,19 +1178,19 @@ def run_wheat(quick_test=True):
                 if fi == 0: results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
                 t0 = time.time()
                 if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn_v2(dl_models[mname], Xtr_gwas_s, epochs=50, lr=1e-3, patience=10)
+                    pretrain_prefgn_v2(dl_models[mname], Xtr_dl_s, epochs=50, lr=1e-3, patience=10)
                 if mname == 'DeepKernelGP':
-                    model = train_dkgp(dl_models[mname], Xtr_gwas_s, ytr, epochs=tp.get('epochs', 200),
+                    model = train_dkgp(dl_models[mname], Xtr_dl_s, ytr, epochs=tp.get('epochs', 200),
                                        lr=tp.get('lr', 5e-3), patience=tp.get('patience', 15), verbose=False)
-                    model.fit(torch.FloatTensor(Xtr_gwas_s), torch.FloatTensor(ytr))
-                    mean, _ = model.predict(torch.FloatTensor(Xte_gwas_s)); preds = mean.cpu().numpy()
+                    model.fit(torch.FloatTensor(Xtr_dl_s), torch.FloatTensor(ytr))
+                    mean, _ = model.predict(torch.FloatTensor(Xte_dl_s)); preds = mean.cpu().numpy()
                 else:
                     bs = 64 if mname == 'FusionNet' else 128
                     lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                     wd = tp.get('weight_decay', 1e-3); pat = tp.get('patience', 30)
-                    model = train_torch_model(dl_models[mname], Xtr_gwas_s, ytr, epochs=300,
+                    model = train_torch_model(dl_models[mname], Xtr_dl_s, ytr, epochs=300,
                                               batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                    preds = predict_torch_model(model, Xte_gwas_s)
+                    preds = predict_torch_model(model, Xte_dl_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist())
                 results[mname]['targets'].extend(yte.tolist())
@@ -1121,9 +1202,9 @@ def run_wheat(quick_test=True):
 
             # ResFGN
             t0 = time.time()
-            ridge, res_model = fit_resfgn_components(Xtr_gwas_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
-            pred_te_ridge = ridge.predict(Xte_gwas_s)
-            res_pred = predict_torch_model(res_model, Xte_gwas_s)
+            ridge, res_model = fit_resfgn_components(Xtr_dl_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
+            pred_te_ridge = ridge.predict(Xte_dl_s)
+            res_pred = predict_torch_model(res_model, Xte_dl_s)
             final_pred = pred_te_ridge + res_pred
             elapsed = time.time() - t0
             if fi == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
@@ -1149,29 +1230,56 @@ def run_wheat(quick_test=True):
         # Stacking
         if folds_run >= 3:
             sr_dl = stacking_evaluate(oof_dl, y, n_folds=min(5, folds_run))
-            trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
+                                          'RMSE': 0.0, 'Type': TYPE_ENS,
+                                          'Meta_weights': sr_dl.get('Meta_weights', []),
+                                          'Base_models': sr_dl.get('Base_models', [])}
             print(f"  {'Stacking (DL)':<24s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f}")
             oof_all = {**oof_trad, **oof_dl}
             sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
-            trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
+                                           'RMSE': 0.0, 'Type': TYPE_ENS,
+                                           'Meta_weights': sr_all.get('Meta_weights', []),
+                                           'Base_models': sr_all.get('Base_models', [])}
+            weights_str = dict(zip(sr_all['Base_models'], [f'{w:.3f}' for w in sr_all['Meta_weights']]))
             print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
+            print(f"    All weights: {weights_str}")
             tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)))
-            trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'],
+                                          'RMSE': 0.0, 'Type': TYPE_ENS,
+                                          'Meta_weights': tsr.get('Meta_weights', []),
+                                          'Base_models': tsr.get('Base_models', [])}
             print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
         all_results[trait] = trait_res
+        # Intermediate save
+        with open(output_dir / "ensemble_intermediate.json", 'w') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        # Deploy models on full data
+        if not quick_test:
+            deploy_models(X_all, y, vt_all, n_snps, trait, output_dir, tuned_params, quick_test)
 
     # Final summary
     if not quick_test:
         print(f"\n{'='*80}\nOVERALL SUMMARY\n{'='*80}")
         eval_models = list(all_results[traits_run[0]].keys())
+        print(f"\n  {'Model':<25s} {'Type':>12s} {'Mean R2':>8s} {'Mean Corr':>10s} {'Best':>8s} {'Worst':>8s}")
+        print(f"  {'-'*80}")
         summ = {m: {'R2': [], 'Corr': []} for m in eval_models}
         for t in traits_run:
             for m in eval_models:
-                if m in all_results[t]: summ[m]['R2'].append(all_results[t][m]['R2']); summ[m]['Corr'].append(all_results[t][m].get('Correlation', 0))
+                if m in all_results[t]:
+                    summ[m]['R2'].append(all_results[t][m]['R2'])
+                    summ[m]['Corr'].append(all_results[t][m].get('Correlation', 0))
         ranked = sorted([(m, np.mean(summ[m]['R2'])) for m in eval_models], key=lambda x: x[1], reverse=True)
+        for m, _ in ranked:
+            mean_r2 = np.mean(summ[m]['R2']); mean_corr = np.mean(summ[m]['Corr'])
+            best = max(summ[m]['R2']); worst = min(summ[m]['R2'])
+            mtype = all_results[traits_run[0]][m].get('Type', '')
+            print(f"  {m:<25s} {mtype:>12s} {mean_r2:8.4f} {mean_corr:10.4f} {best:8.4f} {worst:8.4f}")
+        print(f"\n  Ranking:")
         for i, (m, r) in enumerate(ranked, 1):
             marker = " <-- BEST" if i == 1 else ""
-            print(f"  {i:2d}. {m:<22s} {r:.4f}{marker}")
+            print(f"  {i:2d}. [{all_results[traits_run[0]][m].get('Type', ''):>12s}] {m:<22s} {r:.4f}{marker}")
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         with open(output_dir / f"ensemble_final_{ts}.json", 'w') as f: json.dump(all_results, f, indent=2, ensure_ascii=False)
         print(f"\nResults saved to: {output_dir}")
@@ -1252,37 +1360,48 @@ def run_rice(quick_test=True):
             Xtr_raw, Xte_raw = X_all[tr], X_all[te]; ytr, yte = y[tr], y[te]
             maf_idx = maf_filter(Xtr_raw)
             if len(maf_idx) >= n_snps: Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]
-            gidx = gwas_select(Xtr_raw, ytr, n_snps) if MARKER_SELECTOR == 'gwas' else haplotype_select(Xtr_raw, ytr, n_snps)
-            Xtr, Xte = Xtr_raw[:, gidx], Xte_raw[:, gidx]
-            sc = StandardScaler(); Xtr_s = sc.fit_transform(Xtr).astype(np.float32); Xte_s = sc.transform(Xte).astype(np.float32)
-
-            G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
+            gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr_trad = Xtr_raw[:, gidx_gwas]; Xte_trad = Xte_raw[:, gidx_gwas]
+            sc_trad = StandardScaler(); Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
+            Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
+            G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps; G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
 
             trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr))
             for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
-                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
-                preds = pred_fn(tmodel, Xte_s)
+                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_trad_s, ytr)
+                preds = pred_fn(tmodel, Xte_trad_s)
                 results[tname]['preds'].extend(preds.tolist()); results[tname]['targets'].extend(yte.tolist())
                 results[tname]['time'] += time.time() - t0
                 if fi == 0: results[tname]['params'] = param_count
                 oof_trad[tname][te] = preds
                 print(f"    {tname:<16s} R²={r2_score(yte, preds):+.4f}")
 
+            # DL marker selection (configurable)
+            if MARKER_SELECTOR == 'haplotype':
+                gidx_dl = haplotype_select(Xtr_raw, ytr, n_snps)
+            elif MARKER_SELECTOR == 'hybrid':
+                gidx_dl = hybrid_select(Xtr_raw, ytr, n_snps, gwas_frac=HAPLO_GWAS_FRAC)
+            else:
+                gidx_dl = gidx_gwas
+            Xtr_dl = Xtr_raw[:, gidx_dl]; Xte_dl = Xte_raw[:, gidx_dl]
+            sc_dl = StandardScaler(); Xtr_dl_s = sc_dl.fit_transform(Xtr_dl).astype(np.float32)
+            Xte_dl_s = sc_dl.transform(Xte_dl).astype(np.float32)
+
             for mi, mname in enumerate(DL_NAMES):
                 if fi == 0: results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
                 t0 = time.time(); tp = tuned_params.get(mname, {})
                 if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn_v2(dl_models[mname], Xtr_s, epochs=50, lr=1e-3, patience=10)
+                    pretrain_prefgn_v2(dl_models[mname], Xtr_dl_s, epochs=50, lr=1e-3, patience=10)
                 if mname == 'DeepKernelGP':
-                    model = train_dkgp(dl_models[mname], Xtr_s, ytr, epochs=tp.get('epochs', 200),
+                    model = train_dkgp(dl_models[mname], Xtr_dl_s, ytr, epochs=tp.get('epochs', 200),
                                        lr=tp.get('lr', 5e-3), patience=tp.get('patience', 15), verbose=False)
-                    model.fit(torch.FloatTensor(Xtr_s), torch.FloatTensor(ytr))
-                    mean, _ = model.predict(torch.FloatTensor(Xte_s)); preds = mean.cpu().numpy()
+                    model.fit(torch.FloatTensor(Xtr_dl_s), torch.FloatTensor(ytr))
+                    mean, _ = model.predict(torch.FloatTensor(Xte_dl_s)); preds = mean.cpu().numpy()
                 else:
                     bs = 64 if mname == 'FusionNet' else 128
                     lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3); wd = tp.get('weight_decay', 1e-3); pat = tp.get('patience', 30)
-                    model = train_torch_model(dl_models[mname], Xtr_s, ytr, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                    preds = predict_torch_model(model, Xte_s)
+                    model = train_torch_model(dl_models[mname], Xtr_dl_s, ytr, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+                    preds = predict_torch_model(model, Xte_dl_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
                 print(f"    {mname:<16s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
@@ -1291,8 +1410,8 @@ def run_rice(quick_test=True):
 
             # ResFGN
             t0 = time.time()
-            ridge, res_model = fit_resfgn_components(Xtr_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
-            pred_te_ridge = ridge.predict(Xte_s); res_pred = predict_torch_model(res_model, Xte_s)
+            ridge, res_model = fit_resfgn_components(Xtr_dl_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
+            pred_te_ridge = ridge.predict(Xte_dl_s); res_pred = predict_torch_model(res_model, Xte_dl_s)
             final_pred = pred_te_ridge + res_pred; elapsed = time.time() - t0
             if fi == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
             results['ResFGN']['preds'].extend(final_pred.tolist()); results['ResFGN']['targets'].extend(yte.tolist()); results['ResFGN']['time'] += elapsed
@@ -1312,22 +1431,49 @@ def run_rice(quick_test=True):
             print(f"  {mname:<20s} R²={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
         if folds_run >= 3:
             sr_dl = stacking_evaluate(oof_dl, y, n_folds=min(5, folds_run))
-            trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
+                                          'RMSE': 0.0, 'Type': TYPE_ENS,
+                                          'Meta_weights': sr_dl.get('Meta_weights', []),
+                                          'Base_models': sr_dl.get('Base_models', [])}
             oof_all = {**oof_trad, **oof_dl}; sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
-            trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
+                                           'RMSE': 0.0, 'Type': TYPE_ENS,
+                                           'Meta_weights': sr_all.get('Meta_weights', []),
+                                           'Base_models': sr_all.get('Base_models', [])}
+            weights_str = dict(zip(sr_all['Base_models'], [f'{w:.3f}' for w in sr_all['Meta_weights']]))
+            print(f"    All weights: {weights_str}")
             tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)))
-            trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'],
+                                          'RMSE': 0.0, 'Type': TYPE_ENS,
+                                          'Meta_weights': tsr.get('Meta_weights', []),
+                                          'Base_models': tsr.get('Base_models', [])}
         all_results[trait] = trait_res
+        with open(output_dir / "ensemble_intermediate.json", 'w') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        if not quick_test:
+            deploy_models(X_all, y, None, n_snps, trait, output_dir, tuned_params, quick_test)
 
     if not quick_test:
         print(f"\n{'='*80}\nOVERALL SUMMARY\n{'='*80}")
         eval_models = list(all_results[traits_run[0]].keys())
-        summ = {m: [] for m in eval_models}
+        print(f"\n  {'Model':<25s} {'Type':>12s} {'Mean R2':>8s} {'Mean Corr':>10s} {'Best':>8s} {'Worst':>8s}")
+        print(f"  {'-'*80}")
+        summ = {m: {'R2': [], 'Corr': []} for m in eval_models}
         for t in traits_run:
             for m in eval_models:
-                if m in all_results[t]: summ[m].append(all_results[t][m]['R2'])
-        ranked = sorted([(m, np.mean(summ[m])) for m in eval_models], key=lambda x: x[1], reverse=True)
-        for i, (m, r) in enumerate(ranked, 1): print(f"  {i:2d}. {m:<22s} {r:.4f}{' <-- BEST' if i==1 else ''}")
+                if m in all_results[t]:
+                    summ[m]['R2'].append(all_results[t][m]['R2'])
+                    summ[m]['Corr'].append(all_results[t][m].get('Correlation', 0))
+        ranked = sorted([(m, np.mean(summ[m]['R2'])) for m in eval_models], key=lambda x: x[1], reverse=True)
+        for m, _ in ranked:
+            mean_r2 = np.mean(summ[m]['R2']); mean_corr = np.mean(summ[m]['Corr'])
+            best = max(summ[m]['R2']); worst = min(summ[m]['R2'])
+            mtype = all_results[traits_run[0]][m].get('Type', '')
+            print(f"  {m:<25s} {mtype:>12s} {mean_r2:8.4f} {mean_corr:10.4f} {best:8.4f} {worst:8.4f}")
+        print(f"\n  Ranking:")
+        for i, (m, r) in enumerate(ranked, 1):
+            marker = " <-- BEST" if i == 1 else ""
+            print(f"  {i:2d}. [{all_results[traits_run[0]][m].get('Type', ''):>12s}] {m:<22s} {r:.4f}{marker}")
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         with open(output_dir / f"ensemble_final_{ts}.json", 'w') as f: json.dump(all_results, f, indent=2, ensure_ascii=False)
         print(f"\nRice Done! Total: {(time.time()-total_t0)/60:.1f} min")
@@ -1474,15 +1620,49 @@ def run_maize(quick_test=True):
             print(f"  {mname:<20s} R²={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
         if folds_run >= 3:
             sr_dl = stacking_evaluate(oof_dl, y, n_folds=min(5, folds_run))
-            trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
+                                          'RMSE': 0.0, 'Type': TYPE_ENS,
+                                          'Meta_weights': sr_dl.get('Meta_weights', []),
+                                          'Base_models': sr_dl.get('Base_models', [])}
             oof_all = {**oof_trad, **oof_dl}; sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
-            trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
+                                           'RMSE': 0.0, 'Type': TYPE_ENS,
+                                           'Meta_weights': sr_all.get('Meta_weights', []),
+                                           'Base_models': sr_all.get('Base_models', [])}
+            weights_str = dict(zip(sr_all['Base_models'], [f'{w:.3f}' for w in sr_all['Meta_weights']]))
+            print(f"    All weights: {weights_str}")
             tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)))
-            trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
+            trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'],
+                                          'RMSE': 0.0, 'Type': TYPE_ENS,
+                                          'Meta_weights': tsr.get('Meta_weights', []),
+                                          'Base_models': tsr.get('Base_models', [])}
         all_results[trait] = trait_res
+        with open(output_dir / "ensemble_intermediate.json", 'w') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        if not quick_test:
+            deploy_models(X_all, y, None, n_snps, trait, output_dir, None, quick_test)
 
     if not quick_test:
         print(f"\n{'='*80}\nOVERALL SUMMARY\n{'='*80}")
+        eval_models = list(all_results[traits_run[0]].keys())
+        print(f"\n  {'Model':<25s} {'Type':>12s} {'Mean R2':>8s} {'Mean Corr':>10s} {'Best':>8s} {'Worst':>8s}")
+        print(f"  {'-'*80}")
+        summ = {m: {'R2': [], 'Corr': []} for m in eval_models}
+        for t in traits_run:
+            for m in eval_models:
+                if m in all_results[t]:
+                    summ[m]['R2'].append(all_results[t][m]['R2'])
+                    summ[m]['Corr'].append(all_results[t][m].get('Correlation', 0))
+        ranked = sorted([(m, np.mean(summ[m]['R2'])) for m in eval_models], key=lambda x: x[1], reverse=True)
+        for m, _ in ranked:
+            mean_r2 = np.mean(summ[m]['R2']); mean_corr = np.mean(summ[m]['Corr'])
+            best = max(summ[m]['R2']); worst = min(summ[m]['R2'])
+            mtype = all_results[traits_run[0]][m].get('Type', '')
+            print(f"  {m:<25s} {mtype:>12s} {mean_r2:8.4f} {mean_corr:10.4f} {best:8.4f} {worst:8.4f}")
+        print(f"\n  Ranking:")
+        for i, (m, r) in enumerate(ranked, 1):
+            marker = " <-- BEST" if i == 1 else ""
+            print(f"  {i:2d}. [{all_results[traits_run[0]][m].get('Type', ''):>12s}] {m:<22s} {r:.4f}{marker}")
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         with open(output_dir / f"ensemble_final_{ts}.json", 'w') as f: json.dump(all_results, f, indent=2, ensure_ascii=False)
         print(f"\nMaize Done! Total: {(time.time()-total_t0)/60:.1f} min")
