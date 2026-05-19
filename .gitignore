@@ -12,3 +12,9 @@
 !rice_models_fast.py
 !wheat_models_ensemble.py
 !submit_wheat_ensemble.jsub
+!plot_wheat_results.py
+!maize_models_ensemble.py
+!submit_all_ensemble.jsub
+!deep_kernel_gp.py
+!haplotype_scoring.py
+!genomic_nn_models.py

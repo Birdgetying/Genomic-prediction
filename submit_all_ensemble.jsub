@@ -1,0 +1,151 @@
+#!/bin/bash
+# ============================================================================
+# 全基因组预测集成系统 — 小麦 + 水稻 + 玉米 超算 GPU 作业
+#
+# 使用: jsub < submit_all_ensemble.jsub
+# ============================================================================
+#JSUB -q gpu
+#JSUB -n 2
+#JSUB -gpgpu 1
+#JSUB -J all_ensemble
+#JSUB -o logs/all_ensemble_%J.out
+#JSUB -e logs/all_ensemble_%J.err
+
+echo "======================================================================"
+echo "All Ensemble System (Wheat + Rice + Maize) — Job started at $(date)"
+echo "======================================================================"
+
+module load pytorch-2.3.0_py311
+echo "Module loaded: pytorch-2.3.0_py311"
+
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+export CUDA_LAUNCH_BLOCKING=0
+
+# 工作目录
+cd $HOME/genomic_prediction 2>/dev/null || \
+cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+    echo "ERROR: Cannot find project directory"
+    exit 1
+}
+echo "Working directory: $(pwd)"
+
+# GPU 诊断
+echo ""
+echo "GPU Diagnostics:"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>&1 || echo "nvidia-smi not available"
+python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
+
+mkdir -p logs results/wheat_ensemble results/rice_ensemble results/maize_ensemble
+
+EXIT_CODE=0
+TOTAL_START=$(date +%s)
+
+# ============================================================================
+# 1. Wheat Ensemble
+# ============================================================================
+echo ""
+echo "======================================================================"
+echo "[1/3] WHEAT ENSEMBLE — $(date)"
+echo "======================================================================"
+
+DATA_BASE="/storage/public/home/2024110093/data/Variation/CSIAAS"
+MISSING=0
+for f in \
+    "Core819Samples_snp.filter.final.id_gt.813m.vcf.gz" \
+    "Core819Samples_indel.filter.final.id_gt.813m.vcf.gz" \
+    "SV.new.vcf.gz" \
+    "Phe.txt" \
+    "VCFID.txt"
+do
+    if [ -f "$DATA_BASE/$f" ]; then
+        echo "  [OK] $f"
+    else
+        echo "  [MISSING] $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Missing wheat data files, skipping"
+else
+    T0=$(date +%s)
+    python -u wheat_models_ensemble.py --full 2>&1 | tee "logs/wheat_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    WHEAT_EXIT=${PIPESTATUS[0]}
+    T1=$(date +%s)
+    echo "Wheat finished in $(((T1-T0)/60)) min, exit=$WHEAT_EXIT"
+    [ $WHEAT_EXIT -ne 0 ] && EXIT_CODE=$WHEAT_EXIT
+fi
+
+# ============================================================================
+# 2. Rice Ensemble
+# ============================================================================
+echo ""
+echo "======================================================================"
+echo "[2/3] RICE ENSEMBLE — $(date)"
+echo "======================================================================"
+
+MISSING=0
+for f in "results/rice_data/genotype_matrix.npz" "results/rice_data/trait_data.json"; do
+    if [ -f "$f" ]; then
+        echo "  [OK] $f"
+    else
+        echo "  [MISSING] $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Missing rice data files, skipping"
+else
+    T0=$(date +%s)
+    python -u rice_models_ensemble.py --full 2>&1 | tee "logs/rice_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    RICE_EXIT=${PIPESTATUS[0]}
+    T1=$(date +%s)
+    echo "Rice finished in $(((T1-T0)/60)) min, exit=$RICE_EXIT"
+    [ $RICE_EXIT -ne 0 ] && EXIT_CODE=$RICE_EXIT
+fi
+
+# ============================================================================
+# 3. Maize Ensemble (Iranian)
+# ============================================================================
+echo ""
+echo "======================================================================"
+echo "[3/3] MAIZE ENSEMBLE (Iranian) — $(date)"
+echo "======================================================================"
+
+MISSING=0
+for f in "data2/Iranian_Samples.csv" "data2/phenotype_iranian.csv"; do
+    if [ -f "$f" ]; then
+        SIZE=$(du -h "$f" | cut -f1)
+        echo "  [OK] $f ($SIZE)"
+    else
+        echo "  [MISSING] $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Missing maize data files, skipping"
+else
+    T0=$(date +%s)
+    python -u maize_models_ensemble.py --full 2>&1 | tee "logs/maize_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    MAIZE_EXIT=${PIPESTATUS[0]}
+    T1=$(date +%s)
+    echo "Maize finished in $(((T1-T0)/60)) min, exit=$MAIZE_EXIT"
+    [ $MAIZE_EXIT -ne 0 ] && EXIT_CODE=$MAIZE_EXIT
+fi
+
+# ============================================================================
+# Done
+# ============================================================================
+TOTAL_END=$(date +%s)
+echo ""
+echo "======================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "ALL SUCCESS — Total time: $(((TOTAL_END-TOTAL_START)/60)) min — $(date)"
+else
+    echo "SOME FAILURES (exit=$EXIT_CODE) — Total time: $(((TOTAL_END-TOTAL_START)/60)) min — $(date)"
+fi
+echo "======================================================================"
+exit $EXIT_CODE

@@ -62,7 +62,7 @@ N_FOLDS = 5
 GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
 MAX_VARIANTS_PER_TYPE = 15000  # 每种变异类型最多加载标记数
-MARKER_SELECTOR = 'hybrid'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
+MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
 HAPLO_GWAS_FRAC = 0.6     # hybrid 模式下 GWAS 标记占比
 
 # GPU
@@ -773,14 +773,10 @@ def create_model(name, n_snps, overrides=None):
     o = overrides or {}
     if name == 'FGN':
         return FourierGenomicNet(n_snps=n_snps, hidden=64, dropout=0.35)
-    if name == 'EFM':
-        return EpistaticFM(n_snps=n_snps, k=8, hidden=64, dropout=0.35)
     if name == 'MICNN':
         return MultiScaleInceptionCNN(n_snps=n_snps, hidden=48, dropout=0.35)
     if name == 'FGN v2':
         return FGNv2(n_snps=n_snps, hidden=64, dropout=0.35)
-    if name == 'EFM v2':
-        return EFMv2(n_snps=n_snps, k=8, hidden=64, dropout=0.35, fm_do=0.1)
     if name == 'MICNN v2':
         return MICNNv2(n_snps=n_snps, hidden=40, dropout=0.35, spp_bins=(1, 2, 4))
     if name == 'FGN v3':
@@ -997,7 +993,7 @@ def main():
     print(f"\n实验性状: {trait_names}")
 
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
-    dl_base_names = ['FGN', 'EFM', 'MICNN', 'FGN v2', 'EFM v2', 'MICNN v2',
+    dl_base_names = ['FGN', 'MICNN', 'FGN v2', 'MICNN v2',
                      'FGN v3', 'EFM v3', 'PreFGN', 'DeepKernelGP']
     MARKER_TYPE_MODELS = {'FGN v3', 'PreFGN'}
     dl_ensemble_names = ['FusionNet']
