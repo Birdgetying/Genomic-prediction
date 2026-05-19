@@ -20,3 +20,4 @@
 !haplotype_scoring.py
 !genomic_nn_models.py
 !upload_to_hpc.sh
+!genomic_ensemble.py

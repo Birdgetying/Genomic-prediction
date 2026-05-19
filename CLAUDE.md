@@ -89,23 +89,6 @@ python haplotype_phenotype_analysis.py
 | `Variation/CSIAAS/` | VCF files (SNP, INDEL, SV) from cattle |
 | `data/` | Simulated genomic data for algorithm testing |
 
-## HPC 代码上传
-
-修改代码后, 使用 `upload_to_hpc.sh` 一键上传到景行超算平台:
-
-```
-bash upload_to_hpc.sh              # 上传所有 git 追踪文件
-bash upload_to_hpc.sh --dry-run    # 仅预览, 不实际传输
-```
-
-- 上传列表自动从 `git ls-files` 获取 (即 `.gitignore` 白名单)
-- 自动排除 `.gitignore`、`CLAUDE.md`、`upload_to_hpc.sh` 三个本地专用文件
-- 首次使用需修改脚本顶部 `SERVER` 变量为景行平台实际地址
-- **新建文件后必须**:
-  1. 在 `.gitignore` 添加 `!新文件名` 白名单条目
-  2. `git add` + `git commit` 使其被 git 追踪
-  3. 然后 `bash upload_to_hpc.sh` 即可自动包含新文件
-
 ## HPC Job Submission
 
 作业提交到景行平台 (PBS/Torque):

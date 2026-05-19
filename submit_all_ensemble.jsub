@@ -70,7 +70,7 @@ if [ $MISSING -eq 1 ]; then
     echo "ERROR: Missing wheat data files, skipping"
 else
     T0=$(date +%s)
-    python -u wheat_models_ensemble.py --full 2>&1 | tee "logs/wheat_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    python -u genomic_ensemble.py wheat --full 2>&1 | tee "logs/wheat_ensemble_$(date +%Y%m%d_%H%M%S).log"
     WHEAT_EXIT=${PIPESTATUS[0]}
     T1=$(date +%s)
     echo "Wheat finished in $(((T1-T0)/60)) min, exit=$WHEAT_EXIT"
@@ -99,7 +99,7 @@ if [ $MISSING -eq 1 ]; then
     echo "ERROR: Missing rice data files, skipping"
 else
     T0=$(date +%s)
-    python -u rice_models_ensemble.py --full 2>&1 | tee "logs/rice_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    python -u genomic_ensemble.py rice --full 2>&1 | tee "logs/rice_ensemble_$(date +%Y%m%d_%H%M%S).log"
     RICE_EXIT=${PIPESTATUS[0]}
     T1=$(date +%s)
     echo "Rice finished in $(((T1-T0)/60)) min, exit=$RICE_EXIT"
@@ -129,7 +129,7 @@ if [ $MISSING -eq 1 ]; then
     echo "ERROR: Missing maize data files, skipping"
 else
     T0=$(date +%s)
-    python -u maize_models_ensemble.py --full 2>&1 | tee "logs/maize_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    python -u genomic_ensemble.py maize --full 2>&1 | tee "logs/maize_ensemble_$(date +%Y%m%d_%H%M%S).log"
     MAIZE_EXIT=${PIPESTATUS[0]}
     T1=$(date +%s)
     echo "Maize finished in $(((T1-T0)/60)) min, exit=$MAIZE_EXIT"
