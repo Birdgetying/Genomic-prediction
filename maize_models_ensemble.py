@@ -80,23 +80,6 @@ class FourierGenomicNet(nn.Module):
         return self.head(torch.cat([f_out, mlp_out], dim=1)).squeeze(-1)
 
 
-class EpistaticFM(nn.Module):
-    """EFM: 线性+FM二阶交互+深度MLP"""
-    def __init__(self, n_snps, k=8, hidden=64, dropout=0.35):
-        super().__init__()
-        self.linear = nn.Linear(n_snps, 1, bias=True)
-        self.V = nn.Parameter(torch.randn(n_snps, k) * 0.01)
-        self.mlp = nn.Sequential(
-            nn.Linear(n_snps, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, hidden))
-        self.head = nn.Linear(hidden + 1, 1)
-
-    def forward(self, x):
-        lin = self.linear(x)
-        fm_interact = 0.5 * ((x @ self.V)**2 - (x**2) @ (self.V**2)).sum(dim=1, keepdim=True)
-        deep = self.mlp(x)
-        return self.head(torch.cat([lin, fm_interact, deep], dim=1)).squeeze(-1)
-
 
 class MultiScaleInceptionCNN(nn.Module):
     """MICNN: 多尺度Inception卷积 + 膨胀卷积"""
@@ -139,24 +122,6 @@ class FGNv2(nn.Module):
         return self.head(torch.cat([self.freq_mlp(f), self.wavelet(x)], dim=1)).squeeze(-1)
 
 
-class EFMv2(nn.Module):
-    """EFM v2: +FM Embedding Dropout"""
-    def __init__(self, n_snps, k=8, hidden=64, dropout=0.35, fm_do=0.15):
-        super().__init__()
-        self.linear = nn.Linear(n_snps, 1, bias=True)
-        self.V = nn.Parameter(torch.randn(n_snps, k) * 0.01)
-        self.fm_do = fm_do
-        self.mlp = nn.Sequential(
-            nn.Linear(n_snps, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, hidden))
-        self.head = nn.Linear(hidden + 1, 1)
-
-    def forward(self, x):
-        lin = self.linear(x)
-        V_do = F.dropout(self.V, self.fm_do, training=self.training)
-        fm_interact = 0.5 * ((x @ V_do)**2 - (x**2) @ (V_do**2)).sum(dim=1, keepdim=True)
-        return self.head(torch.cat([lin, fm_interact, self.mlp(x)], dim=1)).squeeze(-1)
-
 
 class MICNNv2(nn.Module):
     """MICNN v2: +Dilated Conv + Spatial Pyramid Pooling"""
@@ -190,25 +155,6 @@ class FGNv3(nn.Module):
     def forward(self, x):
         return self.encoder(x)
 
-
-class EFMv3(nn.Module):
-    """EFM v3: Sparse-gated FM + LayerNorm"""
-    def __init__(self, n_snps, k=4, hidden=64, dropout=0.35):
-        super().__init__()
-        self.linear = nn.Linear(n_snps, 1, bias=True)
-        self.V = nn.Parameter(torch.randn(n_snps, k) * 0.005)
-        self.gate = nn.Sequential(nn.Linear(n_snps, n_snps), nn.Sigmoid())
-        self.mlp = nn.Sequential(
-            nn.Linear(n_snps, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, hidden))
-        self.head = nn.Linear(hidden + 1, 1)
-
-    def forward(self, x):
-        lin = self.linear(x)
-        g = self.gate(x)
-        V_g = self.V * g.unsqueeze(-1)
-        fm = 0.5 * ((x @ V_g)**2 - (x**2) @ (V_g**2)).sum(dim=1, keepdim=True)
-        return self.head(torch.cat([lin, fm, self.mlp(x)], dim=1)).squeeze(-1)
 
 
 class FusionNet(nn.Module):
@@ -407,40 +353,44 @@ def load_iranian_data(max_markers=None):
     print("\n[1/3] Loading genotype matrix ...")
     t0 = time.time()
 
-    # Read with pandas, skip metadata header rows
-    nrows = max_markers + 8 if max_markers else None
+    N_META = 17
+    nrows = max_markers if max_markers else None
     df_geno = pd.read_csv(DATA_DIR / "Iranian_Samples.csv",
                           skiprows=8, header=None, nrows=nrows, low_memory=False)
 
-    # Columns 0-16 = marker metadata, columns 17+ = sample genotypes
-    N_META = 17
-    X_raw = df_geno.iloc[:, N_META:].values.T  # transpose: samples × markers
+    # Extract sample IDs from original header (before skip)
+    sample_ids_raw = pd.read_csv(DATA_DIR / "Iranian_Samples.csv", nrows=0).columns[N_META:]
+    sample_ids = [str(c).strip() for c in sample_ids_raw if str(c).strip() and str(c).strip() != '*']
 
-    # Convert genotype: '0'→0, '1'→1, '2'→2, '-/empty'→NaN
-    X_num = np.full(X_raw.shape, np.nan, dtype=np.float32)
-    X_num[X_raw == '0'] = 0.0
-    X_num[X_raw == '1'] = 1.0
-    X_num[X_raw == '2'] = 2.0
-    del X_raw, df_geno
+    # Genotype matrix: columns 17+ are samples, transpose to samples × markers
+    X_raw = df_geno.iloc[:, N_META:].values.T
+    del df_geno
 
-    # Column-mean imputation for missing values
+    # Encode: '0'→0, '1'→1, '2'→2, '-/empty'→NaN via np.select (single pass)
+    X_num = np.select(
+        [X_raw == '0', X_raw == '1', X_raw == '2'],
+        [0.0, 1.0, 2.0],
+        default=np.nan
+    ).astype(np.float32)
+    del X_raw
+
+    # Column-mean imputation with broadcasting (avoids materializing np.where tuple)
     col_means = np.nanmean(X_num, axis=0)
     nan_mask = np.isnan(X_num)
-    X_num[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+    X_num = np.where(nan_mask, col_means, X_num)
+    missing_pct = nan_mask.sum() / nan_mask.size * 100
     print(f"  Genotype matrix: {X_num.shape} (samples × markers) "
-          f"[missing={nan_mask.sum()/nan_mask.size*100:.1f}%] [{time.time()-t0:.1f}s]")
-
-    # Read sample IDs from first data row of original file
-    with open(DATA_DIR / "Iranian_Samples.csv") as f:
-        header = f.readline().strip().split(',')
-    sample_ids = [str(c).strip() for c in header[N_META:] if c.strip() and c.strip() != '*']
+          f"[missing={missing_pct:.1f}%] [{time.time()-t0:.1f}s]")
 
     # Load phenotypes
     print("\n[2/3] Loading phenotypes ...")
     pheno = pd.read_csv(DATA_DIR / "phenotype_iranian.csv")
     pheno_clean = pheno.iloc[1:].copy()
     pheno_clean.columns = ['GID', 'Heat_dtm', 'Heat_dth', 'Drought_dtm', 'Drought_dth']
-    pheno_clean['GID'] = pheno_clean['GID'].astype(str)
+
+    # Normalize GID: phenotype stores float (e.g. 156377.0), genotype stores int string
+    pheno_clean['GID'] = pheno_clean['GID'].apply(
+        lambda x: str(int(float(x))) if pd.notna(x) else None)
     for c in ['Heat_dtm', 'Heat_dth', 'Drought_dtm', 'Drought_dth']:
         pheno_clean[c] = pd.to_numeric(pheno_clean[c], errors='coerce')
     pheno_clean = pheno_clean.dropna(subset=['Heat_dtm', 'Heat_dth', 'Drought_dtm', 'Drought_dth'])
