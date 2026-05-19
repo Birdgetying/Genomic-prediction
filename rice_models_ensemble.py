@@ -15,7 +15,7 @@ Rice Genomic Prediction — FGN + EFM + MICNN Ensemble
 对照: 保留 FGN/EFM/MICNN 原版作为基线
 """
 
-import json, time, pickle, shutil
+import json, time, os, pickle, shutil
 import numpy as np
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
@@ -54,6 +54,19 @@ GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05  # 预过滤: 剔除 minor allele frequency < 5% 的稀有位点
 MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
 HAPLO_GWAS_FRAC = 0.6     # hybrid 模式下 GWAS 标记占比
+
+# 可复现性
+import random
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(RANDOM_SEED)
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 TYPE_TRAD = 'Traditional'
@@ -64,11 +77,6 @@ TYPE_HYBRID = 'Hybrid'
 # True=仅1个性状x2折本地测试, False=完整实验
 # 命令行: python rice_models_ensemble.py --full  覆盖为完整模式
 QUICK_TEST = True
-
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(RANDOM_SEED)
 
 TRAITS = [
     'Heading_date', 'Plant_height', 'Num_panicles',

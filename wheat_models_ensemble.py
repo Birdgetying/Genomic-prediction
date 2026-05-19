@@ -65,6 +65,18 @@ MAX_VARIANTS_PER_TYPE = 15000  # 每种变异类型最多加载标记数
 MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策略
 HAPLO_GWAS_FRAC = 0.6     # hybrid 模式下 GWAS 标记占比
 
+# 可复现性
+import random
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(RANDOM_SEED)
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
+
 # GPU
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -74,12 +86,6 @@ TYPE_TRAD = 'Traditional'
 TYPE_DL = 'DL'
 TYPE_ENS = 'Ensemble'
 TYPE_HYBRID = 'Hybrid'
-
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(RANDOM_SEED)
-    torch.cuda.manual_seed_all(RANDOM_SEED)
 
 # ============================================================================
 # VCF 数据加载

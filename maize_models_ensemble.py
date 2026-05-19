@@ -49,6 +49,19 @@ RANDOM_SEED = 42
 N_FOLDS = 5
 GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05
+
+# 可复现性
+import random
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(RANDOM_SEED)
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 TYPE_TRAD = 'Traditional'
@@ -308,7 +321,6 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
     if not grid:
         return {}
 
-    np.random.seed(RANDOM_SEED)
     for _ in range(n_trials):
         overrides = {k: np.random.choice(v) for k, v in grid.items()}
         try:
