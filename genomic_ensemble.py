@@ -16,7 +16,7 @@ Usage:
   python genomic_ensemble.py all --full     # Run all three crops
 """
 
-import json, time, os, sys, pickle, shutil, random
+import json, time, os, sys, random
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
@@ -828,24 +828,20 @@ EXTRA_NAMES = ['ResFGN']
 ALL_NAMES = TRAD_NAMES + DL_NAMES + EXTRA_NAMES
 
 
+def _make_trad_configs(G_train, G_te_tr, n_snps, n_train):
+    """Per-fold traditional model configs — GBLUP closures capture G matrices."""
+    return [
+        ('RRBLUP', lambda: RRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps + 1),
+        ('GBLUP', lambda: GBLUP(), lambda m, _x, yt: m.fit(G_train, yt), lambda m, _x: m.predict(G_te_tr), n_train + 1),
+        ('XGBoost', lambda: XGBoostModel(n_estimators=300), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), 300 * 6 * 2),
+        ('ElasticNet', lambda: ElasticNetModel(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps + 1),
+        ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps * 2 + 1),
+    ]
+
+
 # ============================================================================
 # Section H: Stacking / Ensemble Functions
 # ============================================================================
-
-def evaluate_traditional_stacking(oof_trad, y):
-    trad_names = list(oof_trad.keys())
-    X_meta = np.column_stack([oof_trad[m] for m in trad_names])
-    meta = RidgeCV(alphas=np.logspace(-3, 3, 20), fit_intercept=True, cv=5)
-    meta.fit(X_meta, y)
-    kf = KFold(n_splits=min(5, len(trad_names)), shuffle=True, random_state=RANDOM_SEED)
-    sp = np.zeros(len(y))
-    for tr, te in kf.split(X_meta):
-        m = RidgeCV(alphas=np.logspace(-3, 3, 20), fit_intercept=True, cv=3)
-        m.fit(X_meta[tr], y[tr]); sp[te] = m.predict(X_meta[te])
-    return {'R2': float(r2_score(y, sp)), 'Correlation': float(pearsonr(y, sp)[0]),
-            'Meta_weights': meta.coef_.tolist(), 'Meta_intercept': float(meta.intercept_),
-            'Base_models': trad_names}
-
 
 def fit_resfgn_components(X, y, n_snps, cv=3, fusion_overrides=None):
     o = fusion_overrides or {}
@@ -1055,11 +1051,7 @@ def run_wheat(quick_test=True):
         oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
         oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
 
-        dl_models = {}
-        for mname in DL_NAMES:
-            o = {}
-            if mname in MARKER_TYPE_MODELS: o['marker_types'] = vt_all
-            dl_models[mname] = create_model(mname, n_snps, overrides=o)
+        dl_models = {mname: create_model(mname, n_snps) for mname in DL_NAMES}
 
         for fi, (tr, te) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fi+1}/{folds_run} ---")
@@ -1082,22 +1074,10 @@ def run_wheat(quick_test=True):
 
             sc_gwas = StandardScaler(); Xtr_gwas_s = sc_gwas.fit_transform(Xtr_gwas).astype(np.float32)
             Xte_gwas_s = sc_gwas.transform(Xte_gwas).astype(np.float32)
-            Xtr_dl_s, Xte_dl_s = Xtr_gwas_s, Xte_gwas_s
-
             G_fold_train = Xtr_gwas_s @ Xtr_gwas_s.T / n_snps
             G_fold_te_tr = Xte_gwas_s @ Xtr_gwas_s.T / n_snps
 
-            for mname in MARKER_TYPE_MODELS:
-                dl_models[mname].encoder.set_marker_types(vt_dl)
-
-            # Traditional models
-            trad_configs = [
-                ('RRBLUP', lambda: RRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps+1),
-                ('GBLUP', lambda: GBLUP(), lambda m, _x, yt: m.fit(G_fold_train, yt), lambda m, _x: m.predict(G_fold_te_tr), len(tr)+1),
-                ('XGBoost', lambda: XGBoostModel(n_estimators=300), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), 300*6*2),
-                ('ElasticNet', lambda: ElasticNetModel(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps+1),
-                ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps*2+1),
-            ]
+            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr))
             for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
                 t0 = time.time(); tmodel = build_fn()
                 fit_fn(tmodel, Xtr_gwas_s, ytr)
@@ -1111,37 +1091,39 @@ def run_wheat(quick_test=True):
 
             # DL models
             for mi, mname in enumerate(DL_NAMES):
+                tp = tuned_params.get(mname, {})
+                if mname in MARKER_TYPE_MODELS:
+                    dl_models[mname] = create_model(mname, n_snps, overrides=dict(tp, marker_types=vt_dl))
                 if fi == 0: results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
-                t0 = time.time(); tp = tuned_params.get(mname, {})
+                t0 = time.time()
                 if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn_v2(dl_models[mname], Xtr_dl_s, epochs=50, lr=1e-3, patience=10)
+                    pretrain_prefgn_v2(dl_models[mname], Xtr_gwas_s, epochs=50, lr=1e-3, patience=10)
                 if mname == 'DeepKernelGP':
-                    model = train_dkgp(dl_models[mname], Xtr_dl_s, ytr, epochs=tp.get('epochs', 200),
+                    model = train_dkgp(dl_models[mname], Xtr_gwas_s, ytr, epochs=tp.get('epochs', 200),
                                        lr=tp.get('lr', 5e-3), patience=tp.get('patience', 15), verbose=False)
-                    model.fit(torch.FloatTensor(Xtr_dl_s), torch.FloatTensor(ytr))
-                    mean, _ = model.predict(torch.FloatTensor(Xte_dl_s)); preds = mean.cpu().numpy()
+                    model.fit(torch.FloatTensor(Xtr_gwas_s), torch.FloatTensor(ytr))
+                    mean, _ = model.predict(torch.FloatTensor(Xte_gwas_s)); preds = mean.cpu().numpy()
                 else:
                     bs = 64 if mname == 'FusionNet' else 128
                     lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                     wd = tp.get('weight_decay', 1e-3); pat = tp.get('patience', 30)
-                    model = train_torch_model(dl_models[mname], Xtr_dl_s, ytr, epochs=300,
+                    model = train_torch_model(dl_models[mname], Xtr_gwas_s, ytr, epochs=300,
                                               batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                    preds = predict_torch_model(model, Xte_dl_s)
+                    preds = predict_torch_model(model, Xte_gwas_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist())
                 results[mname]['targets'].extend(yte.tolist())
                 results[mname]['time'] += elapsed
                 print(f"    {mname:<16s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
                 if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
-                o = tuned_params.get(mname, {}) or {}
-                if mname in MARKER_TYPE_MODELS: o = dict(o, marker_types=vt_dl)
-                dl_models[mname] = create_model(mname, n_snps, overrides=o)
+                if mname not in MARKER_TYPE_MODELS:
+                    dl_models[mname] = create_model(mname, n_snps, overrides=tp)
 
             # ResFGN
             t0 = time.time()
-            ridge, res_model = fit_resfgn_components(Xtr_dl_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
-            pred_te_ridge = ridge.predict(Xte_dl_s)
-            res_pred = predict_torch_model(res_model, Xte_dl_s)
+            ridge, res_model = fit_resfgn_components(Xtr_gwas_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
+            pred_te_ridge = ridge.predict(Xte_gwas_s)
+            res_pred = predict_torch_model(res_model, Xte_gwas_s)
             final_pred = pred_te_ridge + res_pred
             elapsed = time.time() - t0
             if fi == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
@@ -1149,6 +1131,7 @@ def run_wheat(quick_test=True):
             results['ResFGN']['targets'].extend(yte.tolist())
             results['ResFGN']['time'] += elapsed
             print(f"    {'ResFGN':<16s} R²={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
+            torch.cuda.empty_cache()
 
         # Trait summary
         print(f"\n  {'-'*70}\n  {trait} Final Results:\n  {'Model':<16s} {'R²':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
@@ -1172,7 +1155,7 @@ def run_wheat(quick_test=True):
             sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
             trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
             print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
-            tsr = evaluate_traditional_stacking(oof_trad, y)
+            tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)))
             trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
             print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
         all_results[trait] = trait_res
@@ -1275,13 +1258,7 @@ def run_rice(quick_test=True):
 
             G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
 
-            trad_configs = [
-                ('RRBLUP', lambda: RRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps+1),
-                ('GBLUP', lambda: GBLUP(), lambda m, _x, yt: m.fit(G_fold_train, yt), lambda m, _x: m.predict(G_fold_te_tr), len(tr)+1),
-                ('XGBoost', lambda: XGBoostModel(n_estimators=300), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), 300*6*2),
-                ('ElasticNet', lambda: ElasticNetModel(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps+1),
-                ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps*2+1),
-            ]
+            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr))
             for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
                 t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
                 preds = pred_fn(tmodel, Xte_s)
@@ -1320,6 +1297,7 @@ def run_rice(quick_test=True):
             if fi == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
             results['ResFGN']['preds'].extend(final_pred.tolist()); results['ResFGN']['targets'].extend(yte.tolist()); results['ResFGN']['time'] += elapsed
             print(f"    {'ResFGN':<16s} R²={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
+            torch.cuda.empty_cache()
 
         # Summary
         print(f"\n  {trait} Final Results:")
@@ -1337,7 +1315,7 @@ def run_rice(quick_test=True):
             trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
             oof_all = {**oof_trad, **oof_dl}; sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
             trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
-            tsr = evaluate_traditional_stacking(oof_trad, y)
+            tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)))
             trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
         all_results[trait] = trait_res
 
@@ -1365,11 +1343,11 @@ def load_iranian_data(max_markers=None):
     print("\n[1/3] Loading genotype matrix ..."); t0 = time.time()
     N_META = 17
     nrows = max_markers if max_markers else None
-    df_geno = pd.read_csv(MAIZE_DATA_DIR + "/Iranian_Samples.csv", skiprows=8, header=None, nrows=nrows, low_memory=False)
     with open(MAIZE_DATA_DIR + "/Iranian_Samples.csv") as f:
         for _ in range(8): f.readline()
         header_line = f.readline().strip().split(',')
     sample_ids = [str(c).strip() for c in header_line[N_META:] if c.strip() and c.strip() != '*']
+    df_geno = pd.read_csv(MAIZE_DATA_DIR + "/Iranian_Samples.csv", skiprows=9, header=None, nrows=nrows, low_memory=False)
     X_raw = df_geno.iloc[:, N_META:].values.T; del df_geno
     X_num = np.select([X_raw == '0', X_raw == '1', X_raw == '2'], [0.0, 1.0, 2.0], default=np.nan).astype(np.float32)
     del X_raw
@@ -1436,8 +1414,7 @@ def run_maize(quick_test=True):
         for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
             Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
-            maf = np.minimum(Xtr_raw.mean(axis=0)/2.0, 1.0 - Xtr_raw.mean(axis=0)/2.0)
-            maf_idx = np.where(maf >= MAF_THRESHOLD)[0]
+            maf_idx = maf_filter(Xtr_raw, MAF_THRESHOLD)
             if len(maf_idx) >= n_snps:
                 gidx = gwas_select(Xtr_raw[:, maf_idx], ytr, n_snps); gidx = maf_idx[gidx]
             else: gidx = gwas_select(Xtr_raw, ytr, n_snps)
@@ -1446,14 +1423,7 @@ def run_maize(quick_test=True):
 
             G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
 
-            # Traditional
-            trad_configs = [
-                ('RRBLUP', lambda: RRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps+1),
-                ('GBLUP', lambda: GBLUP(), lambda m, _x, yt: m.fit(G_fold_train, yt), lambda m, _x: m.predict(G_fold_te_tr), len(tr_idx)+1),
-                ('XGBoost', lambda: XGBoostModel(n_estimators=300), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), 300*6*2),
-                ('ElasticNet', lambda: ElasticNetModel(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps+1),
-                ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps*2+1),
-            ]
+            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr_idx))
             for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
                 t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
                 preds = pred_fn(tmodel, Xte_s)
@@ -1490,6 +1460,7 @@ def run_maize(quick_test=True):
             if fold_i == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
             results['ResFGN']['preds'].extend(final_pred.tolist()); results['ResFGN']['targets'].extend(yte.tolist()); results['ResFGN']['time'] += elapsed
             print(f"    {'ResFGN':<16s} R²={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
+            torch.cuda.empty_cache()
 
         # Summary
         trait_res = {}
@@ -1506,7 +1477,7 @@ def run_maize(quick_test=True):
             trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
             oof_all = {**oof_trad, **oof_dl}; sr_all = stacking_evaluate(oof_all, y, n_folds=min(5, folds_run))
             trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
-            tsr = evaluate_traditional_stacking(oof_trad, y)
+            tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)))
             trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'], 'RMSE': 0.0, 'Type': TYPE_ENS}
         all_results[trait] = trait_res
 
