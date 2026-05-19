@@ -979,7 +979,7 @@ def load_wheat_data():
             for variant in vcf:
                 gt = variant.gt_types
                 if len(gt) >= actual_n:
-                    genotypes.append([0 if g==0 else 1 if g==1 else 2 if g==2 else 0 for g in gt[:actual_n]])
+                    genotypes.append(np.clip(gt[:actual_n], 0, 2).astype(np.int8))
             X_v = np.array(genotypes, dtype=np.float32).T
             X_parts.append(X_v)
             variant_type_ids.append(np.full(X_v.shape[1], vtype_id, dtype=np.int32))
