@@ -12,7 +12,7 @@ Maize Genomic Prediction — Iranian/Mexican Maize Ensemble
   python maize_models_ensemble.py --mexican    # 使用墨西哥数据
 """
 
-import json, time, os, sys, pickle, shutil
+import json, time, os, sys, pickle, shutil, random
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
@@ -51,7 +51,6 @@ GWAS_TOP_K = 5000
 MAF_THRESHOLD = 0.05
 
 # 可复现性
-import random
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
@@ -60,7 +59,8 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
+# PYTHONHASHSEED must be set at process launch level, not mid-script:
+#   export PYTHONHASHSEED=42
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -370,9 +370,12 @@ def load_iranian_data(max_markers=None):
     df_geno = pd.read_csv(DATA_DIR / "Iranian_Samples.csv",
                           skiprows=8, header=None, nrows=nrows, low_memory=False)
 
-    # Extract sample IDs from original header (before skip)
-    sample_ids_raw = pd.read_csv(DATA_DIR / "Iranian_Samples.csv", nrows=0).columns[N_META:]
-    sample_ids = [str(c).strip() for c in sample_ids_raw if str(c).strip() and str(c).strip() != '*']
+    # Extract sample IDs from header row without re-parsing entire CSV
+    with open(DATA_DIR / "Iranian_Samples.csv") as f:
+        for _ in range(8):  # skip 8 metadata rows
+            f.readline()
+        header_line = f.readline().strip().split(',')
+    sample_ids = [str(c).strip() for c in header_line[N_META:] if c.strip() and c.strip() != '*']
 
     # Genotype matrix: columns 17+ are samples, transpose to samples × markers
     X_raw = df_geno.iloc[:, N_META:].values.T

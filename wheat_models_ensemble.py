@@ -1,15 +1,14 @@
 """
-Wheat Genomic Prediction — FGN + EFM + MICNN Ensemble System
-=============================================================
-"频域-统计-空间" 正交集成体系, 适配小麦 VCF 数据 (SNP+INDEL+SV)
+Wheat Genomic Prediction — FGN + MICNN Ensemble System
+============================================================
+"频域-空间" 正交集成体系, 适配小麦 VCF 数据 (SNP+INDEL+SV)
 
 数据: 819 小麦核心种质 (WATDE), SNP/INDEL/SV 三种变异类型
 路径: /storage/public/home/2024110093/data/Variation/CSIAAS/
 
 模型:
   Traditional: RRBLUP, GBLUP, XGBoost, ElasticNet, GWAS_RRBLUP, Trad Ensemble
-  DL:         FGN / FGN v2 (FFT+Wavelet), EFM / EFM v2 (FM+MLP),
-              MICNN / MICNN v2 (Inception+Dilated+SPP)
+  DL:         FGN / FGN v2 (FFT+Wavelet), MICNN / MICNN v2 (Inception+Dilated+SPP)
   DL集成:     FusionNet (三分支联合训练), Stacking (DL/All)
 
 用法:
@@ -17,7 +16,7 @@ Wheat Genomic Prediction — FGN + EFM + MICNN Ensemble System
   python wheat_models_ensemble.py --full    # 完整实验 (所有性状 x 5折)
 """
 
-import json, time, os, sys, pickle, shutil
+import json, time, os, sys, pickle, shutil, random
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
@@ -66,7 +65,6 @@ MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid' — 标记筛选策�
 HAPLO_GWAS_FRAC = 0.6     # hybrid 模式下 GWAS 标记占比
 
 # 可复现性
-import random
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
@@ -75,7 +73,8 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
+# PYTHONHASHSEED must be set at process launch level, not mid-script:
+#   export PYTHONHASHSEED=42
 
 # GPU
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -457,26 +456,6 @@ class FourierGenomicNet(nn.Module):
         return self.head(torch.cat([fp, tp], dim=1))
 
 
-class EpistaticFM(nn.Module):
-    """EFM -- 线性+FM二阶交互+深度MLP"""
-    def __init__(self, n_snps, k=8, hidden=64, dropout=0.35):
-        super().__init__()
-        self.linear = nn.Linear(n_snps, 1, bias=True)
-        self.V = nn.Parameter(torch.randn(n_snps, k) * 0.01)
-        self.deep = nn.Sequential(
-            nn.Linear(n_snps, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, hidden), nn.GELU(), nn.Dropout(dropout))
-        self.head = nn.Sequential(
-            nn.Linear(1+1+hidden, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, 1))
-
-    def forward(self, x):
-        lo = self.linear(x)
-        xv = x.unsqueeze(2) * self.V.unsqueeze(0)
-        fm = 0.5 * (xv.sum(1).pow(2) - (xv.pow(2)).sum(1)).sum(1, keepdim=True)
-        return self.head(torch.cat([lo, fm, self.deep(x)], dim=1))
-
-
 class InceptionBlock(nn.Module):
     def __init__(self, in_ch, out_ch, dropout=0.3):
         super().__init__()
@@ -575,55 +554,6 @@ class FGNv2(nn.Module):
         wp = self.pool(self.wavelet_conv(torch.cat([cA, cD], dim=1))).squeeze(-1)
         tp = self.pool(self.time_conv(x.unsqueeze(1))).squeeze(-1)
         return self.head(torch.cat([fp, wp, tp], dim=1))
-
-
-class EFMv2(nn.Module):
-    """EFM v2: +FM Embedding Dropout"""
-    def __init__(self, n_snps, k=8, hidden=64, dropout=0.35, fm_do=0.15):
-        super().__init__()
-        self.linear = nn.Linear(n_snps, 1, bias=True)
-        self.V = nn.Parameter(torch.randn(n_snps, k) * 0.01)
-        self.fm_do = fm_do
-        self.deep = nn.Sequential(
-            nn.Linear(n_snps, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, hidden), nn.GELU(), nn.Dropout(dropout))
-        self.head = nn.Sequential(
-            nn.Linear(1+1+hidden, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, 1))
-
-    def forward(self, x):
-        lo = self.linear(x)
-        Vd = F.dropout(self.V, p=self.fm_do, training=self.training)
-        xv = x.unsqueeze(2) * Vd.unsqueeze(0)
-        fm = 0.5 * (xv.sum(1).pow(2) - (xv.pow(2)).sum(1)).sum(1, keepdim=True)
-        return self.head(torch.cat([lo, fm, self.deep(x)], dim=1))
-
-
-class EFMv3(nn.Module):
-    """EFM v3: Sparse-gated FM + LayerNorm, k=4, top-50% SNP gate"""
-    def __init__(self, n_snps, k=4, hidden=64, dropout=0.35):
-        super().__init__()
-        self.linear = nn.Linear(n_snps, 1, bias=True)
-        self.V = nn.Parameter(torch.randn(n_snps, k) * 0.005)
-        self.fm_ln = nn.LayerNorm(k)
-        self.deep = nn.Sequential(
-            nn.Linear(n_snps, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, hidden), nn.GELU(), nn.Dropout(dropout))
-        self.head = nn.Sequential(
-            nn.Linear(1+k+hidden, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, 1))
-
-    def forward(self, x):
-        lo = self.linear(x)
-        with torch.no_grad():
-            w = self.linear.weight.abs().squeeze()
-            thresh = torch.quantile(w, 0.5)
-            mask = (w >= thresh).float()
-        x_gated = x * mask.unsqueeze(0)
-        xv = x_gated.unsqueeze(2) * self.V.unsqueeze(0)
-        fm = 0.5 * (xv.sum(1).pow(2) - (xv.pow(2)).sum(1))
-        fm = self.fm_ln(fm)
-        return self.head(torch.cat([lo, fm, self.deep(x)], dim=1))
 
 
 class FGNv3(nn.Module):
@@ -844,7 +774,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
         return {}, 0.0
 
     n_val = max(16, int(len(y_train) * 0.2))
-    rng = np.random.RandomState(42)
+    rng = np.random.RandomState(RANDOM_SEED)
     idx = rng.permutation(len(y_train))
     val_idx, tr_idx = idx[:n_val], idx[n_val:]
     X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
@@ -911,7 +841,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
 
     study = optuna.create_study(
         direction='maximize',
-        sampler=optuna.samplers.TPESampler(seed=42),
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
