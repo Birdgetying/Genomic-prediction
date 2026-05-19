@@ -288,9 +288,6 @@ def create_model(name, n_snps, overrides=None):
     if name == 'FGN v3':
         return FGNv3(n_snps=n_snps, hidden=o.get('hidden', 48),
                      dropout=o.get('dropout', 0.35))
-    if name == 'EFM v3':
-        return EFMv3(n_snps=n_snps, k=o.get('k', 4),
-                     hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35))
     if name == 'FusionNet':
         return FusionNet(n_snps=n_snps,
                          hidden_dim=o.get('hidden_dim', 48),
@@ -357,7 +354,6 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
     best_score, best_overrides = -float('inf'), {}
     grids = {
         'FGN v3': {'hidden': [32, 48, 64, 96], 'dropout': [0.2, 0.35, 0.5]},
-        'EFM v3': {'hidden': [32, 48, 64], 'k': [2, 4, 6], 'dropout': [0.2, 0.35, 0.5]},
         'FusionNet': {'hidden_dim': [32, 48, 64], 'dropout': [0.2, 0.35, 0.5]},
         'DeepKernelGP': {'latent_dim': [8, 16, 32], 'hidden': [32, 48, 64], 'dropout': [0.1, 0.2, 0.35]},
         'PreFGN': {'hidden': [32, 48, 64], 'dropout': [0.2, 0.35, 0.5]},
@@ -402,42 +398,47 @@ def fit_resfgn_components(X, y, n_snps, cv=3):
 def load_iranian_data(max_markers=None):
     """加载伊朗玉米数据
 
-    Returns:
-        X: (n_samples, n_markers) genotype matrix
-        y_dict: {trait_name: phenotype_array}
-        sample_ids: list of sample IDs
+    CSV结构: 前8行=元数据头, 前17列=标记属性, 第17列后=样本基因型(0/1/2/-)
     """
     print(f"\n{'='*70}")
     print("Iranian Maize Data Loading")
     print(f"{'='*70}")
 
-    # Load genotype matrix (transposed CSV: markers × samples)
     print("\n[1/3] Loading genotype matrix ...")
     t0 = time.time()
 
-    # Read efficiently: first 17 cols are metadata, rest are samples
-    if max_markers:
-        nrows = min(max_markers + 1, 52600)
-    else:
-        nrows = None
+    # Read with pandas, skip metadata header rows
+    nrows = max_markers + 8 if max_markers else None
+    df_geno = pd.read_csv(DATA_DIR / "Iranian_Samples.csv",
+                          skiprows=8, header=None, nrows=nrows, low_memory=False)
 
-    df_geno = pd.read_csv(DATA_DIR / "Iranian_Samples.csv", nrows=nrows, low_memory=False)
-    meta_cols = [c for c in df_geno.columns[:17] if str(c).strip() == '*']
-    n_meta = len(meta_cols)
+    # Columns 0-16 = marker metadata, columns 17+ = sample genotypes
+    N_META = 17
+    X_raw = df_geno.iloc[:, N_META:].values.T  # transpose: samples × markers
 
-    # Extract sample IDs from first row
-    sample_ids = [str(c) for c in df_geno.columns[n_meta:] if str(c).strip()]
+    # Convert genotype: '0'→0, '1'→1, '2'→2, '-/empty'→NaN
+    X_num = np.full(X_raw.shape, np.nan, dtype=np.float32)
+    X_num[X_raw == '0'] = 0.0
+    X_num[X_raw == '1'] = 1.0
+    X_num[X_raw == '2'] = 2.0
+    del X_raw, df_geno
 
-    # Genotype matrix: rows=markers, cols=samples (transposed from what we want)
-    X_raw = df_geno.iloc[:, n_meta:].values.T.astype(np.float32)  # transpose to samples × markers
-    del df_geno
-    print(f"  Genotype matrix: {X_raw.shape} (samples × markers) [{time.time()-t0:.1f}s]")
+    # Column-mean imputation for missing values
+    col_means = np.nanmean(X_num, axis=0)
+    nan_mask = np.isnan(X_num)
+    X_num[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+    print(f"  Genotype matrix: {X_num.shape} (samples × markers) "
+          f"[missing={nan_mask.sum()/nan_mask.size*100:.1f}%] [{time.time()-t0:.1f}s]")
+
+    # Read sample IDs from first data row of original file
+    with open(DATA_DIR / "Iranian_Samples.csv") as f:
+        header = f.readline().strip().split(',')
+    sample_ids = [str(c).strip() for c in header[N_META:] if c.strip() and c.strip() != '*']
 
     # Load phenotypes
     print("\n[2/3] Loading phenotypes ...")
     pheno = pd.read_csv(DATA_DIR / "phenotype_iranian.csv")
-    # Columns: GID, Heat_dtm, Heat_dth, Drought_dtm, Drought_dth
-    pheno_clean = pheno.iloc[1:].copy()  # skip header row
+    pheno_clean = pheno.iloc[1:].copy()
     pheno_clean.columns = ['GID', 'Heat_dtm', 'Heat_dth', 'Drought_dtm', 'Drought_dth']
     pheno_clean['GID'] = pheno_clean['GID'].astype(str)
     for c in ['Heat_dtm', 'Heat_dth', 'Drought_dtm', 'Drought_dth']:
@@ -449,11 +450,9 @@ def load_iranian_data(max_markers=None):
     print("\n[3/3] Aligning genotype and phenotype samples ...")
     geno_id_set = set(sample_ids)
     pheno_clean = pheno_clean[pheno_clean['GID'].isin(geno_id_set)]
-
-    # Build aligned matrix
     id_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
     aligned_indices = [id_to_idx[sid] for sid in pheno_clean['GID'].values]
-    X = X_raw[aligned_indices]
+    X = X_num[aligned_indices]
     y_dict = {}
     for trait in ['Heat_dtm', 'Heat_dth', 'Drought_dtm', 'Drought_dth']:
         y_dict[trait] = pheno_clean[trait].values.astype(np.float32)
@@ -502,7 +501,7 @@ def main():
     # Model lists
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
     dl_base_names = ['FGN', 'MICNN', 'FGN v2', 'MICNN v2',
-                     'FGN v3', 'EFM v3', 'PreFGN', 'DeepKernelGP']
+                     'FGN v3', 'PreFGN', 'DeepKernelGP']
     dl_ensemble_names = ['FusionNet']
     extra_names = ['ResFGN']
     dl_names = dl_base_names + dl_ensemble_names

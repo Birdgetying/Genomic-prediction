@@ -30,7 +30,7 @@ MODEL_COLORS = {
     'ElasticNet': '#1976D2', 'GWAS_RRBLUP': '#0D47A1',
     'FGN': '#FFB74D', 'MICNN': '#FF8A65',
     'FGN v2': '#F57C00', 'MICNN v2': '#E64A19',
-    'FGN v3': '#BF360C', 'EFM v3': '#F9A825',
+    'FGN v3': '#BF360C',
     'PreFGN': '#00BCD4', 'DeepKernelGP': '#4CAF50',
     'FusionNet': '#E91E63',
     'Stacking (DL)': '#D32F2F', 'Stacking (All)': '#B71C1C',

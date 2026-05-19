@@ -611,10 +611,6 @@ def create_model(name, n_snps, overrides=None):
     if name == 'FGN v3':
         return FGNv3(n_snps=n_snps, hidden=o.get('hidden', 48),
                      dropout=o.get('dropout', 0.35))
-    if name == 'EFM v3':
-        return EFMv3(n_snps=n_snps, k=o.get('k', 4),
-                     hidden=o.get('hidden', 64),
-                     dropout=o.get('dropout', 0.35))
     if name == 'FusionNet':
         return FusionNet(n_snps=n_snps,
                          hidden_dim=o.get('hidden_dim', 48),
@@ -686,17 +682,6 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             }
             model = FGNv3(n_snps=n_snps, hidden=overrides['hidden'],
                           dropout=overrides['dropout'])
-            bs = 128
-        elif model_name == 'EFM v3':
-            overrides = {
-                'k': trial.suggest_categorical('k', [3, 4, 6]),
-                'hidden': trial.suggest_categorical('hidden', [48, 64, 96]),
-                'dropout': trial.suggest_float('dropout', 0.2, 0.5),
-                'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
-                'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
-            }
-            model = EFMv3(n_snps=n_snps, k=overrides['k'],
-                          hidden=overrides['hidden'], dropout=overrides['dropout'])
             bs = 128
         elif model_name == 'FusionNet':
             overrides = {
@@ -803,7 +788,7 @@ def main():
 
     trad_names = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
     dl_base_names = ['FGN', 'MICNN', 'FGN v2', 'MICNN v2',
-                     'FGN v3', 'EFM v3', 'PreFGN', 'DeepKernelGP']
+                     'FGN v3', 'PreFGN', 'DeepKernelGP']
     extra_names = ['ResFGN']
     dl_names = dl_base_names + ['FusionNet']
     all_names = trad_names + dl_names + extra_names
@@ -844,7 +829,7 @@ def main():
             sc_tune = StandardScaler()
             X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
 
-            for tune_name in ['FGN v3', 'EFM v3', 'FusionNet']:
+            for tune_name in ['FGN v3', 'FusionNet']:
                 best_p, best_r2 = tune_model_hyperparams(
                     tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
