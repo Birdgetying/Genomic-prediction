@@ -1452,7 +1452,6 @@ def load_iranian_data(max_markers=None):
     N_META = 17
     nrows = max_markers if max_markers else None
     with open(MAIZE_DATA_DIR + "/Iranian_Samples.csv") as f:
-        for _ in range(8): f.readline()
         header_line = f.readline().strip().split(',')
     sample_ids = [str(c).strip() for c in header_line[N_META:] if c.strip() and c.strip() != '*']
     df_geno = pd.read_csv(MAIZE_DATA_DIR + "/Iranian_Samples.csv", skiprows=8, header=None, nrows=nrows, low_memory=False)
