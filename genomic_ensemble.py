@@ -86,7 +86,6 @@ TYPE_ENS = 'Ensemble'
 TYPE_HYBRID = 'Hybrid'
 
 def _model_type(mname):
-    if mname == 'ResFGN': return TYPE_HYBRID
     if mname in ('Stacking (DL)', 'Stacking (All)', 'Trad Ensemble'): return TYPE_ENS
     if mname in ('RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP'): return TYPE_TRAD
     return TYPE_DL
@@ -128,254 +127,6 @@ def early_stop_restore(model, opt, scheduler_fn, loss_fn, forward_fn,
     return model
 
 
-class FGNEncoder(nn.Module):
-    """BN -> FFT -> FreqSE -> FreqConv + SNP gate -> TimeConv -> concat output"""
-    def __init__(self, n_snps, hidden=64, dropout=0.35, marker_types=None):
-        super().__init__()
-        self.n_freq = n_snps // 2 + 1
-        self.bn = nn.BatchNorm1d(n_snps)
-        se_hidden = max(4, self.n_freq // 8)
-        self.freq_se = nn.Sequential(
-            nn.Linear(self.n_freq, se_hidden), nn.GELU(),
-            nn.Linear(se_hidden, self.n_freq), nn.Sigmoid())
-        self.freq_conv = nn.Sequential(
-            nn.Conv1d(1, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Conv1d(hidden, hidden, 5, padding=2), nn.BatchNorm1d(hidden), nn.GELU(),
-            nn.Dropout(dropout * 0.5))
-        self.snp_gate = nn.Sequential(nn.Linear(n_snps, 1), nn.Sigmoid())
-        self.time_conv = nn.Sequential(
-            nn.Conv1d(1, hidden // 2, 21, padding=10), nn.BatchNorm1d(hidden // 2),
-            nn.GELU(), nn.Dropout(dropout * 0.5))
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.out_dim = hidden + hidden // 2
-        if marker_types is not None:
-            n_types = int(max(marker_types) + 1) if hasattr(marker_types, '__len__') else 3
-            self.type_embed = nn.Parameter(torch.zeros(n_types))
-            self.register_buffer('_marker_type_idx',
-                                 torch.as_tensor(marker_types, dtype=torch.long))
-        else:
-            self.type_embed = None
-            self._marker_type_idx = None
-
-    def set_marker_types(self, marker_types):
-        if self.type_embed is None:
-            raise RuntimeError("set_marker_types(): type_embed is None")
-        self._marker_type_idx = torch.as_tensor(marker_types, dtype=torch.long)
-
-    def forward(self, x):
-        if self.type_embed is not None and self._marker_type_idx is not None:
-            x = x + self.type_embed[self._marker_type_idx]
-        x = self.bn(x)
-        xc = torch.fft.rfft(x, dim=1)
-        mag = xc.abs()
-        se_w = self.freq_se(mag.mean(dim=0, keepdim=True))
-        mag_w = mag * se_w
-        fp = self.pool(self.freq_conv(mag_w.unsqueeze(1))).squeeze(-1)
-        g = self.snp_gate(x)
-        tp = self.pool(self.time_conv((x * g).unsqueeze(1))).squeeze(-1)
-        return torch.cat([fp, tp], dim=1)
-
-
-class PreFGN(nn.Module):
-    """Self-supervised pretraining FGN: stage1=masked reconstruction, stage2=phenotype finetune"""
-    def __init__(self, n_snps, hidden=64, dropout=0.35, marker_types=None):
-        super().__init__()
-        enc_out = hidden + hidden // 2
-        self.encoder = FGNEncoder(n_snps, hidden, dropout, marker_types)
-        self.decoder = nn.Sequential(
-            nn.Linear(enc_out, hidden * 2), nn.GELU(),
-            nn.Linear(hidden * 2, n_snps))
-        self.head = nn.Sequential(
-            nn.Linear(enc_out, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, hidden // 2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden // 2, 1))
-
-    def forward(self, x):
-        return self.head(self.encoder(x))
-
-    def reconstruct(self, x_masked):
-        return self.decoder(self.encoder(x_masked))
-
-    def pretrainable_params(self):
-        return list(self.encoder.parameters()) + list(self.decoder.parameters())
-
-
-def pretrain_prefgn(model, X, epochs=50, lr=1e-3, mask_ratio=0.2, patience=10):
-    model = model.to(DEVICE)
-    X_t = torch.FloatTensor(X)
-    dl = DataLoader(TensorDataset(X_t), batch_size=min(128, len(X)), shuffle=True)
-    opt = torch.optim.AdamW(model.pretrainable_params(), lr=lr)
-    def forward_masked(batch, m):
-        xb = batch[0].to(DEVICE)
-        mask = torch.rand_like(xb) > mask_ratio
-        x_masked = xb.clone(); x_masked[~mask] = 0.0
-        recon = m.reconstruct(x_masked)
-        return F.mse_loss(recon[~mask], xb[~mask])
-    def sched(opt_):
-        return torch.optim.lr_scheduler.ReduceLROnPlateau(opt_, mode='min', factor=0.5, patience=5)
-    return early_stop_restore(model, opt, sched, None, forward_masked, dl, epochs, patience, DEVICE).cpu()
-
-
-def pretrain_prefgn_v2(model, X, epochs=50, lr=1e-3, patience=10,
-                       mask_block=(3, 15), mask_frac=0.2, noise_std=0.05):
-    """Block masking + Gaussian denoising pretraining"""
-    model = model.to(DEVICE)
-    X_t = torch.FloatTensor(X)
-    dl = DataLoader(TensorDataset(X_t), batch_size=min(128, len(X)), shuffle=True)
-    opt = torch.optim.AdamW(model.pretrainable_params(), lr=lr)
-    n_snps = X.shape[1]; bl, bh = mask_block
-    def forward_block_masked(batch, m):
-        xb = batch[0].to(DEVICE)
-        mask = torch.ones_like(xb, dtype=torch.bool)
-        n_mask_target = int(n_snps * mask_frac); n_masked = 0
-        while n_masked < n_mask_target:
-            start = torch.randint(0, max(1, n_snps - bl), (1,)).item()
-            end = min(start + torch.randint(bl, bh + 1, (1,)).item(), n_snps)
-            mask[:, start:end] = False
-            n_masked += (end - start)
-        x_masked = xb.clone(); x_masked[~mask] = 0.0
-        noise = torch.randn_like(xb) * noise_std
-        x_masked[mask] = x_masked[mask] + noise[mask]
-        recon = m.reconstruct(x_masked)
-        loss_masked = F.mse_loss(recon[~mask], xb[~mask])
-        loss_all = F.mse_loss(recon, xb)
-        return 0.7 * loss_masked + 0.3 * loss_all
-    def sched(opt_):
-        return torch.optim.lr_scheduler.ReduceLROnPlateau(opt_, mode='min', factor=0.5, patience=5)
-    return early_stop_restore(model, opt, sched, None, forward_block_masked, dl, epochs, patience, DEVICE).cpu()
-
-
-# ============================================================================
-# Section B: Deep Kernel GP (from deep_kernel_gp.py)
-# ============================================================================
-JITTER = 1e-5
-
-
-class GenomicEncoder(nn.Module):
-    """Residual MLP: n_snps -> 256 -> 256 -> 128 -> latent_dim"""
-    def __init__(self, n_snps, latent_dim=24, hidden1=256, hidden2=128, dropout=0.3):
-        super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.BatchNorm1d(n_snps), nn.Linear(n_snps, hidden1), nn.GELU(),
-            nn.Dropout(dropout * 0.5))
-        self.block1 = nn.Sequential(
-            nn.BatchNorm1d(hidden1), nn.Linear(hidden1, hidden1), nn.GELU(),
-            nn.Dropout(dropout))
-        self.down_proj = nn.Sequential(
-            nn.BatchNorm1d(hidden1), nn.Linear(hidden1, hidden2), nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.BatchNorm1d(hidden2), nn.Linear(hidden2, latent_dim))
-        self.layer_norm = nn.LayerNorm(latent_dim)
-
-    def forward(self, x):
-        h = self.input_proj(x); h = h + self.block1(h)
-        h = self.down_proj(h); return self.layer_norm(h)
-
-
-class DeepKernelGP(nn.Module):
-    """Exact GP with learned NN encoder"""
-    def __init__(self, encoder, outputscale=1.0, lengthscale=1.0, noise=0.1):
-        super().__init__()
-        self.encoder = encoder
-        self.log_outputscale = nn.Parameter(torch.tensor(np.log(outputscale)))
-        self.log_lengthscale = nn.Parameter(torch.tensor(np.log(lengthscale)))
-        self.log_noise = nn.Parameter(torch.tensor(np.log(noise)))
-        self._train_features = None; self._train_y = None; self._K_inv = None
-
-    def _build_kernel(self, X1, X2=None):
-        lsq = torch.exp(self.log_lengthscale) ** 2
-        outscale = torch.exp(self.log_outputscale)
-        f1 = self.encoder(X1)
-        if X2 is None:
-            sq_dist = torch.cdist(f1, f1, p=2).pow(2)
-        else:
-            sq_dist = torch.cdist(f1, self.encoder(X2), p=2).pow(2)
-        return outscale * torch.exp(-0.5 * sq_dist / lsq)
-
-    def _kernel_on_features(self, F1, F2):
-        lsq = torch.exp(self.log_lengthscale) ** 2
-        outscale = torch.exp(self.log_outputscale)
-        sq_dist = torch.cdist(F1, F2, p=2).pow(2)
-        return outscale * torch.exp(-0.5 * sq_dist / lsq)
-
-    def marginal_nll(self, X, y):
-        n = X.shape[0]; K = self._build_kernel(X)
-        noise = torch.exp(self.log_noise)
-        Ky = K + noise * torch.eye(n, device=X.device)
-        Ky = Ky + JITTER * torch.eye(n, device=X.device)
-        L = torch.linalg.cholesky(Ky)
-        alpha = torch.cholesky_solve(y.unsqueeze(1), L).squeeze(1)
-        nll = 0.5 * (y * alpha).sum()
-        nll += L.diag().log().sum()
-        nll += 0.5 * n * np.log(2 * np.pi)
-        return nll / n
-
-    def fit(self, X, y):
-        self.eval()
-        with torch.no_grad():
-            self._train_features = self.encoder(X).detach()
-            self._train_y = y.detach()
-            n = X.shape[0]; K = self._build_kernel(X)
-            noise = torch.exp(self.log_noise)
-            Ky = K + noise * torch.eye(n, device=X.device)
-            Ky = Ky + JITTER * torch.eye(n, device=X.device)
-            L = torch.linalg.cholesky(Ky)
-            self._K_inv = torch.cholesky_inverse(L)
-
-    def predict(self, X_test):
-        if self._K_inv is None:
-            raise RuntimeError("call fit() before predict()")
-        with torch.no_grad():
-            f_test = self.encoder(X_test)
-            K_star = self._kernel_on_features(f_test, self._train_features)
-            alpha = self._K_inv @ self._train_y.unsqueeze(1)
-            mean = (K_star @ alpha).squeeze()
-            K_ss = torch.exp(self.log_outputscale) * torch.ones(X_test.shape[0], device=X_test.device)
-            diag_terms = torch.diag(K_star @ self._K_inv @ K_star.T)
-            variance = torch.clamp(K_ss - diag_terms, min=0)
-        return mean, variance
-
-
-def train_dkgp(model, X_train, y_train, epochs=200, lr=5e-3, patience=15,
-               batch_size=None, verbose=True):
-    model = model.to(DEVICE)
-    X_t = torch.FloatTensor(X_train).to(DEVICE)
-    y_t = torch.FloatTensor(y_train).to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=8)
-    best_state, best_loss, wait = None, float('inf'), 0
-    eval_every = 50
-    for epoch in range(epochs):
-        model.train(); opt.zero_grad()
-        if batch_size and batch_size < len(X_train):
-            idx = torch.randperm(len(X_train))[:batch_size]
-            loss = model.marginal_nll(X_t[idx], y_t[idx])
-        else:
-            loss = model.marginal_nll(X_t, y_t)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-        opt.step()
-        current_loss = loss.item(); scheduler.step(current_loss)
-        if current_loss < best_loss:
-            best_loss = current_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            wait = 0
-        else:
-            wait += 1
-            if wait >= patience:
-                if verbose: print(f"    DKL early stop @ epoch {epoch+1}, NLL={best_loss:.4f}")
-                break
-        if verbose and (epoch + 1) % eval_every == 0:
-            model.eval()
-            with torch.no_grad():
-                eval_nll = model.marginal_nll(X_t, y_t).item()
-            print(f"    DKL epoch {epoch+1:3d}: NLL={eval_nll:.4f}, "
-                  f"l={model.log_lengthscale.exp():.3f}, "
-                  f"sf={model.log_outputscale.exp():.3f}, "
-                  f"sn={model.log_noise.exp():.3f}")
-    if best_state is not None: model.load_state_dict(best_state)
-    model.eval(); model = model.cpu(); return model
 
 
 # ============================================================================
@@ -487,20 +238,6 @@ class FourierGenomicNet(nn.Module):
         return self.head(torch.cat([fp, tp], dim=1))
 
 
-class InceptionBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, dropout=0.3):
-        super().__init__()
-        e = out_ch // 4; r = out_ch - e*4
-        self.b3 = nn.Sequential(nn.Conv1d(in_ch, e, 3, padding=1), nn.BatchNorm1d(e), nn.GELU())
-        self.b7 = nn.Sequential(nn.Conv1d(in_ch, e, 7, padding=3), nn.BatchNorm1d(e), nn.GELU())
-        self.b15 = nn.Sequential(nn.Conv1d(in_ch, e, 15, padding=7), nn.BatchNorm1d(e), nn.GELU())
-        self.b31 = nn.Sequential(nn.Conv1d(in_ch, e+r, 31, padding=15), nn.BatchNorm1d(e+r), nn.GELU())
-        self.do = nn.Dropout(dropout*0.5)
-
-    def forward(self, x):
-        return self.do(torch.cat([self.b3(x), self.b7(x), self.b15(x), self.b31(x)], dim=1))
-
-
 class SEBlock(nn.Module):
     def __init__(self, ch, r=8):
         super().__init__()
@@ -508,26 +245,6 @@ class SEBlock(nn.Module):
                                 nn.GELU(), nn.Conv1d(ch//r, ch, 1), nn.Sigmoid())
     def forward(self, x):
         return x * self.se(x)
-
-
-class MultiScaleInceptionCNN(nn.Module):
-    """MICNN — multi-scale Inception + SE"""
-    def __init__(self, n_snps, hidden=48, dropout=0.35):
-        super().__init__()
-        self.stem = nn.Sequential(nn.Conv1d(1, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU())
-        self.b1 = InceptionBlock(hidden, hidden*2, dropout); self.s1 = SEBlock(hidden*2)
-        self.b2 = InceptionBlock(hidden*2, hidden*3, dropout); self.s2 = SEBlock(hidden*3)
-        self.b3 = InceptionBlock(hidden*3, hidden*4, dropout); self.s3 = SEBlock(hidden*4)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Sequential(
-            nn.Linear(hidden*4, hidden*3), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*3, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, 1))
-
-    def forward(self, x):
-        x = self.stem(x.unsqueeze(1))
-        x = self.s1(self.b1(x)); x = self.s2(self.b2(x)); x = self.s3(self.b3(x))
-        return self.head(self.pool(x).squeeze(-1))
 
 
 class HaarWaveletDecomp(nn.Module):
@@ -582,19 +299,50 @@ class FGNv2(nn.Module):
         return self.head(torch.cat([fp, wp, tp], dim=1))
 
 
-class FGNv3(nn.Module):
-    """FGN v3: Freq SE + SNP gate + BN — composes FGNEncoder + regression head"""
-    def __init__(self, n_snps, hidden=48, dropout=0.35, marker_types=None):
+class FGNv4(nn.Module):
+    """FGN v4: Complex-aware spectral (concat real+imag) + wavelet + time + colsample dropout"""
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.2):
         super().__init__()
-        self.encoder = FGNEncoder(n_snps, hidden, dropout, marker_types)
-        total = self.encoder.out_dim
+        self.n_freq = n_snps // 2 + 1
+        self.input_dropout = input_dropout
+        self.spec_r = nn.Parameter(torch.randn(1, 24, self.n_freq) * 0.02)
+        self.spec_i = nn.Parameter(torch.randn(1, 24, self.n_freq) * 0.02)
+        ch = hidden // 2
+        self.freq_conv_r = nn.Sequential(
+            nn.Conv1d(24, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.freq_conv_i = nn.Sequential(
+            nn.Conv1d(24, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.wavelet = HaarWaveletDecomp()
+        self.wavelet_conv = nn.Sequential(
+            nn.Conv1d(2, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.time_conv = nn.Sequential(
+            nn.Conv1d(1, ch, 21, padding=10), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Sequential(
-            nn.Linear(total, hidden*2), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*2, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(ch * 4, hidden), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden, 1))
 
     def forward(self, x):
-        return self.head(self.encoder(x))
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        xc = torch.fft.rfft(x, dim=1)
+        xr = xc.real.unsqueeze(1).expand(-1, 24, -1) * self.spec_r
+        xi = xc.imag.unsqueeze(1).expand(-1, 24, -1) * self.spec_i
+        fp_r = self.pool(self.freq_conv_r(xr)).squeeze(-1)
+        fp_i = self.pool(self.freq_conv_i(xi)).squeeze(-1)
+        cA, cD = self.wavelet(x)
+        wp = self.pool(self.wavelet_conv(torch.cat([cA, cD], dim=1))).squeeze(-1)
+        tp = self.pool(self.time_conv(x.unsqueeze(1))).squeeze(-1)
+        return self.head(torch.cat([fp_r, fp_i, wp, tp], dim=1))
 
 
 class DilatedInceptionBlock(nn.Module):
@@ -617,27 +365,6 @@ class SpatialPyramidPool1D(nn.Module):
     def forward(self, x):
         B = x.size(0)
         return torch.cat([F.adaptive_avg_pool1d(x, b).view(B, -1) for b in self.bins], dim=1)
-
-
-class MICNNv2(nn.Module):
-    """MICNN v2: +DilatedConv + SPP"""
-    def __init__(self, n_snps, hidden=40, dropout=0.35, spp_bins=(1, 2, 4)):
-        super().__init__()
-        self.stem = nn.Sequential(nn.Conv1d(1, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU())
-        self.b1 = DilatedInceptionBlock(hidden, hidden*2, dropout); self.s1 = SEBlock(hidden*2)
-        self.b2 = DilatedInceptionBlock(hidden*2, hidden*3, dropout); self.s2 = SEBlock(hidden*3)
-        self.b3 = DilatedInceptionBlock(hidden*3, hidden*4, dropout); self.s3 = SEBlock(hidden*4)
-        self.spp = SpatialPyramidPool1D(spp_bins)
-        spp_dim = (hidden*4) * sum(spp_bins)
-        self.head = nn.Sequential(
-            nn.Linear(spp_dim, hidden*8), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*8, hidden*4), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden*4, 1))
-
-    def forward(self, x):
-        x = self.stem(x.unsqueeze(1))
-        x = self.s1(self.b1(x)); x = self.s2(self.b2(x)); x = self.s3(self.b3(x))
-        return self.head(self.spp(x))
 
 
 class FusionNet(nn.Module):
@@ -684,6 +411,60 @@ class FusionNet(nn.Module):
         m = self.micnn_se(self.micnn_block(m))
         micnn_f = self.micnn_spp(m)
         return self.fusion_head(torch.cat([fgn_f, efm_f, micnn_f], dim=1))
+
+
+class AdditiveGenomicNet(nn.Module):
+    """End-to-end additive model: linear SNP effects + nonlinear spectral residual.
+
+    Replaces the two-stage ResFGN. The linear path captures additive effects
+    (analogous to RRBLUP), the spectral path learns nonlinear residuals
+    (epistasis, dominance). Input dropout mimics XGBoost colsample.
+    """
+    def __init__(self, n_snps, hidden=48, dropout=0.35, input_dropout=0.2):
+        super().__init__()
+        self.n_freq = n_snps // 2 + 1
+        self.input_dropout = input_dropout
+        self.additive = nn.Linear(n_snps, 1, bias=False)
+        ch = hidden // 2
+        self.spec_r = nn.Parameter(torch.randn(1, 16, self.n_freq) * 0.02)
+        self.spec_i = nn.Parameter(torch.randn(1, 16, self.n_freq) * 0.02)
+        self.freq_conv_r = nn.Sequential(
+            nn.Conv1d(16, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.freq_conv_i = nn.Sequential(
+            nn.Conv1d(16, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.wavelet = HaarWaveletDecomp()
+        self.wavelet_conv = nn.Sequential(
+            nn.Conv1d(2, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.time_conv = nn.Sequential(
+            nn.Conv1d(1, ch, 21, padding=10), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.nonlinear_head = nn.Sequential(
+            nn.Linear(ch * 4, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x_do = F.dropout(x, p=self.input_dropout, training=self.training)
+        lin = self.additive(x_do)
+        xc = torch.fft.rfft(x_do, dim=1)
+        xr = xc.real.unsqueeze(1).expand(-1, 16, -1) * self.spec_r
+        xi = xc.imag.unsqueeze(1).expand(-1, 16, -1) * self.spec_i
+        fp_r = self.pool(self.freq_conv_r(xr)).squeeze(-1)
+        fp_i = self.pool(self.freq_conv_i(xi)).squeeze(-1)
+        cA, cD = self.wavelet(x_do)
+        wp = self.pool(self.wavelet_conv(torch.cat([cA, cD], dim=1))).squeeze(-1)
+        tp = self.pool(self.time_conv(x_do.unsqueeze(1))).squeeze(-1)
+        nonlin = self.nonlinear_head(torch.cat([fp_r, fp_i, wp, tp], dim=1))
+        return lin + nonlin
 
 
 # ============================================================================
@@ -826,26 +607,21 @@ def _select_dl_markers(Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps):
 def create_model(name, n_snps, overrides=None):
     o = overrides or {}
     if name == 'FGN': return FourierGenomicNet(n_snps=n_snps, hidden=64, dropout=0.35)
-    if name == 'MICNN': return MultiScaleInceptionCNN(n_snps=n_snps, hidden=48, dropout=0.35)
     if name == 'FGN v2': return FGNv2(n_snps=n_snps, hidden=64, dropout=0.35)
-    if name == 'MICNN v2': return MICNNv2(n_snps=n_snps, hidden=40, dropout=0.35, spp_bins=(1, 2, 4))
-    if name == 'FGN v3': return FGNv3(n_snps=n_snps, hidden=o.get('hidden', 48), dropout=o.get('dropout', 0.35), marker_types=o.get('marker_types'))
+    if name == 'FGN v4': return FGNv4(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.2))
     if name == 'FusionNet': return FusionNet(n_snps=n_snps, hidden_dim=o.get('hidden_dim', 48), dropout=o.get('dropout', 0.35))
-    if name == 'PreFGN': return PreFGN(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), marker_types=o.get('marker_types'))
-    if name == 'DeepKernelGP':
-        encoder = GenomicEncoder(n_snps=n_snps, latent_dim=o.get('latent_dim', 24), hidden1=o.get('hidden1', 256), hidden2=o.get('hidden2', 128), dropout=o.get('dropout', 0.3))
-        return DeepKernelGP(encoder, outputscale=o.get('outputscale', 1.0), lengthscale=o.get('lengthscale', 1.0), noise=o.get('noise', 0.1))
+    if name == 'AdditiveGenomicNet': return AdditiveGenomicNet(n_snps=n_snps, hidden=o.get('hidden', 48), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.2))
     raise ValueError(f"Unknown model: {name}")
 
 
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
-MARKER_TYPE_MODELS = {'FGN v3', 'PreFGN'}
+MARKER_TYPE_MODELS = set()
 
 TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
-DL_BASE_NAMES = ['FGN', 'MICNN', 'FGN v2', 'MICNN v2', 'FGN v3', 'PreFGN', 'DeepKernelGP']
-DL_NAMES = DL_BASE_NAMES + ['FusionNet']
-EXTRA_NAMES = ['ResFGN']
+DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4']  # base models for Stacking OOF
+DL_NAMES = DL_BASE_NAMES + ['FusionNet', 'AdditiveGenomicNet']
+EXTRA_NAMES = []
 ALL_NAMES = TRAD_NAMES + DL_NAMES + EXTRA_NAMES
 
 
@@ -863,17 +639,6 @@ def _make_trad_configs(G_train, G_te_tr, n_snps, n_train):
 # ============================================================================
 # Section H: Stacking / Ensemble Functions
 # ============================================================================
-
-def fit_resfgn_components(X, y, n_snps, cv=3, fusion_overrides=None):
-    o = fusion_overrides or {}
-    ridge = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=cv)
-    ridge.fit(X, y); residuals = y - ridge.predict(X)
-    fusion = FusionNet(n_snps=n_snps, hidden_dim=o.get('hidden_dim', 48), dropout=o.get('dropout', 0.35)).to(DEVICE)
-    fusion = train_torch_model(fusion, X, residuals, epochs=300, batch_size=64,
-                               lr=o.get('lr', 1e-3), weight_decay=o.get('weight_decay', 1e-3),
-                               patience=o.get('patience', 30))
-    return ridge, fusion
-
 
 def stacking_evaluate(oof_preds_dict, targets, n_folds=5):
     base_names = list(oof_preds_dict.keys())
@@ -917,7 +682,7 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
     print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
 
 
-def deploy_models(X, y, vt, n_snps, trait_name, output_dir, tuned_params, quick_test=False):
+def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test=False):
     """Fit all models on full data and save to disk for later inference."""
     import pickle
     deploy_dir = output_dir / f"deployed_{trait_name}"
@@ -926,7 +691,7 @@ def deploy_models(X, y, vt, n_snps, trait_name, output_dir, tuned_params, quick_
     print(f"\n  Deploying models on full dataset ({len(y)} samples) ...")
 
     gidx = gwas_select(X, y, n_snps)
-    X_f = X[:, gidx]; vt_f = vt[gidx] if vt is not None else None
+    X_f = X[:, gidx]
     sc = StandardScaler(); X_s = sc.fit_transform(X_f).astype(np.float32)
     with open(deploy_dir / "scaler.pkl", 'wb') as f: pickle.dump(sc, f)
 
@@ -943,33 +708,19 @@ def deploy_models(X, y, vt, n_snps, trait_name, output_dir, tuned_params, quick_
 
     for mname in DL_NAMES:
         tp = tuned_params.get(mname, {}) if tuned_params else {}
-        if vt_f is not None and mname in MARKER_TYPE_MODELS:
-            model = create_model(mname, n_snps, overrides=dict(tp, marker_types=vt_f))
-        else:
-            model = create_model(mname, n_snps, overrides=tp)
-        if mname == 'PreFGN' and not quick_test:
-            pretrain_prefgn_v2(model, X_s, epochs=50, lr=1e-3, patience=10)
-        if mname == 'DeepKernelGP':
-            model = train_dkgp(model, X_s, y, epochs=tp.get('epochs', 200),
-                               lr=tp.get('lr', 5e-3), patience=tp.get('patience', 15), verbose=False)
-            model.fit(torch.FloatTensor(X_s), torch.FloatTensor(y))
-        else:
-            bs = 64 if mname == 'FusionNet' else 128
-            lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-            wd = tp.get('weight_decay', 1e-3); pat = tp.get('patience', 30)
-            model = train_torch_model(model, X_s, y, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+        model = create_model(mname, n_snps, overrides=tp)
+        bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+        lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+        wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
+        pat = tp.get('patience', 30)
+        model = train_torch_model(model, X_s, y, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
         torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
         print(f"    [saved] {mname}.pt")
         del model
-
-    ridge, res_model = fit_resfgn_components(X_s, y, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet') if tuned_params else None)
-    with open(deploy_dir / "ResFGN_ridge.pkl", 'wb') as f: pickle.dump(ridge, f)
-    torch.save(res_model.state_dict(), deploy_dir / "ResFGN_fusion.pt")
-    print(f"    [saved] ResFGN_ridge.pkl + ResFGN_fusion.pt")
-    del res_model; torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
     meta = {'trait': trait_name, 'n_snps': n_snps, 'gwas_indices': gidx.tolist(),
-            'n_samples': len(y), 'models': list(trad_models.keys()) + DL_NAMES + ['ResFGN']}
+            'n_samples': len(y), 'models': list(trad_models.keys()) + DL_NAMES}
     with open(deploy_dir / "deployment_meta.json", 'w') as f: json.dump(meta, f, indent=2)
     print(f"    [saved] deployment_meta")
 
@@ -985,13 +736,15 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
     X_val, y_val = X_train[val_idx], y_train[val_idx]
 
     def objective(trial):
-        if model_name == 'FGN v3':
-            overrides = {'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
+        if model_name == 'FGN v4':
+            overrides = {'hidden': trial.suggest_categorical('hidden', [48, 64, 96]),
                          'dropout': trial.suggest_float('dropout', 0.2, 0.5),
+                         'input_dropout': trial.suggest_float('input_dropout', 0.1, 0.4),
                          'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
                          'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
                          'patience': trial.suggest_int('patience', 20, 50)}
-            model = FGNv3(n_snps=n_snps, hidden=overrides['hidden'], dropout=overrides['dropout'])
+            model = FGNv4(n_snps=n_snps, hidden=overrides['hidden'], dropout=overrides['dropout'],
+                          input_dropout=overrides['input_dropout'])
             bs = 128
         elif model_name == 'FusionNet':
             overrides = {'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48, 64]),
@@ -1001,23 +754,16 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
                          'patience': trial.suggest_int('patience', 20, 50)}
             model = FusionNet(n_snps=n_snps, hidden_dim=overrides['hidden_dim'], dropout=overrides['dropout'])
             bs = 64
-        elif model_name == 'DeepKernelGP':
-            overrides = {'latent_dim': trial.suggest_categorical('latent_dim', [16, 24, 32]),
-                         'hidden1': trial.suggest_categorical('hidden1', [128, 256]),
-                         'hidden2': trial.suggest_categorical('hidden2', [64, 128]),
-                         'dropout': trial.suggest_float('dropout', 0.1, 0.4),
-                         'lr': trial.suggest_float('lr', 1e-3, 1e-2, log=True),
-                         'epochs': trial.suggest_int('epochs', 150, 300),
-                         'patience': trial.suggest_int('patience', 10, 25)}
-            encoder = GenomicEncoder(n_snps=n_snps, latent_dim=overrides['latent_dim'],
-                                     hidden1=overrides['hidden1'], hidden2=overrides['hidden2'],
-                                     dropout=overrides['dropout'])
-            model = DeepKernelGP(encoder)
-            model = train_dkgp(model, X_tr, y_tr, epochs=overrides['epochs'], lr=overrides['lr'],
-                               patience=overrides['patience'], verbose=False)
-            model.fit(torch.FloatTensor(X_tr), torch.FloatTensor(y_tr))
-            mean, _ = model.predict(torch.FloatTensor(X_val))
-            return float(r2_score(y_val, mean.cpu().numpy()))
+        elif model_name == 'AdditiveGenomicNet':
+            overrides = {'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
+                         'dropout': trial.suggest_float('dropout', 0.2, 0.5),
+                         'input_dropout': trial.suggest_float('input_dropout', 0.1, 0.4),
+                         'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
+                         'weight_decay': trial.suggest_float('weight_decay', 5e-4, 1e-2, log=True),
+                         'patience': trial.suggest_int('patience', 20, 50)}
+            model = AdditiveGenomicNet(n_snps=n_snps, hidden=overrides['hidden'], dropout=overrides['dropout'],
+                                       input_dropout=overrides['input_dropout'])
+            bs = 64
         else: raise ValueError(f"Unknown model for tuning: {model_name}")
         model = train_torch_model(model, X_tr, y_tr, epochs=300, batch_size=bs,
                                   lr=overrides.get('lr', 2e-3),
@@ -1177,7 +923,7 @@ def run_wheat(quick_test=True):
                 X_tune = X_all[:, maf_tune][:, gidx_t]
             else: X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
             sc_tune = StandardScaler(); X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
-            for tune_name in ['FGN v3', 'FusionNet']:
+            for tune_name in ['FGN v4', 'FusionNet', 'AdditiveGenomicNet']:
                 best_p, best_r2 = tune_model_hyperparams(tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
                 pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
@@ -1224,45 +970,22 @@ def run_wheat(quick_test=True):
             # DL models
             for mi, mname in enumerate(DL_NAMES):
                 tp = tuned_params.get(mname, {})
-                if mname in MARKER_TYPE_MODELS:
-                    dl_models[mname] = create_model(mname, n_snps, overrides=dict(tp, marker_types=vt_dl))
                 if fi == 0: results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
                 t0 = time.time()
-                if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn_v2(dl_models[mname], Xtr_dl_s, epochs=50, lr=1e-3, patience=10)
-                if mname == 'DeepKernelGP':
-                    model = train_dkgp(dl_models[mname], Xtr_dl_s, ytr, epochs=tp.get('epochs', 200),
-                                       lr=tp.get('lr', 5e-3), patience=tp.get('patience', 15), verbose=False)
-                    model.fit(torch.FloatTensor(Xtr_dl_s), torch.FloatTensor(ytr))
-                    mean, _ = model.predict(torch.FloatTensor(Xte_dl_s)); preds = mean.cpu().numpy()
-                else:
-                    bs = 64 if mname == 'FusionNet' else 128
-                    lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-                    wd = tp.get('weight_decay', 1e-3); pat = tp.get('patience', 30)
-                    model = train_torch_model(dl_models[mname], Xtr_dl_s, ytr, epochs=300,
-                                              batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                    preds = predict_torch_model(model, Xte_dl_s)
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+                wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
+                pat = tp.get('patience', 30)
+                model = train_torch_model(dl_models[mname], Xtr_dl_s, ytr, epochs=300,
+                                          batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+                preds = predict_torch_model(model, Xte_dl_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist())
                 results[mname]['targets'].extend(yte.tolist())
                 results[mname]['time'] += elapsed
-                print(f"    {mname:<16s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                print(f"    {mname:<22s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
                 if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
-                if mname not in MARKER_TYPE_MODELS:
-                    dl_models[mname] = create_model(mname, n_snps, overrides=tp)
-
-            # ResFGN
-            t0 = time.time()
-            ridge, res_model = fit_resfgn_components(Xtr_dl_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
-            pred_te_ridge = ridge.predict(Xte_dl_s)
-            res_pred = predict_torch_model(res_model, Xte_dl_s)
-            final_pred = pred_te_ridge + res_pred
-            elapsed = time.time() - t0
-            if fi == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
-            results['ResFGN']['preds'].extend(final_pred.tolist())
-            results['ResFGN']['targets'].extend(yte.tolist())
-            results['ResFGN']['time'] += elapsed
-            print(f"    {'ResFGN':<16s} R²={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
+                dl_models[mname] = create_model(mname, n_snps, overrides=tp)
             torch.cuda.empty_cache()
 
         # Trait summary
@@ -1283,7 +1006,7 @@ def run_wheat(quick_test=True):
         with open(output_dir / "ensemble_intermediate.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         if not quick_test:
-            deploy_models(X_all, y, vt_all, n_snps, trait, output_dir, tuned_params, quick_test)
+            deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
 
     if not quick_test:
         _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Wheat')
@@ -1352,7 +1075,7 @@ def run_rice(quick_test=True):
                 X_tune = X_all[:, maf_tune][:, gidx_t]
             else: X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
             sc_tune = StandardScaler(); X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
-            for tune_name in ['FGN v3', 'FusionNet']:
+            for tune_name in ['FGN v4', 'FusionNet', 'AdditiveGenomicNet']:
                 best_p, best_r2 = tune_model_hyperparams(tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
                 print(f"    {tune_name}: val R²={best_r2:.4f}")
@@ -1391,32 +1114,17 @@ def run_rice(quick_test=True):
             for mi, mname in enumerate(DL_NAMES):
                 if fi == 0: results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
                 t0 = time.time(); tp = tuned_params.get(mname, {})
-                if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn_v2(dl_models[mname], Xtr_dl_s, epochs=50, lr=1e-3, patience=10)
-                if mname == 'DeepKernelGP':
-                    model = train_dkgp(dl_models[mname], Xtr_dl_s, ytr, epochs=tp.get('epochs', 200),
-                                       lr=tp.get('lr', 5e-3), patience=tp.get('patience', 15), verbose=False)
-                    model.fit(torch.FloatTensor(Xtr_dl_s), torch.FloatTensor(ytr))
-                    mean, _ = model.predict(torch.FloatTensor(Xte_dl_s)); preds = mean.cpu().numpy()
-                else:
-                    bs = 64 if mname == 'FusionNet' else 128
-                    lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3); wd = tp.get('weight_decay', 1e-3); pat = tp.get('patience', 30)
-                    model = train_torch_model(dl_models[mname], Xtr_dl_s, ytr, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                    preds = predict_torch_model(model, Xte_dl_s)
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+                wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
+                pat = tp.get('patience', 30)
+                model = train_torch_model(dl_models[mname], Xtr_dl_s, ytr, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+                preds = predict_torch_model(model, Xte_dl_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<16s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                print(f"    {mname:<22s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
                 if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
                 dl_models[mname] = create_model(mname, n_snps, overrides=tuned_params.get(mname, {}) or {})
-
-            # ResFGN
-            t0 = time.time()
-            ridge, res_model = fit_resfgn_components(Xtr_dl_s, ytr, n_snps, cv=3, fusion_overrides=tuned_params.get('FusionNet'))
-            pred_te_ridge = ridge.predict(Xte_dl_s); res_pred = predict_torch_model(res_model, Xte_dl_s)
-            final_pred = pred_te_ridge + res_pred; elapsed = time.time() - t0
-            if fi == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
-            results['ResFGN']['preds'].extend(final_pred.tolist()); results['ResFGN']['targets'].extend(yte.tolist()); results['ResFGN']['time'] += elapsed
-            print(f"    {'ResFGN':<16s} R²={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
             torch.cuda.empty_cache()
 
         # Summary
@@ -1434,7 +1142,7 @@ def run_rice(quick_test=True):
         with open(output_dir / "ensemble_intermediate.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         if not quick_test:
-            deploy_models(X_all, y, None, n_snps, trait, output_dir, tuned_params, quick_test)
+            deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
 
     if not quick_test:
         _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Rice')
@@ -1544,29 +1252,15 @@ def run_maize(quick_test=True):
             for mi, mname in enumerate(DL_NAMES):
                 if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in dl_models[mname].parameters())
                 t0 = time.time()
-                if mname == 'PreFGN' and not quick_test:
-                    pretrain_prefgn_v2(dl_models[mname], Xtr_s, epochs=50, lr=1e-3, patience=10)
-                if mname == 'DeepKernelGP':
-                    model = train_dkgp(dl_models[mname], Xtr_s, ytr, epochs=200, lr=5e-3, patience=15, verbose=False)
-                    model.fit(torch.FloatTensor(Xtr_s), torch.FloatTensor(ytr))
-                    mean, _ = model.predict(torch.FloatTensor(Xte_s)); preds = mean.cpu().numpy()
-                else:
-                    model = train_torch_model(dl_models[mname], Xtr_s, ytr, epochs=300, batch_size=128, lr=2e-3, weight_decay=1e-3, patience=30)
-                    preds = predict_torch_model(model, Xte_s)
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+                wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
+                model = train_torch_model(dl_models[mname], Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
+                preds = predict_torch_model(model, Xte_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<16s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                print(f"    {mname:<22s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
                 if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
                 dl_models[mname] = create_model(mname, n_snps)
-
-            # ResFGN
-            t0 = time.time()
-            ridge, res_model = fit_resfgn_components(Xtr_s, ytr, n_snps, cv=3)
-            pred_te_ridge = ridge.predict(Xte_s); res_pred = predict_torch_model(res_model, Xte_s)
-            final_pred = pred_te_ridge + res_pred; elapsed = time.time() - t0
-            if fold_i == 0: results['ResFGN']['params'] = (n_snps+1) + sum(p.numel() for p in res_model.parameters())
-            results['ResFGN']['preds'].extend(final_pred.tolist()); results['ResFGN']['targets'].extend(yte.tolist()); results['ResFGN']['time'] += elapsed
-            print(f"    {'ResFGN':<16s} R²={r2_score(yte, final_pred):+.4f}  ({elapsed:.1f}s)")
             torch.cuda.empty_cache()
 
         # Summary
@@ -1583,7 +1277,7 @@ def run_maize(quick_test=True):
         with open(output_dir / "ensemble_intermediate.json", 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         if not quick_test:
-            deploy_models(X_all, y, None, n_snps, trait, output_dir, None, quick_test)
+            deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
 
     if not quick_test:
         _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Maize')
