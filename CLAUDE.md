@@ -135,4 +135,4 @@ Most root-level Python files are independent training scripts that share similar
 - SWA (Stochastic Weight Averaging): 稳定 +0.01-0.02
 - hidden=96 for FGN v4/v7: 轻微提升
 - 去掉 StandardScaler: +0.01
-- Stacking: Trad+Top DL + Ridge meta-learner，在 Plant_height 上 +0.006 (边际)
+- Stacking:比XGBoost提升0.02左右

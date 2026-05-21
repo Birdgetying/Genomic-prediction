@@ -22,7 +22,7 @@ import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import RidgeCV, ElasticNetCV
+from sklearn.linear_model import RidgeCV, ElasticNetCV, LassoCV
 from scipy.stats import pearsonr
 import xgboost as xgb
 
@@ -1104,7 +1104,9 @@ def create_model(name, n_snps, overrides=None):
     raise ValueError(f"Unknown model: {name}")
 
 
-RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+RIDGE_ALPHAS = np.logspace(-3, 5, 50)  # wide 50-point log grid for better alpha selection
+LASSO_ALPHAS = np.logspace(-4, 2, 30)
+ENET_ALPHAS = np.logspace(-4, 2, 20)
 
 TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
 DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGN v6', 'FGN v7', 'FGN v9', 'FGN v10', 'FGN v11', 'FGNplus', 'GenomicFM', 'FGN PCA']
@@ -1124,49 +1126,263 @@ def _make_trad_configs(G_train, G_te_tr, n_snps, n_train):
 
 
 # ============================================================================
-# Section H: Stacking / Ensemble Functions
+# Section H: Stacking / Ensemble Functions (Enhanced)
 # ============================================================================
 
-def stacking_evaluate(oof_preds_dict, targets, n_folds=5):
+def _prune_correlated(oof_preds_dict, targets, corr_threshold=0.995):
+    """Remove redundant base models whose OOF predictions are too correlated.
+
+    For each pair with |r| > corr_threshold, keep the model with higher R².
+    Returns filtered dict and list of removed names.
+    """
+    names = list(oof_preds_dict.keys())
+    if len(names) <= 1:
+        return oof_preds_dict, []
+    preds = np.column_stack([oof_preds_dict[m] for m in names])
+    corr = np.corrcoef(preds.T)
+    np.fill_diagonal(corr, 0)
+    # Rank by individual R² descending
+    r2_scores = {m: float(r2_score(targets, oof_preds_dict[m])) for m in names}
+    ranked = sorted(names, key=lambda m: r2_scores[m], reverse=True)
+    kept, removed = [], set()
+    for m in ranked:
+        if m in removed:
+            continue
+        kept.append(m)
+        mi = names.index(m)
+        for j, other in enumerate(names):
+            if other != m and other not in removed and other not in kept:
+                if abs(corr[mi, j]) > corr_threshold:
+                    removed.add(other)
+    pruned = {m: oof_preds_dict[m] for m in kept}
+    return pruned, list(removed)
+
+
+def _greedy_forward_select(oof_preds_dict, targets, meta_type='Lasso',
+                           min_gain=0.0005, max_models=10):
+    """Greedy forward model selection via nested 3-fold CV on meta-features.
+
+    Starts from the single best model, iteratively adds the model that gives
+    the largest R² improvement. Stops when gain < min_gain.
+
+    Args:
+        oof_preds_dict: {model_name: OOF_predictions_array}
+        targets: phenotype values
+        meta_type: 'Ridge', 'Lasso', or 'ElasticNet'
+        min_gain: minimum R² improvement to keep adding models
+        max_models: hard cap on number of base models
+
+    Returns:
+        selected_names: ordered list of selected model names
+    """
+    names = list(oof_preds_dict.keys())
+    if len(names) <= 1:
+        return names
+
+    # Score each model individually
+    scores = {m: float(r2_score(targets, oof_preds_dict[m])) for m in names}
+    ranked = sorted(names, key=lambda m: scores[m], reverse=True)
+
+    selected = [ranked[0]]
+    pool = ranked[1:]
+
+    inner_kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+    def _eval_subset(sel):
+        X = np.column_stack([oof_preds_dict[m] for m in sel])
+        preds = np.zeros(len(targets))
+        for itr, ite in inner_kf.split(X):
+            if meta_type == 'Ridge':
+                m = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=3)
+            elif meta_type == 'Lasso':
+                m = LassoCV(alphas=LASSO_ALPHAS, cv=3, max_iter=10000, random_state=42)
+            elif meta_type == 'ElasticNet':
+                m = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
+                                 alphas=ENET_ALPHAS, cv=3, max_iter=10000, random_state=42)
+            else:
+                m = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=3)
+            m.fit(X[itr], targets[itr])
+            preds[ite] = m.predict(X[ite])
+        return float(r2_score(targets, preds))
+
+    best_r2 = _eval_subset(selected)
+
+    while pool and len(selected) < max_models:
+        gains = []
+        for cand in pool[:min(12, len(pool))]:  # test up to 12 candidates per round
+            trial_r2 = _eval_subset(selected + [cand])
+            gains.append((cand, trial_r2 - best_r2, trial_r2))
+        gains.sort(key=lambda x: -x[2])
+        best_cand, best_gain, best_trial_r2 = gains[0]
+        if best_gain < min_gain:
+            break
+        selected.append(best_cand)
+        pool.remove(best_cand)
+        best_r2 = best_trial_r2
+
+    return selected
+
+
+def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
+                      meta_type='Ridge', prune_corr=True):
+    """Evaluate a stacking ensemble with flexible meta-learner and optional pruning.
+
+    Args:
+        oof_preds_dict: {model_name: OOF_predictions_array}
+        targets: phenotype values
+        n_folds: inner CV folds for honest evaluation
+        meta_type: 'Ridge' (default), 'Lasso', 'ElasticNet'
+        prune_corr: if True, correlation-prune before stacking (r > 0.995)
+
+    Returns:
+        dict with R2, Correlation, Meta_weights, Meta_intercept, Base_models,
+        Pruned_models (if pruning was applied)
+    """
+    original_names = list(oof_preds_dict.keys())
+    pruned_names = []
+
+    if prune_corr and len(original_names) > 2:
+        oof_preds_dict, pruned_names = _prune_correlated(oof_preds_dict, targets)
+
     base_names = list(oof_preds_dict.keys())
+    if len(base_names) < 2:
+        # single model → just return its performance
+        r2_v = float(r2_score(targets, oof_preds_dict[base_names[0]]))
+        corr_v = float(pearsonr(targets, oof_preds_dict[base_names[0]])[0])
+        return {'R2': r2_v, 'Correlation': corr_v,
+                'Meta_weights': [1.0], 'Meta_intercept': 0.0,
+                'Base_models': base_names, 'Pruned_models': pruned_names}
+
     X_meta = np.column_stack([oof_preds_dict[m] for m in base_names])
-    meta = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
-    meta.fit(X_meta, targets)
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_SEED)
+
+    # Inner CV for honest evaluation
+    kf = KFold(n_splits=min(n_folds, len(targets)//3), shuffle=True, random_state=RANDOM_SEED)
     sp = np.zeros(len(targets))
+
     for tr, te in kf.split(X_meta):
-        m = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=3)
-        m.fit(X_meta[tr], targets[tr]); sp[te] = m.predict(X_meta[te])
-    return {'R2': float(r2_score(targets, sp)), 'Correlation': float(pearsonr(targets, sp)[0]),
-            'Meta_weights': meta.coef_.tolist(), 'Meta_intercept': float(meta.intercept_),
-            'Base_models': base_names}
+        if meta_type == 'Lasso':
+            m = LassoCV(alphas=LASSO_ALPHAS, cv=3, max_iter=10000, random_state=42)
+        elif meta_type == 'ElasticNet':
+            m = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
+                             alphas=ENET_ALPHAS, cv=3, max_iter=10000, random_state=42)
+        else:  # Ridge (default)
+            m = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=3)
+        m.fit(X_meta[tr], targets[tr])
+        sp[te] = m.predict(X_meta[te])
+
+    # Full fit for weight extraction
+    if meta_type == 'Lasso':
+        final_meta = LassoCV(alphas=LASSO_ALPHAS, cv=5, max_iter=10000, random_state=42)
+    elif meta_type == 'ElasticNet':
+        final_meta = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
+                                  alphas=ENET_ALPHAS, cv=5, max_iter=10000, random_state=42)
+    else:
+        final_meta = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+    final_meta.fit(X_meta, targets)
+
+    result = {'R2': float(r2_score(targets, sp)),
+              'Correlation': float(pearsonr(targets, sp)[0]),
+              'Meta_weights': final_meta.coef_.tolist(),
+              'Meta_intercept': float(final_meta.intercept_),
+              'Base_models': base_names,
+              'Meta_type': meta_type}
+    if pruned_names:
+        result['Pruned_models'] = pruned_names
+    return result
+
+
+def stacking_evaluate_greedy(oof_preds_dict, targets, n_folds=5, meta_type='Lasso'):
+    """Full stacking pipeline: prune → greedy select → evaluate with inner CV.
+
+    This is the recommended variant that automatically finds the optimal model
+    subset.  Uses Lasso as default meta-learner because it naturally prunes
+    weak base models via L1 regularization.
+    """
+    # Step 1: correlation pruning
+    pruned_dict, pruned_names = _prune_correlated(oof_preds_dict, targets)
+
+    # Step 2: greedy forward selection
+    if len(pruned_dict) > 2:
+        selected = _greedy_forward_select(pruned_dict, targets, meta_type=meta_type)
+    else:
+        selected = list(pruned_dict.keys())
+
+    # Step 3: evaluate selected subset
+    selected_dict = {m: oof_preds_dict[m] for m in selected}
+    result = stacking_evaluate(selected_dict, targets, n_folds=n_folds,
+                               meta_type=meta_type, prune_corr=False)
+    if pruned_names:
+        result['Pruned_models'] = pruned_names
+    result['Greedy_selected'] = selected
+    return result
 
 
 def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
-    """Run 3 stacking ensembles and add results to trait_res. Only when folds >= 3."""
+    """Run stacking ensembles and add results to trait_res.
+
+    Produces 5 ensemble variants:
+      - Stacking (DL)        — DL models only, Ridge meta-learner
+      - Stacking (All)       — all models, Ridge meta-learner
+      - Trad Ensemble        — traditional models only, Ridge
+      - Stacking (Pruned)    — all models, Lasso meta-learner, correlation-pruned
+      - Stacking (Greedy)    — greedy forward selection + Lasso meta-learner
+    """
     if folds_run < 3: return
     n_cv = min(5, folds_run)
-    sr_dl = stacking_evaluate(oof_dl, y, n_folds=n_cv)
+
+    # --- 1. Stacking (DL) — Ridge ---
+    sr_dl = stacking_evaluate(oof_dl, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
     trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
                                   'RMSE': 0.0, 'Type': TYPE_ENS,
                                   'Meta_weights': sr_dl.get('Meta_weights', []),
                                   'Base_models': sr_dl.get('Base_models', [])}
+
+    # --- 2. Stacking (All) — Ridge ---
     oof_all = {**oof_trad, **oof_dl}
-    sr_all = stacking_evaluate(oof_all, y, n_folds=n_cv)
+    sr_all = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
     trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
                                    'RMSE': 0.0, 'Type': TYPE_ENS,
                                    'Meta_weights': sr_all.get('Meta_weights', []),
                                    'Base_models': sr_all.get('Base_models', [])}
-    tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)))
+
+    # --- 3. Trad Ensemble — Ridge ---
+    tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)),
+                            meta_type='Ridge', prune_corr=False)
     trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'],
                                   'RMSE': 0.0, 'Type': TYPE_ENS,
                                   'Meta_weights': tsr.get('Meta_weights', []),
                                   'Base_models': tsr.get('Base_models', [])}
+
+    # --- 4. Stacking (Pruned) — Lasso, correlation-pruned ---
+    sp = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='Lasso', prune_corr=True)
+    trait_res['Stacking (Pruned)'] = {'R2': sp['R2'], 'Correlation': sp['Correlation'],
+                                       'RMSE': 0.0, 'Type': TYPE_ENS,
+                                       'Meta_weights': sp.get('Meta_weights', []),
+                                       'Base_models': sp.get('Base_models', []),
+                                       'Pruned_models': sp.get('Pruned_models', [])}
+
+    # --- 5. Stacking (Greedy) — Greedy select + Lasso ---
+    sg = stacking_evaluate_greedy(oof_all, y, n_folds=n_cv, meta_type='Lasso')
+    trait_res['Stacking (Greedy)'] = {'R2': sg['R2'], 'Correlation': sg['Correlation'],
+                                       'RMSE': 0.0, 'Type': TYPE_ENS,
+                                       'Meta_weights': sg.get('Meta_weights', []),
+                                       'Base_models': sg.get('Base_models', []),
+                                       'Greedy_selected': sg.get('Greedy_selected', []),
+                                       'Pruned_models': sg.get('Pruned_models', [])}
+
     print(f"  {'Stacking (DL)':<24s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f}")
     print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
-    weights_str = dict(zip(sr_all['Base_models'], [f'{w:.3f}' for w in sr_all['Meta_weights']]))
-    print(f"    All weights: {weights_str}")
     print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
+    print(f"  {'Stacking (Pruned)':<24s} {sp['R2']:8.4f} {sp['Correlation']:8.4f}  "
+          f"[{'Lasso' if sp.get('Meta_type')=='Lasso' else '?'}, "
+          f"pruned={len(sp.get('Pruned_models',[]))}]")
+    print(f"  {'Stacking (Greedy)':<24s} {sg['R2']:8.4f} {sg['Correlation']:8.4f}  "
+          f"[{sg.get('Meta_type','Lasso')}, "
+          f"selected={len(sg.get('Greedy_selected',[]))}/{len(oof_all)}]")
+    # Show greedy selected model names
+    gs = sg.get('Greedy_selected', [])
+    if gs:
+        print(f"    Greedy selected: {gs}")
 
 
 def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test=False):
