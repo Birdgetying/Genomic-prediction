@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Quick test: run genomic_ensemble pipeline on WheatGP pickle data (599 samples, 1280 markers)."""
-import sys, os, time, pickle, json, random
+"""Quick test: run genomic_ensemble pipeline on Rice SNP data (529 samples, 360K markers)."""
+import sys, os, time, json, random
 import numpy as np
 
 random.seed(42)
@@ -17,62 +17,42 @@ torch.backends.cudnn.benchmark = False
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import KFold
 from sklearn.metrics import r2_score
-from sklearn.linear_model import RidgeCV
 from scipy.stats import pearsonr
 
-# Import everything needed from the ensemble module
 import genomic_ensemble as ge
 
-def load_wheatgp_data(data_dir="WheatGP/WheatGP-main/data_example"):
-    """Load WheatGP pickle dicts and convert to (n_samples, n_markers) matrices."""
-    import pickle
-    with open(f"{data_dir}/G_train.pkl", 'rb') as f:
-        G_train = pickle.load(f)
-    with open(f"{data_dir}/P_train.pkl", 'rb') as f:
-        P_train = pickle.load(f)
-    with open(f"{data_dir}/G_te.pkl", 'rb') as f:
-        G_te = pickle.load(f)
-    with open(f"{data_dir}/P_te.pkl", 'rb') as f:
-        P_te = pickle.load(f)
 
-    keys_tr = sorted(G_train.keys(), key=lambda k: int(k))
-    keys_te = sorted(G_te.keys(), key=lambda k: int(k))
-
-    X_train = np.array([G_train[k] for k in keys_tr], dtype=np.float32)
-    y_train = np.array([float(np.asarray(P_train[k]).ravel()[0]) for k in keys_tr], dtype=np.float32)
-    X_test = np.array([G_te[k] for k in keys_te], dtype=np.float32)
-    y_test = np.array([float(np.asarray(P_te[k]).ravel()[0]) for k in keys_te], dtype=np.float32)
-
-    return X_train, y_train, X_test, y_test
+def load_rice_trait(trait_name="Grain_length"):
+    """Load a single rice trait from pre-processed data."""
+    data = np.load("results/rice_data/genotype_matrix.npz", allow_pickle=True)
+    G = data['G']
+    with open("results/rice_data/trait_data.json") as f:
+        trait_info = json.load(f)
+    td = trait_info[trait_name]
+    idxs = td['genotype_indices']
+    y = np.array(td['values']).astype(np.float32)
+    X_t = G[idxs]
+    mask = ~np.isnan(y)
+    return X_t[mask], y[mask]
 
 
-def run_wheatgp_quicktest():
+def run_rice_quicktest():
     print("=" * 70)
-    print("  WheatGP Data Quick Test — Genomic Ensemble Pipeline")
+    print("  Rice Data Quick Test — Genomic Ensemble Pipeline")
     print("=" * 70)
 
-    X_train, y_train, X_test, y_test = load_wheatgp_data()
-    print(f"\nTrain: {X_train.shape[0]} samples, {X_train.shape[1]} markers")
-    print(f"Test:  {X_test.shape[0]} samples")
-    print(f"Genotype range: [{X_train.min():.0f}, {X_train.max():.0f}]")
-    print(f"Phenotype range: [{y_train.min():.4f}, {y_train.max():.4f}]")
-
-    # In WheatGP workflow, training and testing are separate sets.
-    # For ensemble CV evaluation, we combine them.
-    X_all = np.vstack([X_train, X_test])
-    y_all = np.concatenate([y_train, y_test])
-    n_total = len(y_all)
+    X_all, y_all = load_rice_trait("Plant_height")
     n_snps = min(ge.GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-
-    print(f"Combined: {n_total} samples, {n_snps} GWAS-selected markers")
+    print(f"\nSamples: {len(y_all)}, Markers: {X_all.shape[1]} -> {n_snps} GWAS-selected")
+    print(f"Genotype range: [{X_all.min():.0f}, {X_all.max():.0f}]")
+    print(f"Phenotype range: [{y_all.min():.4f}, {y_all.max():.4f}]")
     print(f"Device: {ge.DEVICE}")
 
-    # 3-fold CV to evaluate all models
     N_FOLDS = 3
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=ge.RANDOM_SEED)
     results = {m: {'preds': [], 'targets': [], 'time': 0.0} for m in ge.ALL_NAMES}
-    oof_trad = {m: np.zeros(n_total) for m in ge.TRAD_NAMES}
-    oof_dl = {m: np.zeros(n_total) for m in ge.DL_BASE_NAMES}
+    oof_trad = {m: np.zeros(len(y_all)) for m in ge.TRAD_NAMES}
+    oof_dl = {m: np.zeros(len(y_all)) for m in ge.DL_BASE_NAMES}
 
     for fi, (tr, te) in enumerate(kf.split(X_all)):
         print(f"\n  --- Fold {fi+1}/{N_FOLDS} ---")
@@ -109,16 +89,17 @@ def run_wheatgp_quicktest():
 
         # DL models
         for mname in ge.DL_NAMES:
+            overrides = {}
+            if mname == 'FGN':
+                overrides = {'n_spec': 64, 'hidden': 80}
+            model = ge.create_model(mname, n_snps, overrides=overrides)
             t0 = time.time()
             bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
             bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
             wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
-            model = ge.create_model(mname, n_snps)
-            cs = 0.65 if mname == 'FGN v5' else 1.0
-            model = ge.train_torch_model(model, Xtr_s, ytr, epochs=200, batch_size=bs,
-                                         lr=2e-3, weight_decay=wd, patience=25, colsample=cs)
+            model = ge.train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs,
+                                         lr=2e-3, weight_decay=wd, patience=35)
             preds = ge.predict_torch_model(model, Xte_s)
-            del model
             elapsed = time.time() - t0
             results[mname]['preds'].extend(preds.tolist())
             results[mname]['targets'].extend(yte.tolist())
@@ -126,12 +107,13 @@ def run_wheatgp_quicktest():
             print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
             if mname in ge.DL_BASE_NAMES:
                 oof_dl[mname][te] = preds
+            del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     # Summary
     print(f"\n{'='*70}")
-    print(f"  Final Results (3-fold CV, {n_total} samples):")
+    print(f"  Final Results (2-fold CV, {len(y_all)} samples):")
     print(f"  {'Model':<22s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}")
     print(f"  {'-'*60}")
 
@@ -156,10 +138,11 @@ def run_wheatgp_quicktest():
             print(f"  {stack_name:<22s} {sr['R2']:+.4f}  {sr['Correlation']:+.4f}  {sr['RMSE']:.4f}")
 
     # Save
-    with open("results/wheatgp_quicktest.json", 'w') as f:
+    os.makedirs("results", exist_ok=True)
+    with open("results/rice_quicktest.json", 'w') as f:
         json.dump(trait_res, f, indent=2, ensure_ascii=False)
-    print(f"\nResults saved to results/wheatgp_quicktest.json")
+    print(f"\nResults saved to results/rice_quicktest.json")
 
 
 if __name__ == '__main__':
-    run_wheatgp_quicktest()
+    run_rice_quicktest()

@@ -22,3 +22,4 @@
 !upload_to_hpc.sh
 !genomic_ensemble.py
 !test_wheatgp.py
+!test_rice.py

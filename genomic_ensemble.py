@@ -175,14 +175,17 @@ def hybrid_select(X, y, k, variant_types=None, gwas_frac=0.6, window=DEFAULT_WIN
 # ============================================================================
 
 class FourierGenomicNet(nn.Module):
-    """FGN — FFT spectral + time-domain dual path"""
-    def __init__(self, n_snps, hidden=64, dropout=0.35):
+    """FGN — FFT spectral + time-domain dual path."""
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0, n_spec=32, droppath=0.0):
         super().__init__()
         self.n_freq = n_snps // 2 + 1
-        self.spec_r = nn.Parameter(torch.randn(1, 32, self.n_freq) * 0.02)
-        self.spec_i = nn.Parameter(torch.randn(1, 32, self.n_freq) * 0.02)
+        self.input_dropout = input_dropout
+        self.droppath = droppath
+        self.n_spec = n_spec
+        self.spec_r = nn.Parameter(torch.randn(1, n_spec, self.n_freq) * 0.02)
+        self.spec_i = nn.Parameter(torch.randn(1, n_spec, self.n_freq) * 0.02)
         self.freq_conv = nn.Sequential(
-            nn.Conv1d(32, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Conv1d(n_spec, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU(),
             nn.Dropout(dropout*0.5),
             nn.Conv1d(hidden, hidden, 5, padding=2), nn.BatchNorm1d(hidden), nn.GELU(),
             nn.Dropout(dropout*0.5))
@@ -196,11 +199,18 @@ class FourierGenomicNet(nn.Module):
             nn.Linear(hidden, 1))
 
     def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
         xc = torch.fft.rfft(x, dim=1)
-        xr = xc.real.unsqueeze(1).expand(-1, 32, -1) * self.spec_r
-        xi = xc.imag.unsqueeze(1).expand(-1, 32, -1) * self.spec_i
+        xr = xc.real.unsqueeze(1).expand(-1, self.n_spec, -1) * self.spec_r
+        xi = xc.imag.unsqueeze(1).expand(-1, self.n_spec, -1) * self.spec_i
         fp = self.pool(self.freq_conv(xr + xi)).squeeze(-1)
         tp = self.pool(self.time_conv(x.unsqueeze(1))).squeeze(-1)
+        if self.training and self.droppath > 0:
+            r = torch.rand(1, device=x.device).item()
+            if r < self.droppath:
+                fp = fp * 0
+            elif r < self.droppath * 2:
+                tp = tp * 0
         return self.head(torch.cat([fp, tp], dim=1))
 
 
@@ -307,7 +317,7 @@ class _SpectralBranch(nn.Module):
 
 class FGNv4(nn.Module):
     """FGN v4: Complex-aware spectral + wavelet + time + colsample dropout"""
-    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.2):
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0):
         super().__init__()
         ch = hidden // 2
         self.input_dropout = input_dropout
@@ -319,6 +329,89 @@ class FGNv4(nn.Module):
     def forward(self, x):
         x = F.dropout(x, p=self.input_dropout, training=self.training)
         return self.head(torch.cat(self.spec(x), dim=1))
+
+
+class FGNv5(nn.Module):
+    """FGN v5: Complex-aware spectral + multi-scale time conv (k=7,31,101).
+
+    Extends v4's proven complex spectral branch with three additional parallel
+    time-domain paths at different kernel widths, capturing LD at short/medium/
+    long ranges. The original time conv (k=21) is retained alongside.
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0):
+        super().__init__()
+        ch = hidden // 2
+        self.input_dropout = input_dropout
+        self.spec = _SpectralBranch(n_snps // 2 + 1, 24, ch, dropout)
+        # Additional multi-scale time conv paths (spec already has k=21)
+        self.time_k7 = nn.Sequential(
+            nn.Conv1d(1, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.time_k51 = nn.Sequential(
+            nn.Conv1d(1, ch, 51, padding=25), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.time_k101 = nn.Sequential(
+            nn.Conv1d(1, ch, 101, padding=50), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        total_ch = ch * 7  # fp_r, fp_i, wp, tp(k21), tp_k7, tp_k51, tp_k101
+        self.head = nn.Sequential(
+            nn.Linear(total_ch, hidden * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        fp_r, fp_i, wp, tp_orig = self.spec(x)
+        x_u = x.unsqueeze(1)
+        tp_k7 = self.pool(self.time_k7(x_u)).squeeze(-1)
+        tp_k51 = self.pool(self.time_k51(x_u)).squeeze(-1)
+        tp_k101 = self.pool(self.time_k101(x_u)).squeeze(-1)
+        return self.head(torch.cat([fp_r, fp_i, wp, tp_orig, tp_k7, tp_k51, tp_k101], dim=1))
+
+
+class FGNplus(nn.Module):
+    """Improved FGN: additive skip + input dropout on top of FGN architecture.
+
+    Mirrors FGN's spectral+time paths exactly, but adds:
+    - Additive skip connection preserves linear SNP effects
+    - Input dropout acts as colsample regularization
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0):
+        super().__init__()
+        self.n_freq = n_snps // 2 + 1
+        self.input_dropout = input_dropout
+
+        # Additive path — captures linear SNP effects (same as RRBLUP)
+        self.additive = nn.Linear(n_snps, 1, bias=False)
+        nn.init.normal_(self.additive.weight, std=1.0 / np.sqrt(n_snps))
+
+        # Spectral path: same as FGN (real+imag combined)
+        self.spec_r = nn.Parameter(torch.randn(1, 32, self.n_freq) * 0.02)
+        self.spec_i = nn.Parameter(torch.randn(1, 32, self.n_freq) * 0.02)
+        self.freq_conv = nn.Sequential(
+            nn.Conv1d(32, hidden, 7, padding=3), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(hidden, hidden, 5, padding=2), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.time_conv = nn.Sequential(
+            nn.Conv1d(1, hidden, 21, padding=10), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 2, hidden * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x_do = F.dropout(x, p=self.input_dropout, training=self.training)
+        add_out = self.additive(x_do)
+        xc = torch.fft.rfft(x_do, dim=1)
+        xr = xc.real.unsqueeze(1).expand(-1, 32, -1) * self.spec_r
+        xi = xc.imag.unsqueeze(1).expand(-1, 32, -1) * self.spec_i
+        fp = self.pool(self.freq_conv(xr + xi)).squeeze(-1)
+        tp = self.pool(self.time_conv(x_do.unsqueeze(1))).squeeze(-1)
+        return add_out + self.head(torch.cat([fp, tp], dim=1))
 
 
 class DilatedInceptionBlock(nn.Module):
@@ -391,7 +484,7 @@ class FusionNet(nn.Module):
 
 class AdditiveGenomicNet(nn.Module):
     """End-to-end additive: linear SNP effects + nonlinear spectral residual."""
-    def __init__(self, n_snps, hidden=48, dropout=0.35, input_dropout=0.2):
+    def __init__(self, n_snps, hidden=48, dropout=0.35, input_dropout=0.0):
         super().__init__()
         ch = hidden // 2
         self.input_dropout = input_dropout
@@ -409,38 +502,203 @@ class AdditiveGenomicNet(nn.Module):
 
 
 # ============================================================================
-# Section E: Common Training Functions
+# Section D2: GenomicFM — Factorization Machine for Genomic Prediction
+# ============================================================================
+
+class GenomicFM(nn.Module):
+    """Linear + learned embedding + MLP for genomic prediction.
+
+    Linear path captures additive SNP effects; a small MLP on learned
+    feature embeddings captures nonlinear interactions.
+    ~5500 params at k=4 for n_snps=1230.
+    """
+    def __init__(self, n_snps, k=4, dropout=0.2, mlp_hidden=16):
+        super().__init__()
+        self.linear = nn.Linear(n_snps, 1)         # additive SNP effects
+        self.V = nn.Parameter(torch.randn(n_snps, k))  # SNP embeddings, scaled in forward
+        self.mlp = nn.Sequential(
+            nn.Linear(k, mlp_hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, 1))
+
+    def forward(self, x):
+        fm_linear = self.linear(x)                       # (batch, 1)
+        scale = self.V.shape[0] ** 0.5
+        xv = (x @ self.V) / scale                         # (batch, k), scaled to unit variance
+        mlp_out = self.mlp(xv)                            # (batch, 1)
+        return fm_linear + mlp_out
+
+
+class FGN_PCA(nn.Module):
+    """FGN-PCA: PCA-optimized FGN — direct projection + conv + FM interactions."""
+    def __init__(self, n_features, hidden=64, dropout=0.35, fm_k=4):
+        super().__init__()
+        self.direct_proj = nn.Sequential(
+            nn.Linear(n_features, hidden), nn.GELU(), nn.Dropout(dropout * 0.5))
+        self.conv_path = nn.Sequential(
+            nn.Conv1d(1, hidden, 21, padding=10), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.V = nn.Parameter(torch.randn(n_features, fm_k) * 0.001)
+        self.fm_scale = nn.Parameter(torch.zeros(1))
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 2 + fm_k, hidden * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        dp = self.direct_proj(x)
+        cp = self.pool(self.conv_path(x.unsqueeze(1))).squeeze(-1)
+        scale = x.shape[1] ** 0.5
+        fm_out = 0.5 * ((x @ self.V) ** 2 - (x ** 2) @ (self.V ** 2)) / scale
+        fm_out = fm_out * torch.tanh(self.fm_scale)
+        return self.head(torch.cat([dp, cp, fm_out], dim=1))
+
+
+# ============================================================================
+# Section E: Bagged TinyNet Ensemble (Random-Forest style)
+# ============================================================================
+
+class TinySNPNet(nn.Module):
+    """Ultra-lightweight network for bagging ensemble — ~200 params."""
+    def __init__(self, n_features, hidden=8, dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_features, hidden), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def train_bagged_ensemble(X_train, y_train, n_estimators=200, n_colsample=50,
+                          hidden=8, dropout=0.3, epochs=20, lr=0.01, weight_decay=1e-3):
+    """Train a bagged ensemble of TinySNPNets, each on a random feature subset."""
+    n_total_features = X_train.shape[1]
+    n_colsample = min(n_colsample, n_total_features)
+    models = []
+    feat_indices = []
+    n_total = len(y_train)
+    n_val = max(1, int(n_total * 0.15))
+    rng = np.random.RandomState(RANDOM_SEED)
+
+    for i in range(n_estimators):
+        # Random feature subset (like colsample_bytree)
+        feat_idx = rng.choice(n_total_features, n_colsample, replace=False)
+        X_sub = X_train[:, feat_idx].astype(np.float32)
+
+        # Random bootstrap sample (like subsample)
+        boot_idx = rng.choice(n_total, int(n_total * 0.7), replace=True)
+        X_boot, y_boot = X_sub[boot_idx], y_train[boot_idx].astype(np.float32)
+
+        # Train/val split
+        idx = rng.permutation(len(y_boot))
+        val_idx, tr_idx = idx[:n_val], idx[n_val:]
+        Xt = torch.FloatTensor(X_boot[tr_idx]).to(DEVICE)
+        yt = torch.FloatTensor(y_boot[tr_idx]).to(DEVICE)
+        Xv = torch.FloatTensor(X_boot[val_idx]).to(DEVICE)
+        yv = torch.FloatTensor(y_boot[val_idx]).to(DEVICE)
+
+        model = TinySNPNet(n_colsample, hidden=hidden, dropout=dropout).to(DEVICE)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        crit = nn.MSELoss()
+        best_state, best_loss, wait = None, float('inf'), 0
+
+        for _ in range(epochs):
+            model.train()
+            opt.zero_grad()
+            loss = crit(model(Xt).squeeze(), yt)
+            loss.backward()
+            opt.step()
+            model.eval()
+            with torch.no_grad():
+                vl = crit(model(Xv).squeeze(), yv).item()
+            if vl < best_loss:
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_loss = vl
+                wait = 0
+            else:
+                wait += 1
+                if wait >= 5: break
+
+        model.load_state_dict(best_state)
+        model.cpu()
+        models.append(model)
+        feat_indices.append(feat_idx)
+
+    return models, feat_indices
+
+
+def predict_bagged_ensemble(models, feat_indices, X):
+    """Predict using bagged ensemble — average of all TinySNPNets."""
+    preds = np.zeros(len(X), dtype=np.float32)
+    for model, feat_idx in zip(models, feat_indices):
+        X_sub = X[:, feat_idx].astype(np.float32)
+        Xt = torch.FloatTensor(X_sub).to(DEVICE)
+        model = model.to(DEVICE)
+        model.eval()
+        with torch.no_grad():
+            p = model(Xt).squeeze().cpu().numpy()
+        preds += p
+        model.cpu()
+    return preds / len(models)
+
+
+# ============================================================================
+# Section F: Common Training Functions
 # ============================================================================
 
 def train_torch_model(model, X_train, y_train,
                       epochs=300, batch_size=128, lr=1e-3, weight_decay=1e-4,
-                      patience=30, val_ratio=0.15):
+                      patience=30, val_ratio=0.15, grad_clip=1.0,
+                      use_swa=False, use_mixup=True, mixup_alpha=0.4,
+                      label_smooth=0.0, colsample=1.0):
     model = model.to(DEVICE)
     n_total = len(X_train)
+    n_snps = X_train.shape[1]
     n_val = max(1, int(n_total * val_ratio))
     rng = np.random.RandomState(RANDOM_SEED)
     idx = rng.permutation(n_total)
     val_idx, tr_idx = idx[:n_val], idx[n_val:]
-    Xt = torch.FloatTensor(X_train[tr_idx]).to(DEVICE)
+    Xt_full = torch.FloatTensor(X_train[tr_idx]).to(DEVICE)
     yt = torch.FloatTensor(y_train[tr_idx]).to(DEVICE)
-    Xv = torch.FloatTensor(X_train[val_idx]).to(DEVICE)
+    Xv_full = torch.FloatTensor(X_train[val_idx]).to(DEVICE)
     yv = torch.FloatTensor(y_train[val_idx]).to(DEVICE)
-    dl = DataLoader(TensorDataset(Xt, yt), batch_size=min(batch_size, len(tr_idx)), shuffle=True)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=15)
+    sch = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=30, T_mult=2, eta_min=lr*0.01)
     crit = nn.MSELoss()
     best_state, best_loss, wait = None, float('inf'), 0
-    for _ in range(epochs):
+    swa_state, swa_n, swa_start = None, 0, max(1, int(epochs * 0.3))
+    for ep in range(epochs):
         model.train()
+        # Per-epoch colsample: same feature mask for all samples this epoch
+        if colsample < 1.0:
+            cmask = torch.rand(n_snps, device=DEVICE) < colsample
+            Xt = Xt_full * cmask.float()
+            Xv = Xv_full * cmask.float()
+        else:
+            Xt, Xv = Xt_full, Xv_full
+        dl = DataLoader(TensorDataset(Xt, yt), batch_size=min(batch_size, len(tr_idx)), shuffle=True)
         for bx, by in dl:
+            if use_mixup and ep >= 5:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                lam = max(lam, 1.0 - lam)
+                perm = torch.randperm(bx.size(0), device=DEVICE)
+                bx = lam * bx + (1.0 - lam) * bx[perm]
+                by = lam * by + (1.0 - lam) * by[perm]
+            if label_smooth > 0:
+                noise = torch.randn_like(by) * label_smooth
+                by = by + noise
             opt.zero_grad()
             loss = crit(model(bx).squeeze(), by)
             loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
         model.eval()
+        sch.step()
         with torch.no_grad():
             vl = crit(model(Xv).squeeze(), yv).item()
-        sch.step(vl)
         if vl < best_loss:
             best_loss = vl
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -448,7 +706,18 @@ def train_torch_model(model, X_train, y_train,
         else:
             wait += 1
             if wait >= patience: break
-    model.load_state_dict(best_state)
+        if use_swa and ep >= swa_start:
+            if swa_state is None:
+                swa_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                swa_n = 1
+            else:
+                for k in swa_state:
+                    swa_state[k] = (swa_state[k] * swa_n + model.state_dict()[k].cpu().clone()) / (swa_n + 1)
+                swa_n += 1
+    if use_swa and swa_state is not None:
+        model.load_state_dict(swa_state)
+    else:
+        model.load_state_dict(best_state)
     model.eval()
     return model.cpu()
 
@@ -547,18 +816,28 @@ def _select_dl_markers(Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps):
 
 def create_model(name, n_snps, overrides=None):
     o = overrides or {}
-    if name == 'FGN': return FourierGenomicNet(n_snps=n_snps, hidden=64, dropout=0.35)
+    if name == 'FGN': return FourierGenomicNet(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0), n_spec=o.get('n_spec', 32), droppath=o.get('droppath', 0.0))
     if name == 'FGN v2': return FGNv2(n_snps=n_snps, hidden=64, dropout=0.35)
-    if name == 'FGN v4': return FGNv4(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.2))
+    if name == 'FGN v4': return FGNv4(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGN v5': return FGNv5(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
     if name == 'FusionNet': return FusionNet(n_snps=n_snps, hidden_dim=o.get('hidden_dim', 48), dropout=o.get('dropout', 0.35))
-    if name == 'AdditiveGenomicNet': return AdditiveGenomicNet(n_snps=n_snps, hidden=o.get('hidden', 48), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.2))
+    if name == 'AdditiveGenomicNet': return AdditiveGenomicNet(n_snps=n_snps, hidden=o.get('hidden', 48), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGNplus':
+        return FGNplus(n_snps=n_snps, hidden=o.get('hidden', 64),
+                       dropout=o.get('dropout', 0.35),
+                       input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGN PCA': return FGN_PCA(n_features=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), fm_k=o.get('fm_k', 4))
+    if name == 'GenomicFM':
+        return GenomicFM(n_snps=n_snps, k=o.get('k', 4),
+                         dropout=o.get('dropout', 0.2),
+                         mlp_hidden=o.get('mlp_hidden', 16))
     raise ValueError(f"Unknown model: {name}")
 
 
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
 TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
-DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4']  # base models for Stacking OOF
+DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGNplus', 'GenomicFM', 'FGN PCA']
 DL_NAMES = DL_BASE_NAMES + ['FusionNet', 'AdditiveGenomicNet']
 ALL_NAMES = TRAD_NAMES + DL_NAMES
 
@@ -647,10 +926,11 @@ def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test
     for mname in DL_NAMES:
         tp = tuned_params.get(mname, {}) if tuned_params else {}
         model = create_model(mname, n_snps, overrides=tp)
-        bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
         lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
         wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
         pat = tp.get('patience', 30)
+        bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+        bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
         model = train_torch_model(model, X_s, y, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
         torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
         print(f"    [saved] {mname}.pt")
@@ -674,7 +954,33 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
     X_val, y_val = X_train[val_idx], y_train[val_idx]
 
     def objective(trial):
-        if model_name == 'FGN v4':
+        if model_name == 'FGN':
+            overrides = {'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
+                         'dropout': trial.suggest_float('dropout', 0.3, 0.55),
+                         'input_dropout': trial.suggest_float('input_dropout', 0.0, 0.2),
+                         'n_spec': trial.suggest_categorical('n_spec', [8, 16, 24]),
+                         'droppath': trial.suggest_float('droppath', 0.0, 0.25),
+                         'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
+                         'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+                         'patience': trial.suggest_int('patience', 20, 50)}
+            model = FourierGenomicNet(n_snps=n_snps, hidden=overrides['hidden'],
+                                      dropout=overrides['dropout'],
+                                      input_dropout=overrides['input_dropout'],
+                                      n_spec=overrides['n_spec'],
+                                      droppath=overrides['droppath'])
+            bs = 32
+        elif model_name == 'FGNplus':
+            overrides = {'hidden': trial.suggest_categorical('hidden', [48, 64, 96]),
+                         'dropout': trial.suggest_float('dropout', 0.25, 0.5),
+                         'input_dropout': trial.suggest_float('input_dropout', 0.1, 0.4),
+                         'lr': trial.suggest_float('lr', 5e-4, 5e-3, log=True),
+                         'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+                         'patience': trial.suggest_int('patience', 20, 50)}
+            model = FGNplus(n_snps=n_snps, hidden=overrides['hidden'],
+                            dropout=overrides['dropout'],
+                            input_dropout=overrides['input_dropout'])
+            bs = 32
+        elif model_name == 'FGN v4':
             overrides = {'hidden': trial.suggest_categorical('hidden', [48, 64, 96]),
                          'dropout': trial.suggest_float('dropout', 0.2, 0.5),
                          'input_dropout': trial.suggest_float('input_dropout', 0.1, 0.4),
@@ -702,6 +1008,22 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             model = AdditiveGenomicNet(n_snps=n_snps, hidden=overrides['hidden'], dropout=overrides['dropout'],
                                        input_dropout=overrides['input_dropout'])
             bs = 64
+        elif model_name == 'GenomicFM':
+            overrides = {'k': trial.suggest_categorical('k', [2, 4, 8]),
+                         'dropout': trial.suggest_float('dropout', 0.1, 0.4),
+                         'mlp_hidden': trial.suggest_categorical('mlp_hidden', [8, 16, 24]),
+                         'lr': trial.suggest_float('lr', 1e-3, 5e-3, log=True),
+                         'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
+                         'patience': trial.suggest_int('patience', 20, 50)}
+            model = GenomicFM(n_snps=n_snps, k=overrides['k'],
+                              dropout=overrides['dropout'],
+                              mlp_hidden=overrides['mlp_hidden'])
+            bs = 32
+            model = train_torch_model(model, X_tr, y_tr, epochs=200, batch_size=bs,
+                                       lr=overrides['lr'], weight_decay=overrides['weight_decay'],
+                                       patience=overrides['patience'], val_ratio=0.2)
+            preds = predict_torch_model(model, X_val)
+            return float(r2_score(y_val, preds))
         else: raise ValueError(f"Unknown model for tuning: {model_name}")
         model = train_torch_model(model, X_tr, y_tr, epochs=300, batch_size=bs,
                                   lr=overrides.get('lr', 2e-3),
@@ -861,11 +1183,11 @@ def run_wheat(quick_test=True):
                 X_tune = X_all[:, maf_tune][:, gidx_t]
             else: X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
             sc_tune = StandardScaler(); X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
-            for tune_name in ['FGN v4', 'FusionNet', 'AdditiveGenomicNet']:
+            for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet', 'AdditiveGenomicNet', 'GenomicFM']:
                 best_p, best_r2 = tune_model_hyperparams(tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
                 pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
-                print(f"    {tune_name}: val R²={best_r2:.4f}  [{pstr}]")
+                print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0} for m in ALL_NAMES}
@@ -898,7 +1220,7 @@ def run_wheat(quick_test=True):
                 results[tname]['time'] += time.time() - t0
                 if fi == 0: results[tname]['params'] = param_count
                 oof_trad[tname][te] = preds
-                print(f"    {tname:<16s} R²={r2_score(yte, preds):+.4f}")
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
 
             gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
                 Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps)
@@ -907,9 +1229,10 @@ def run_wheat(quick_test=True):
             for mi, mname in enumerate(DL_NAMES):
                 tp = tuned_params.get(mname, {})
                 model = create_model(mname, n_snps, overrides=tp)
-                if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
                 t0 = time.time()
+                if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
                 bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+                bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                 wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
                 pat = tp.get('patience', 30)
@@ -920,12 +1243,12 @@ def run_wheat(quick_test=True):
                 results[mname]['preds'].extend(preds.tolist())
                 results[mname]['targets'].extend(yte.tolist())
                 results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
                 if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
             torch.cuda.empty_cache()
 
         # Trait summary
-        print(f"\n  {'-'*70}\n  {trait} Final Results:\n  {'Model':<16s} {'R²':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
+        print(f"\n  {'-'*70}\n  {trait} Final Results:\n  {'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
         trait_res = {}
         for mname in ALL_NAMES:
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
@@ -1011,10 +1334,10 @@ def run_rice(quick_test=True):
                 X_tune = X_all[:, maf_tune][:, gidx_t]
             else: X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
             sc_tune = StandardScaler(); X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
-            for tune_name in ['FGN v4', 'FusionNet', 'AdditiveGenomicNet']:
+            for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet', 'AdditiveGenomicNet', 'GenomicFM']:
                 best_p, best_r2 = tune_model_hyperparams(tune_name, X_tune_s, y, n_snps, n_trials=15)
                 tuned_params[tune_name] = best_p
-                print(f"    {tune_name}: val R²={best_r2:.4f}")
+                print(f"    {tune_name}: val R2={best_r2:.4f}")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
         results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0} for m in ALL_NAMES}
@@ -1039,7 +1362,7 @@ def run_rice(quick_test=True):
                 results[tname]['time'] += time.time() - t0
                 if fi == 0: results[tname]['params'] = param_count
                 oof_trad[tname][te] = preds
-                print(f"    {tname:<16s} R²={r2_score(yte, preds):+.4f}")
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
 
             # DL marker selection (configurable)
             gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
@@ -1048,9 +1371,9 @@ def run_rice(quick_test=True):
             for mi, mname in enumerate(DL_NAMES):
                 tp = tuned_params.get(mname, {})
                 model = create_model(mname, n_snps, overrides=tp)
-                if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
                 t0 = time.time()
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+                if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                 wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
                 pat = tp.get('patience', 30)
@@ -1058,7 +1381,7 @@ def run_rice(quick_test=True):
                 preds = predict_torch_model(model, Xte_dl_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
                 if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
             torch.cuda.empty_cache()
 
@@ -1070,7 +1393,7 @@ def run_rice(quick_test=True):
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
             trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run}
-            print(f"  {mname:<20s} R²={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
         all_results[trait] = trait_res
@@ -1179,20 +1502,20 @@ def run_maize(quick_test=True):
                 results[tname]['time'] += time.time() - t0
                 if fold_i == 0: results[tname]['params'] = param_count
                 oof_trad[tname][te_idx] = preds
-                print(f"    {tname:<16s} R²={r2_score(yte, preds):+.4f}")
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
 
             # DL
             for mi, mname in enumerate(DL_NAMES):
                 model = create_model(mname, n_snps)
-                if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
                 t0 = time.time()
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+                if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
                 wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
                 model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
                 preds = predict_torch_model(model, Xte_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R²={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
                 if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
             torch.cuda.empty_cache()
 
@@ -1203,7 +1526,7 @@ def run_maize(quick_test=True):
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
             trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run}
-            print(f"  {mname:<20s} R²={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
         all_results[trait] = trait_res
