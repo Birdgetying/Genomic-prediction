@@ -114,3 +114,25 @@ tail -f logs/xxx_output.*   # monitor logs
 ## Note
 
 Most root-level Python files are independent training scripts that share similar structure but target different datasets or model variants. They are NOT a unified package — each is self-contained with its own model definitions, config, and training loop. The `cropformer/` package is the exception (properly modularized).
+
+## Failed Approaches (不要重复尝试)
+
+以下方案已经验证无效，不要再浪费时间：
+
+1. **残差学习 (Residual FGN)**: 用 RRBLUP/XGBoost 预测残差，再训练 FGN 拟合残差，最后相加。结果比单独 XGBoost 差（R2 0.149 vs 0.206）。
+2. **L1 正则化 on snp_weight**: 在 FGN v7 的 snp_weight 上加 L1 惩罚，效果不显著。
+3. **NGBoost (Neural Gradient Boosting)**: TinyNN + boosting，用户已确认此方案不可行。
+4. **XGBoost 作为 stacking meta-learner**: 在 4-18 维 meta-feature 上 XGBoost 严重过拟合，Ridge/Lasso 远优于 XGBoost meta-learner。
+5. **FGN v5 (复数分离卷积)**: 比 v4 差。
+6. **FGN v6 (大核 k=31 时间卷积)**: 比 v4 差。
+7. **FGN v9 (DCT 替代 FFT)**: 比 v4 差。
+8. **FGN v10 (加性线性路径)**: 比 v7 差。
+9. **FGN v11 (双 FFT+DCT)**: 与 v7 相当，但 fold 间不稳定。
+10. **StandardScaler**: 去掉比保留好（+0.01），已采纳。不要再加回来。
+11. **Mixup**: 对 v4 有益但对 v7 有害，效果不一致。
+
+**当前有效的提升手段**:
+- SWA (Stochastic Weight Averaging): 稳定 +0.01-0.02
+- hidden=96 for FGN v4/v7: 轻微提升
+- 去掉 StandardScaler: +0.01
+- Stacking: Trad+Top DL + Ridge meta-learner，在 Plant_height 上 +0.006 (边际)

@@ -27,3 +27,6 @@
 !test_multitrait.py
 !test_residual_fgn.py
 !test_noscale.py
+!test_stacking.py
+!test_stacking_10trait.py
+!test_diverse_stacking.py
