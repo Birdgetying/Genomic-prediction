@@ -92,13 +92,17 @@ def run_rice_quicktest():
             overrides = {}
             if mname == 'FGN':
                 overrides = {'n_spec': 64, 'hidden': 80}
+            elif mname == 'FGN v6':
+                overrides = {'hidden': 64, 'max_freq': 384}
+            elif mname in ('FGN v4', 'FGN v7'):
+                overrides = {'hidden': 96}
             model = ge.create_model(mname, n_snps, overrides=overrides)
             t0 = time.time()
             bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
             bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
             wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
             model = ge.train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs,
-                                         lr=2e-3, weight_decay=wd, patience=35)
+                                         lr=2e-3, weight_decay=wd, patience=35, use_swa=True)
             preds = ge.predict_torch_model(model, Xte_s)
             elapsed = time.time() - t0
             results[mname]['preds'].extend(preds.tolist())

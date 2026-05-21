@@ -23,3 +23,7 @@
 !genomic_ensemble.py
 !test_wheatgp.py
 !test_rice.py
+!test_ablation.py
+!test_multitrait.py
+!test_residual_fgn.py
+!test_noscale.py

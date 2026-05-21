@@ -276,12 +276,18 @@ class FGNv2(nn.Module):
 
 
 class _SpectralBranch(nn.Module):
-    """Separate real/imag FFT conv paths + wavelet + time — shared by FGNv4/AdditiveGenomicNet."""
-    def __init__(self, n_freq, n_spec, ch, dropout):
+    """Separate real/imag FFT conv paths + wavelet + time — shared by FGNv4/AdditiveGenomicNet.
+
+    If max_freq is set (< n_freq), only the first max_freq frequency components are used,
+    acting as low-pass filtering that removes high-frequency noise. This is biologically
+    motivated: LD blocks span dozens to hundreds of SNPs, corresponding to low frequencies.
+    """
+    def __init__(self, n_freq, n_spec, ch, dropout, max_freq=None):
         super().__init__()
         self.n_spec = n_spec
-        self.spec_r = nn.Parameter(torch.randn(1, n_spec, n_freq) * 0.02)
-        self.spec_i = nn.Parameter(torch.randn(1, n_spec, n_freq) * 0.02)
+        self.max_freq = max_freq or n_freq
+        self.spec_r = nn.Parameter(torch.randn(1, n_spec, self.max_freq) * 0.02)
+        self.spec_i = nn.Parameter(torch.randn(1, n_spec, self.max_freq) * 0.02)
         self.freq_conv_r = nn.Sequential(
             nn.Conv1d(n_spec, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
             nn.Dropout(dropout * 0.5),
@@ -304,7 +310,7 @@ class _SpectralBranch(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
 
     def forward(self, x):
-        xc = torch.fft.rfft(x, dim=1)
+        xc = torch.fft.rfft(x, dim=1)[:, :self.max_freq]
         xr = xc.real.unsqueeze(1).expand(-1, self.n_spec, -1) * self.spec_r
         xi = xc.imag.unsqueeze(1).expand(-1, self.n_spec, -1) * self.spec_i
         fp_r = self.pool(self.freq_conv_r(xr)).squeeze(-1)
@@ -317,11 +323,11 @@ class _SpectralBranch(nn.Module):
 
 class FGNv4(nn.Module):
     """FGN v4: Complex-aware spectral + wavelet + time + colsample dropout"""
-    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0):
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0, n_spec=24):
         super().__init__()
         ch = hidden // 2
         self.input_dropout = input_dropout
-        self.spec = _SpectralBranch(n_snps // 2 + 1, 24, ch, dropout)
+        self.spec = _SpectralBranch(n_snps // 2 + 1, n_spec, ch, dropout)
         self.head = nn.Sequential(
             nn.Linear(ch * 4, hidden), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(hidden, 1))
@@ -368,6 +374,260 @@ class FGNv5(nn.Module):
         tp_k51 = self.pool(self.time_k51(x_u)).squeeze(-1)
         tp_k101 = self.pool(self.time_k101(x_u)).squeeze(-1)
         return self.head(torch.cat([fp_r, fp_i, wp, tp_orig, tp_k7, tp_k51, tp_k101], dim=1))
+
+
+class FGNv6(nn.Module):
+    """FGN v6: Low-frequency focused complex spectral + wavelet + time.
+
+    Key innovation: truncates FFT to only low frequencies (max_freq=384 for
+    5000 SNPs). This removes high-frequency noise that corresponds to single-
+    SNP fluctuations, keeping only patterns spanning ≥13 SNPs — matching
+    typical LD block sizes. Benefits:
+    - 85% fewer spectral weight params → less overfitting
+    - Built-in denoising via low-pass filtering
+    - Forces model to learn from genome-wide trends instead of individual SNPs
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0, max_freq=384):
+        super().__init__()
+        ch = hidden // 2
+        self.input_dropout = input_dropout
+        self.spec = _SpectralBranch(n_snps // 2 + 1, 24, ch, dropout, max_freq=max_freq)
+        self.head = nn.Sequential(
+            nn.Linear(ch * 4, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        return self.head(torch.cat(self.spec(x), dim=1))
+
+
+class FGNv7(nn.Module):
+    """FGN v7: FGN v4 + learned per-SNP importance weights.
+
+    Key innovation: before FFT, genotype is multiplied by learned SNP weights
+    (sigmoid-bounded). This gives the model explicit feature selection capability
+    — important SNPs get weight near 1.0, noisy SNPs near 0.0. This mimics
+    XGBoost's implicit feature selection via tree splits, but in a differentiable
+    way compatible with spectral processing.
+
+    Weight initialization is near 1.0 (sigmoid(2)=0.88) so the model starts
+    using all SNPs and gradually down-weights noise.
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0):
+        super().__init__()
+        ch = hidden // 2
+        self.input_dropout = input_dropout
+        self.snp_weight = nn.Parameter(torch.full((1, n_snps), 2.0))
+        self.spec = _SpectralBranch(n_snps // 2 + 1, 24, ch, dropout)
+        self.head = nn.Sequential(
+            nn.Linear(ch * 4, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        w = torch.sigmoid(self.snp_weight)
+        return self.head(torch.cat(self.spec(x * w), dim=1))
+
+
+class FGNv8(nn.Module):
+    """FGN v8: Adaptive linear+spectral fusion with learnable mixing coefficient.
+
+    Core insight: high-heritability traits need mostly linear (additive) modeling;
+    low-heritability traits benefit from FGN's spectral bias. Instead of hard-coding
+    the balance, α is learned per-trait via sigmoid gating.
+
+    - α → 1: mostly linear, spectral path suppressed (high-h² traits)
+    - α → 0: mostly spectral, linear path suppressed (low-h² traits)
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0):
+        super().__init__()
+        ch = hidden // 2
+        self.input_dropout = input_dropout
+        # Strong additive path — captures linear SNP effects
+        self.additive = nn.Linear(n_snps, 1, bias=False)
+        nn.init.normal_(self.additive.weight, std=1.0 / np.sqrt(n_snps))
+        # Spectral path — FGN v4 complex-aware branch
+        self.spec = _SpectralBranch(n_snps // 2 + 1, 24, ch, dropout)
+        self.spec_head = nn.Sequential(
+            nn.Linear(ch * 4, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+        # Learnable mixing coefficient (sigmoid → bounded (0,1))
+        # Init at 2.5 → sigmoid≈0.92, favoring linear path initially
+        self.logit_alpha = nn.Parameter(torch.tensor([2.5]))
+
+    def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        lin = self.additive(x)
+        spec = self.spec_head(torch.cat(self.spec(x), dim=1))
+        alpha = torch.sigmoid(self.logit_alpha)
+        return alpha * lin + (1.0 - alpha) * spec
+
+
+class FGNv9(nn.Module):
+    """FGN v9: DCT-based spectral processing + wavelet + time.
+
+    Replaces FFT with Discrete Cosine Transform (DCT-II). Motivation:
+    - FFT assumes periodic boundary (SNPs on chr1 wrap to chrN) → artificial
+      high-frequency noise at chromosome boundaries
+    - DCT assumes symmetric boundary → no artificial discontinuities
+    - DCT has better energy compaction for smooth signals → more of the genomic
+      signal is concentrated in fewer coefficients
+    - DCT is purely real → simpler spectral path (no real/imag split needed)
+
+    Uses n_dct=384 coefficients (matching v6's max_freq) for built-in denoising.
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0, n_dct=384):
+        super().__init__()
+        ch = hidden // 2
+        self.input_dropout = input_dropout
+        # Pre-compute DCT-II basis matrix
+        n = torch.arange(n_snps).float()
+        k = torch.arange(n_dct).float().unsqueeze(1)
+        dct_basis = torch.cos(np.pi * k * (n + 0.5) / n_snps)
+        # Normalize: DCT-II standard scaling
+        dct_basis[0] *= 1.0 / np.sqrt(2)
+        dct_basis *= np.sqrt(2.0 / n_snps)
+        self.register_buffer('dct_basis', dct_basis)  # (n_dct, n_snps)
+        self.n_spec = 24
+        self.spec_weight = nn.Parameter(torch.randn(1, self.n_spec, n_dct) * 0.02)
+        self.freq_conv = nn.Sequential(
+            nn.Conv1d(self.n_spec, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.wavelet = HaarWaveletDecomp()
+        self.wavelet_conv = nn.Sequential(
+            nn.Conv1d(2, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.time_conv = nn.Sequential(
+            nn.Conv1d(1, ch, 21, padding=10), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Sequential(
+            nn.Linear(ch * 3, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        x_dct = x @ self.dct_basis.T  # (B, n_snps) @ (n_snps, n_dct) → (B, n_dct)
+        x_spec = x_dct.unsqueeze(1).expand(-1, self.n_spec, -1) * self.spec_weight
+        fp = self.pool(self.freq_conv(x_spec)).squeeze(-1)
+        cA, cD = self.wavelet(x)
+        wp = self.pool(self.wavelet_conv(torch.cat([cA, cD], dim=1))).squeeze(-1)
+        tp = self.pool(self.time_conv(x.unsqueeze(1))).squeeze(-1)
+        return self.head(torch.cat([fp, wp, tp], dim=1))
+
+
+class FGNv10(nn.Module):
+    """FGN v10: FGN v7 SNP attention + explicit additive linear path.
+
+    The additive path (Linear n_snps→1) uses RAW SNPs without attention weighting,
+    directly capturing pure additive effects the way RRBLUP/XGBoost do. The spectral
+    paths use attention-weighted SNPs for non-additive signal. This dual-path design
+    targets the gap between FGN and XGBoost on high-heritability traits.
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0):
+        super().__init__()
+        ch = hidden // 2
+        self.input_dropout = input_dropout
+        self.snp_weight = nn.Parameter(torch.full((1, n_snps), 2.0))
+        self.additive = nn.Linear(n_snps, 1, bias=False)
+        nn.init.normal_(self.additive.weight, std=1.0 / np.sqrt(n_snps))
+        self.spec = _SpectralBranch(n_snps // 2 + 1, 24, ch, dropout)
+        self.head = nn.Sequential(
+            nn.Linear(ch * 4 + 1, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        w = torch.sigmoid(self.snp_weight)
+        add_out = self.additive(x)  # raw SNPs for pure additive signal
+        spec_out = self.spec(x * w)  # attention-weighted for spectral
+        return self.head(torch.cat([*spec_out, add_out], dim=1))
+
+
+class FGNv11(nn.Module):
+    """FGN v11: Dual spectral paths — FFT + DCT — in a single model.
+
+    FFT captures sharp transitions (periodic boundary), DCT captures smooth trends
+    (symmetric boundary). Stacking evidence shows they provide complementary signals.
+    Four paths: FFT combined (real+imag), DCT, wavelet, time-domain conv.
+    """
+    def __init__(self, n_snps, hidden=64, dropout=0.35, input_dropout=0.0, n_dct=384):
+        super().__init__()
+        ch = hidden // 2
+        self.input_dropout = input_dropout
+        n_freq = n_snps // 2 + 1
+
+        # --- FFT path ---
+        n_spec = 24
+        self.spec_r = nn.Parameter(torch.randn(1, n_spec, n_freq) * 0.02)
+        self.spec_i = nn.Parameter(torch.randn(1, n_spec, n_freq) * 0.02)
+        self.fft_conv = nn.Sequential(
+            nn.Conv1d(n_spec * 2, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+
+        # --- DCT path ---
+        n = torch.arange(n_snps).float()
+        k = torch.arange(n_dct).float().unsqueeze(1)
+        dct_basis = torch.cos(np.pi * k * (n + 0.5) / n_snps)
+        dct_basis[0] *= 1.0 / np.sqrt(2)
+        dct_basis *= np.sqrt(2.0 / n_snps)
+        self.register_buffer('dct_basis', dct_basis)  # (n_dct, n_snps)
+        self.n_spec_dct = 24
+        self.spec_weight_dct = nn.Parameter(torch.randn(1, self.n_spec_dct, n_dct) * 0.02)
+        self.dct_conv = nn.Sequential(
+            nn.Conv1d(self.n_spec_dct, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+
+        # --- Wavelet path ---
+        self.wavelet = HaarWaveletDecomp()
+        self.wavelet_conv = nn.Sequential(
+            nn.Conv1d(2, ch, 7, padding=3), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Conv1d(ch, ch, 5, padding=2), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+
+        # --- Time-domain path ---
+        self.time_conv = nn.Sequential(
+            nn.Conv1d(1, ch, 21, padding=10), nn.BatchNorm1d(ch), nn.GELU(),
+            nn.Dropout(dropout * 0.5))
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        # 4 paths × ch = 4×32 = 128 for hidden=64
+        self.head = nn.Sequential(
+            nn.Linear(ch * 4, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1))
+
+    def forward(self, x):
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+
+        # FFT
+        x_fft = torch.fft.rfft(x, dim=1)
+        real, imag = x_fft.real, x_fft.imag
+        sr = real.unsqueeze(1).expand(-1, 24, -1) * self.spec_r
+        si = imag.unsqueeze(1).expand(-1, 24, -1) * self.spec_i
+        fft_feat = self.pool(self.fft_conv(torch.cat([sr, si], dim=1))).squeeze(-1)
+
+        # DCT
+        x_dct = x @ self.dct_basis.T
+        x_dct = x_dct.unsqueeze(1).expand(-1, self.n_spec_dct, -1) * self.spec_weight_dct
+        dct_feat = self.pool(self.dct_conv(x_dct)).squeeze(-1)
+
+        # Wavelet
+        cA, cD = self.wavelet(x)
+        wv_feat = self.pool(self.wavelet_conv(torch.cat([cA, cD], dim=1))).squeeze(-1)
+
+        # Time conv
+        tp_feat = self.pool(self.time_conv(x.unsqueeze(1))).squeeze(-1)
+
+        return self.head(torch.cat([fft_feat, dct_feat, wv_feat, tp_feat], dim=1))
 
 
 class FGNplus(nn.Module):
@@ -652,7 +912,7 @@ def train_torch_model(model, X_train, y_train,
                       epochs=300, batch_size=128, lr=1e-3, weight_decay=1e-4,
                       patience=30, val_ratio=0.15, grad_clip=1.0,
                       use_swa=False, use_mixup=True, mixup_alpha=0.4,
-                      label_smooth=0.0, colsample=1.0):
+                      label_smooth=0.0, colsample=1.0, l1_lambda=0.0):
     model = model.to(DEVICE)
     n_total = len(X_train)
     n_snps = X_train.shape[1]
@@ -691,6 +951,10 @@ def train_torch_model(model, X_train, y_train,
                 by = by + noise
             opt.zero_grad()
             loss = crit(model(bx).squeeze(), by)
+            if l1_lambda > 0:
+                for name, param in model.named_parameters():
+                    if 'snp_weight' in name:
+                        loss = loss + l1_lambda * param.abs().sum()
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -818,8 +1082,14 @@ def create_model(name, n_snps, overrides=None):
     o = overrides or {}
     if name == 'FGN': return FourierGenomicNet(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0), n_spec=o.get('n_spec', 32), droppath=o.get('droppath', 0.0))
     if name == 'FGN v2': return FGNv2(n_snps=n_snps, hidden=64, dropout=0.35)
-    if name == 'FGN v4': return FGNv4(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGN v4': return FGNv4(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0), n_spec=o.get('n_spec', 24))
     if name == 'FGN v5': return FGNv5(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGN v6': return FGNv6(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0), max_freq=o.get('max_freq', 384))
+    if name == 'FGN v7': return FGNv7(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGN v8': return FGNv8(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGN v9': return FGNv9(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0), n_dct=o.get('n_dct', 384))
+    if name == 'FGN v10': return FGNv10(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
+    if name == 'FGN v11': return FGNv11(n_snps=n_snps, hidden=o.get('hidden', 64), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0), n_dct=o.get('n_dct', 384))
     if name == 'FusionNet': return FusionNet(n_snps=n_snps, hidden_dim=o.get('hidden_dim', 48), dropout=o.get('dropout', 0.35))
     if name == 'AdditiveGenomicNet': return AdditiveGenomicNet(n_snps=n_snps, hidden=o.get('hidden', 48), dropout=o.get('dropout', 0.35), input_dropout=o.get('input_dropout', 0.0))
     if name == 'FGNplus':
@@ -837,7 +1107,7 @@ def create_model(name, n_snps, overrides=None):
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
 TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
-DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGNplus', 'GenomicFM', 'FGN PCA']
+DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGN v6', 'FGN v7', 'FGN v9', 'FGN v10', 'FGN v11', 'FGNplus', 'GenomicFM', 'FGN PCA']
 DL_NAMES = DL_BASE_NAMES + ['FusionNet', 'AdditiveGenomicNet']
 ALL_NAMES = TRAD_NAMES + DL_NAMES
 
