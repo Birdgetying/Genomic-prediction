@@ -160,18 +160,6 @@ def train_all_models_cached(trait_name, force_retrain=False):
 # Improvement 1: R² pre-filter
 # ============================================================================
 
-def filter_by_r2(oof_dict, y, threshold=0.0):
-    """Remove models with R² < threshold. Returns filtered dict + removed list."""
-    kept = {}
-    removed = []
-    for mname, preds in oof_dict.items():
-        if float(r2_score(y, preds)) >= threshold:
-            kept[mname] = preds
-        else:
-            removed.append(mname)
-    return kept, removed
-
-
 # ============================================================================
 # Improvement 2+3: ElasticNetCV stacking + Greedy forward selection
 # ============================================================================
@@ -304,7 +292,7 @@ def run_comparison(trait_name="Plant_height", force_retrain=False):
     print(f"    R²={bl['R2']:+.4f}, n_models={len(all_models)}, n_active={bl['n_active']}")
 
     # B: R² filter + ElasticNetCV
-    oof_filtered, removed = filter_by_r2(oof, y, threshold=R2_FILTER_THRESHOLD)
+    oof_filtered, removed = ge._filter_by_r2(oof, y, threshold=R2_FILTER_THRESHOLD)
     if len(oof_filtered) >= 2:
         fe = eval_stacking(list(oof_filtered.keys()), oof_filtered, y, meta_type='ElasticNet')
         results['Improved: R²-filter + ElasticNet'] = fe

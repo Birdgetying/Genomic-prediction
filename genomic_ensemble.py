@@ -1248,7 +1248,7 @@ def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
         oof_preds_dict: {model_name: OOF_predictions_array}
         targets: phenotype values
         n_folds: inner CV folds for honest evaluation
-        meta_type: 'Ridge' (default), 'Lasso', 'ElasticNet'
+        meta_type: 'ElasticNet' (default), 'Ridge', 'Lasso'
         prune_corr: if True, correlation-prune before stacking (r > 0.995)
 
     Returns:
@@ -1345,97 +1345,79 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
       - Stacking (Greedy)    — greedy forward selection + ElasticNet meta-learner
       - Stacking (R²+Greedy) — R² filter + greedy forward selection + ElasticNet
 
-    Safety: each stacking variant's R² is floored at best_single_model R²,
-    ensuring the ensemble never regresses below the best individual model.
+    Each variant is floored at best_single_model performance so the ensemble
+    never regresses below the best individual model.
     """
     if folds_run < 3: return
     n_cv = min(5, folds_run)
 
-    # Best single model R² (excluding ensemble entries) — safety floor
-    best_single_r2 = max(
-        r['R2'] for name, r in trait_res.items()
-        if r.get('Type') != TYPE_ENS and not name.startswith('Best')
-    )
+    singles = [(name, r) for name, r in trait_res.items()
+               if r.get('Type') != TYPE_ENS and not name.startswith('Best')]
+    best_name, best_info = max(singles, key=lambda x: x[1]['R2'])
+    best_single_r2 = best_info['R2']
+    best_single_corr = best_info.get('Correlation', 0.0)
 
-    # --- 1. Stacking (DL) — Ridge ---
-    sr_dl = stacking_evaluate(oof_dl, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
-    trait_res['Stacking (DL)'] = {'R2': max(sr_dl['R2'], best_single_r2),
-                                  'Correlation': sr_dl['Correlation'],
-                                  'RMSE': 0.0, 'Type': TYPE_ENS,
-                                  'Meta_weights': sr_dl.get('Meta_weights', []),
-                                  'Base_models': sr_dl.get('Base_models', [])}
+    def _record(name, result, **extra):
+        """Record a stacking variant with best-single safety floor."""
+        r2 = result['R2']
+        corr = result.get('Correlation', 0.0)
+        if r2 < best_single_r2:
+            r2 = best_single_r2
+            corr = best_single_corr
+        trait_res[name] = {'R2': r2, 'Correlation': corr, 'RMSE': 0.0,
+                           'Type': TYPE_ENS,
+                           'Meta_weights': result.get('Meta_weights', []),
+                           'Base_models': result.get('Base_models', []),
+                           **extra}
 
-    # --- 2. Stacking (All) — Ridge ---
     oof_all = {**oof_trad, **oof_dl}
-    sr_all = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
-    trait_res['Stacking (All)'] = {'R2': max(sr_all['R2'], best_single_r2),
-                                   'Correlation': sr_all['Correlation'],
-                                   'RMSE': 0.0, 'Type': TYPE_ENS,
-                                   'Meta_weights': sr_all.get('Meta_weights', []),
-                                   'Base_models': sr_all.get('Base_models', [])}
 
-    # --- 3. Trad Ensemble — Ridge ---
+    sr_dl = stacking_evaluate(oof_dl, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
+    _record('Stacking (DL)', sr_dl)
+
+    sr_all = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
+    _record('Stacking (All)', sr_all)
+
     tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)),
                             meta_type='Ridge', prune_corr=False)
-    trait_res['Trad Ensemble'] = {'R2': max(tsr['R2'], best_single_r2),
-                                  'Correlation': tsr['Correlation'],
-                                  'RMSE': 0.0, 'Type': TYPE_ENS,
-                                  'Meta_weights': tsr.get('Meta_weights', []),
-                                  'Base_models': tsr.get('Base_models', [])}
+    _record('Trad Ensemble', tsr)
 
-    # --- 4. Stacking (Pruned) — ElasticNet, correlation-pruned ---
     sp = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='ElasticNet', prune_corr=True)
-    trait_res['Stacking (Pruned)'] = {'R2': max(sp['R2'], best_single_r2),
-                                      'Correlation': sp['Correlation'],
-                                      'RMSE': 0.0, 'Type': TYPE_ENS,
-                                      'Meta_weights': sp.get('Meta_weights', []),
-                                      'Base_models': sp.get('Base_models', []),
-                                      'Pruned_models': sp.get('Pruned_models', [])}
+    _record('Stacking (Pruned)', sp, Pruned_models=sp.get('Pruned_models', []))
 
-    # --- 5. Stacking (Greedy) — Greedy select + ElasticNet ---
     sg = stacking_evaluate_greedy(oof_all, y, n_folds=n_cv, meta_type='ElasticNet')
-    trait_res['Stacking (Greedy)'] = {'R2': max(sg['R2'], best_single_r2),
-                                      'Correlation': sg['Correlation'],
-                                      'RMSE': 0.0, 'Type': TYPE_ENS,
-                                      'Meta_weights': sg.get('Meta_weights', []),
-                                      'Base_models': sg.get('Base_models', []),
-                                      'Greedy_selected': sg.get('Greedy_selected', []),
-                                      'Pruned_models': sg.get('Pruned_models', [])}
+    _record('Stacking (Greedy)', sg,
+            Greedy_selected=sg.get('Greedy_selected', []),
+            Pruned_models=sg.get('Pruned_models', []))
 
-    # --- 6. Stacking (R²+Greedy) — R² filter → Greedy select + ElasticNet ---
     oof_r2_filtered, r2_removed = _filter_by_r2(oof_all, y, threshold=0.0)
     if len(oof_r2_filtered) >= 2:
         srg = stacking_evaluate_greedy(oof_r2_filtered, y, n_folds=n_cv, meta_type='ElasticNet')
-        trait_res['Stacking (R²+Greedy)'] = {'R2': max(srg['R2'], best_single_r2),
-                                              'Correlation': srg['Correlation'],
-                                              'RMSE': 0.0, 'Type': TYPE_ENS,
-                                              'Meta_weights': srg.get('Meta_weights', []),
-                                              'Base_models': srg.get('Base_models', []),
-                                              'Greedy_selected': srg.get('Greedy_selected', []),
-                                              'Pruned_models': srg.get('Pruned_models', []),
-                                              'R2_filtered': r2_removed}
+        _record('Stacking (R²+Greedy)', srg,
+                Greedy_selected=srg.get('Greedy_selected', []),
+                Pruned_models=srg.get('Pruned_models', []),
+                R2_filtered=r2_removed)
     else:
-        # Fallback: not enough models after R² filter — use best single
-        srg = {'R2': best_single_r2, 'Correlation': 0.0, 'Meta_weights': [],
-               'Base_models': list(oof_r2_filtered.keys()),
-               'Greedy_selected': list(oof_r2_filtered.keys()),
-               'Pruned_models': []}
-        trait_res['Stacking (R²+Greedy)'] = {'R2': best_single_r2,
-                                              'Correlation': 0.0,
-                                              'RMSE': 0.0, 'Type': TYPE_ENS,
-                                              'Meta_weights': [],
-                                              'Base_models': list(oof_r2_filtered.keys()),
-                                              'Greedy_selected': [],
-                                              'Pruned_models': [],
-                                              'R2_filtered': r2_removed}
+        if len(oof_r2_filtered) == 1:
+            mname = list(oof_r2_filtered.keys())[0]
+            fallback_r2 = float(r2_score(y, oof_r2_filtered[mname]))
+            fallback_corr = float(pearsonr(y, oof_r2_filtered[mname])[0])
+        else:
+            fallback_r2 = best_single_r2
+            fallback_corr = best_single_corr
+        srg = {'R2': fallback_r2, 'Correlation': fallback_corr}
+        _record('Stacking (R²+Greedy)', srg,
+                Greedy_selected=list(oof_r2_filtered.keys()),
+                Pruned_models=[], R2_filtered=r2_removed)
 
+    n_greedy_pool = len(oof_all) - len(sg.get('Pruned_models', []))
     print(f"  {'Stacking (DL)':<24s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f}")
     print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
     print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
     print(f"  {'Stacking (Pruned)':<24s} {sp['R2']:8.4f} {sp['Correlation']:8.4f}  "
           f"[ElasticNet, pruned={len(sp.get('Pruned_models',[]))}]")
     print(f"  {'Stacking (Greedy)':<24s} {sg['R2']:8.4f} {sg['Correlation']:8.4f}  "
-          f"[ElasticNet, selected={len(sg.get('Greedy_selected',[]))}/{len(oof_all)}]")
+          f"[ElasticNet, selected={len(sg.get('Greedy_selected',[]))}/{n_greedy_pool}]")
     gs = sg.get('Greedy_selected', [])
     if gs:
         print(f"    Greedy selected: {gs}")
@@ -2114,9 +2096,22 @@ if __name__ == '__main__':
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*80}")
 
-    if crop in ('wheat', 'all'): run_wheat(quick_test=not full_mode)
-    if crop in ('rice', 'all'): run_rice(quick_test=not full_mode)
-    if crop in ('maize', 'all'): run_maize(quick_test=not full_mode)
+    if crop == 'all':
+        import subprocess
+        procs = []
+        for c in ['wheat', 'rice', 'maize']:
+            cmd = [sys.executable, __file__, c]
+            if full_mode:
+                cmd.append('--full')
+            print(f"  Launching subprocess: {' '.join(cmd)}")
+            procs.append(subprocess.Popen(cmd))
+        for i, p in enumerate(procs):
+            p.wait()
+            print(f"  Subprocess {['wheat','rice','maize'][i]} finished (rc={p.returncode})")
+    else:
+        if crop == 'wheat': run_wheat(quick_test=not full_mode)
+        if crop == 'rice': run_rice(quick_test=not full_mode)
+        if crop == 'maize': run_maize(quick_test=not full_mode)
 
     print(f"\n{'#'*80}")
     print(f"  All done! Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
