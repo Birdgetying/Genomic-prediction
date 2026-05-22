@@ -28,10 +28,10 @@ echo "Working directory: $(pwd)"
 echo ""
 echo "Node: $(hostname), CPUs: $(nproc)"
 
-# 确保 cyvcf2 已安装（VCF 解析必需）
+# 确保 cyvcf2 已安装（VCF 解析必需，使用校内 PyPI 镜像）
 python -c "import cyvcf2" 2>/dev/null || {
-    echo "Installing cyvcf2..."
-    pip install cyvcf2 --user
+    echo "Installing cyvcf2 from internal mirror..."
+    pip install -i http://10.105.32.248/pypi/simple/ --trusted-host 10.105.32.248 cyvcf2
 }
 
 python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"

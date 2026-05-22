@@ -24,13 +24,7 @@ torch.backends.cudnn.benchmark = False
 
 Genomic prediction/selection research — reproducing and extending deep learning models for predicting crop and animal phenotypes from genomic variants (SNPs, INDELs, SVs). The primary reference paper is "Cropformer: An interpretable deep learning framework for crop genomic prediction" (Wang et al., 2025).
 
-## Key Sub-Projects
-
-- **`cropformer/`** — Custom Transformer-based genomic prediction framework (PyTorch). Core modules: `model.py` (GenomicTransformer, CropformerV3), `data.py` (data loading/generation), `trainer.py`.
-- **`WheatGP/WheatGP-main/`** — CNN+LSTM model for wheat polyploid genomic prediction (PyTorch). Has a tkinter GUI.
-- **`DNNGP-main/`** — Deep neural network for genomic prediction using TensorFlow 2.6. Used for baseline comparisons.
-- **`CropG2P-main/`** — Another genomic prediction framework with data preprocessing pipeline and model explanation tools.
-- **`cattle_data/genomic-FM-main/`** — Genomic foundation model for cattle (finetuning pretrained DNA language models like DNABERT, HyenaDNA, Nucleotide Transformer).
+## 项目架构看docs.md
 
 ## Environment
 
@@ -38,6 +32,11 @@ Genomic prediction/selection research — reproducing and extending deep learnin
 - GPU required for training; CUDA expected
 - HPC cluster uses PBS/Torque job scheduler (`.jsub` files)
 - Key deps: `numpy`, `pandas`, `torch`, `scikit-learn`, `xgboost`, `scipy`, `matplotlib`
+
+**HPC 镜像源（节点无外网，必须使用校内代理）：**
+- Conda: `http://10.105.32.248/anaconda/`（首次需 `cp /storage/public/share/conda-mirror/.condarc ~/`）
+- PyPI: `http://10.105.32.248/pypi/simple/`
+- pip 安装命令: `pip install -i http://10.105.32.248/pypi/simple/ --trusted-host 10.105.32.248 <package>`
 
 ```
 pip install -r requirements.txt
@@ -51,14 +50,7 @@ python run.py --mode train --n_samples 20000 --n_snps 5000
 python run.py --mode demo
 ```
 
-**Key training scripts (root directory, in approximate order of complexity):**
-- `efficient_rrblup.py` — Fast RRBLUP baseline on wheat2000 PCA data
-- `train_optimized_model.py` — GWAS-filtered + PCA + Transformer on wheat2000 (good starting point)
-- `train_enhanced_automl.py` — CNN-Transformer with Optuna AutoML
-- `train_enhanced_automl_separate_gwas.py` — Separate processing of SNP/INDEL/SV from VCF with GWAS integration
-- `train_sv_enhanced.py` — Full pipeline with SV (structural variation) data
-- `train_sv_pro_gwas.py` — Most advanced: GWAS-guided marker optimization across all variant types
-- `train_comprehensive_ablation.py` — Ablation study comparing multiple model architectures + baselines
+
 
 **GUI platform:**
 ```
@@ -76,18 +68,7 @@ python compare_all_models.py
 python haplotype_phenotype_analysis.py
 ```
 
-## Data Locations
 
-| Directory | Content |
-|-----------|---------|
-| `dnngp_data/wheat599/` | 599 wheat lines, PCA features |
-| `dnngp_data/wheat2000/SNP_pca/` | 2000 wheat lines, PCA-reduced SNPs (~1691 dims) |
-| `dnngp_data/wheat2000/SNP_origin/` | Raw 33,710-dim SNP genotypes |
-| `dnngp_data/maize1404/` | 1404 maize lines |
-| `dnngp_data/tomato332/` | 332 tomato accessions |
-| `data2/` | Iranian & Mexican wheat samples with phenotypes |
-| `Variation/CSIAAS/` | VCF files (SNP, INDEL, SV) from cattle |
-| `data/` | Simulated genomic data for algorithm testing |
 
 ## HPC Job Submission
 
@@ -100,7 +81,7 @@ tail -f logs/xxx_output.*   # monitor logs
 
 ## Key Architectural Patterns
 
-1. **Data preprocessing is critical**: PCA features should be mean-centered but NOT fully standardized (preserves variance structure). GWAS-guided marker selection significantly improves prediction.
+1. **Data preprocessing is critical**
 2. **Cross-validation**: All experiments use 5-fold CV (often stratified/quantile-split for fair comparison).
 3. **Baseline models**: RRBLUP (RidgeCV) and XGBoost are standard baselines. RRBLUP often outperforms deep models on linear-dominated genomic data.
 4. **Model architecture pattern**: `Config` class at module level → data loading with train/test split → PCA/dimension reduction → PyTorch model (CNN+Transformer hybrid) → training loop with early stopping → result JSON + plots.
