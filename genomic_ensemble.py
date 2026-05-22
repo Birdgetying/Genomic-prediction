@@ -1479,7 +1479,7 @@ def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test
 
     meta = {'trait': trait_name, 'n_snps': n_snps, 'gwas_indices': gidx.tolist(),
             'n_samples': len(y), 'models': list(trad_models.keys()) + DL_NAMES}
-    with open(deploy_dir / "deployment_meta.json", 'w') as f: json.dump(meta, f, indent=2)
+    with open(deploy_dir / "deployment_meta.json", 'w', encoding='utf-8') as f: json.dump(meta, f, indent=2)
     print(f"    [saved] deployment_meta")
 
 
@@ -1605,7 +1605,7 @@ def _print_final_summary(all_results, traits_run, output_dir, total_t0, crop_nam
         marker = " <-- BEST" if i == 1 else ""
         print(f"  {i:2d}. [{all_results[traits_run[0]][m].get('Type', ''):>12s}] {m:<22s} {r:.4f}{marker}")
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    with open(output_dir / f"ensemble_final_{ts}.json", 'w') as f:
+    with open(output_dir / f"ensemble_final_{ts}.json", 'w', encoding='utf-8') as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     print(f"\nResults saved to: {output_dir}")
     print(f"Total time: {(time.time()-total_t0)/60:.1f} min")
@@ -1802,7 +1802,7 @@ def run_wheat(quick_test=True):
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
         all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w') as f:
+        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
@@ -1937,7 +1937,7 @@ def run_rice(quick_test=True):
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
         all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w') as f:
+        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
@@ -2070,7 +2070,7 @@ def run_maize(quick_test=True):
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
         all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w') as f:
+        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
