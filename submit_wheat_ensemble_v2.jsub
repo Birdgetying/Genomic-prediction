@@ -14,6 +14,9 @@ echo "======================================================================"
 echo "Wheat Ensemble (v2) — Job started at $(date)"
 echo "======================================================================"
 
+module load pytorch-2.3.0_py311
+echo "Module loaded: pytorch-2.3.0_py311"
+
 export PYTHONHASHSEED=42
 
 # 工作目录
