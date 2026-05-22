@@ -26,6 +26,13 @@ from sklearn.linear_model import RidgeCV, ElasticNetCV, LassoCV
 from scipy.stats import pearsonr
 import xgboost as xgb
 
+# Fix Windows console encoding for Unicode characters (R², Δ, etc.)
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
