@@ -1,0 +1,77 @@
+#!/bin/bash
+# ============================================================================
+# Wheat Genomic Ensemble — 仅小麦 (使用更新后的 genomic_ensemble.py)
+#
+# 使用: jsub < submit_wheat_ensemble_v2.jsub
+# ============================================================================
+#JSUB -q cpu
+#JSUB -n 4
+#JSUB -J wheat_ensemble_v2
+#JSUB -o logs/wheat_ensemble_v2_%J.out
+#JSUB -e logs/wheat_ensemble_v2_%J.err
+
+echo "======================================================================"
+echo "Wheat Ensemble (v2) — Job started at $(date)"
+echo "======================================================================"
+
+export PYTHONHASHSEED=42
+
+# 工作目录
+cd $HOME/genomic_prediction 2>/dev/null || \
+cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+    echo "ERROR: Cannot find project directory"
+    exit 1
+}
+echo "Working directory: $(pwd)"
+
+# CPU 信息
+echo ""
+echo "Node: $(hostname), CPUs: $(nproc)"
+python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
+
+mkdir -p logs results/wheat_ensemble
+
+echo ""
+echo "Checking data files..."
+DATA_BASE="/storage/public/home/2024110093/data/Variation/CSIAAS"
+MISSING=0
+for f in \
+    "Core819Samples_snp.filter.final.id_gt.813m.vcf.gz" \
+    "Core819Samples_indel.filter.final.id_gt.813m.vcf.gz" \
+    "SV.new.vcf.gz" \
+    "Phe.txt" \
+    "VCFID.txt"
+do
+    if [ -f "$DATA_BASE/$f" ]; then
+        SIZE=$(du -h "$DATA_BASE/$f" | cut -f1)
+        echo "  [OK] $f ($SIZE)"
+    else
+        echo "  [MISSING] $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Missing wheat data files"
+    exit 1
+fi
+
+echo ""
+echo "======================================================================"
+echo "Starting wheat ensemble (full mode) — $(date)"
+echo "======================================================================"
+
+T0=$(date +%s)
+python -u genomic_ensemble.py wheat --full 2>&1 | tee "logs/wheat_ensemble_v2_$(date +%Y%m%d_%H%M%S).log"
+EXIT_CODE=${PIPESTATUS[0]}
+T1=$(date +%s)
+
+echo ""
+echo "======================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "SUCCESS — Total time: $(((T1-T0)/60)) min — $(date)"
+else
+    echo "FAILED with exit code $EXIT_CODE — $(date)"
+fi
+echo "======================================================================"
+exit $EXIT_CODE

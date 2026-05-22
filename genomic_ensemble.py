@@ -49,8 +49,9 @@ MAF_THRESHOLD = 0.05
 MARKER_SELECTOR = 'gwas'  # 'gwas' | 'haplotype' | 'hybrid'
 HAPLO_GWAS_FRAC = 0.6
 
-# Project root on HPC
-PROJECT_DIR = "/storage/public/home/2024110093/genomic_prediction"
+# Project root — auto-detect local vs HPC
+_PROJECT_DIR_HPC = "/storage/public/home/2024110093/genomic_prediction"
+PROJECT_DIR = _PROJECT_DIR_HPC if os.path.isdir(_PROJECT_DIR_HPC) else os.path.dirname(os.path.abspath(__file__))
 
 # Wheat data paths
 WHEAT_DATA_BASE = "/storage/public/home/2024110093/data/Variation/CSIAAS/"
