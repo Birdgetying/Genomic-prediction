@@ -4,7 +4,7 @@
 #
 # 使用: jsub < submit_wheat_ensemble_v2.jsub
 # ============================================================================
-#JSUB -q cpu
+#JSUB -q fat
 #JSUB -n 4
 #JSUB -J wheat_ensemble_v2
 #JSUB -o logs/wheat_ensemble_v2_%J.out
@@ -27,7 +27,15 @@ echo "Working directory: $(pwd)"
 # CPU 信息
 echo ""
 echo "Node: $(hostname), CPUs: $(nproc)"
+
+# 确保 cyvcf2 已安装（VCF 解析必需）
+python -c "import cyvcf2" 2>/dev/null || {
+    echo "Installing cyvcf2..."
+    pip install cyvcf2 --user
+}
+
 python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
+python -c "import cyvcf2; print(f'cyvcf2: OK')"
 
 mkdir -p logs results/wheat_ensemble
 
