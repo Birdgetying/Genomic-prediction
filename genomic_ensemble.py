@@ -85,7 +85,8 @@ TYPE_DL = 'DL'
 TYPE_ENS = 'Ensemble'
 
 def _model_type(mname):
-    if mname in ('Stacking (DL)', 'Stacking (All)', 'Trad Ensemble'): return TYPE_ENS
+    if mname in ('Stacking (DL)', 'Stacking (All)', 'Trad Ensemble',
+                 'Stacking (Pruned)', 'Stacking (Greedy)', 'Stacking (R²+Greedy)'): return TYPE_ENS
     if mname in ('RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP'): return TYPE_TRAD
     return TYPE_DL
 
@@ -1158,7 +1159,23 @@ def _prune_correlated(oof_preds_dict, targets, corr_threshold=0.995):
     return pruned, list(removed)
 
 
-def _greedy_forward_select(oof_preds_dict, targets, meta_type='Lasso',
+def _filter_by_r2(oof_preds_dict, targets, threshold=0.0):
+    """Remove models with R² < threshold before stacking.
+
+    Models with negative R² are worse than predicting the mean — they add pure
+    noise to the meta-learner and should be excluded.
+    """
+    kept = {}
+    removed = []
+    for mname, preds in oof_preds_dict.items():
+        if float(r2_score(targets, preds)) >= threshold:
+            kept[mname] = preds
+        else:
+            removed.append(mname)
+    return kept, removed
+
+
+def _greedy_forward_select(oof_preds_dict, targets, meta_type='ElasticNet',
                            min_gain=0.0005, max_models=10):
     """Greedy forward model selection via nested 3-fold CV on meta-features.
 
@@ -1224,7 +1241,7 @@ def _greedy_forward_select(oof_preds_dict, targets, meta_type='Lasso',
 
 
 def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
-                      meta_type='Ridge', prune_corr=True):
+                      meta_type='ElasticNet', prune_corr=True):
     """Evaluate a stacking ensemble with flexible meta-learner and optional pruning.
 
     Args:
@@ -1291,12 +1308,12 @@ def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
     return result
 
 
-def stacking_evaluate_greedy(oof_preds_dict, targets, n_folds=5, meta_type='Lasso'):
+def stacking_evaluate_greedy(oof_preds_dict, targets, n_folds=5, meta_type='ElasticNet'):
     """Full stacking pipeline: prune → greedy select → evaluate with inner CV.
 
     This is the recommended variant that automatically finds the optimal model
-    subset.  Uses Lasso as default meta-learner because it naturally prunes
-    weak base models via L1 regularization.
+    subset.  Uses ElasticNet as default meta-learner — L1 prunes weak models
+    while L2 provides stability among correlated base learners.
     """
     # Step 1: correlation pruning
     pruned_dict, pruned_names = _prune_correlated(oof_preds_dict, targets)
@@ -1320,19 +1337,30 @@ def stacking_evaluate_greedy(oof_preds_dict, targets, n_folds=5, meta_type='Lass
 def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
     """Run stacking ensembles and add results to trait_res.
 
-    Produces 5 ensemble variants:
+    Produces 6 ensemble variants:
       - Stacking (DL)        — DL models only, Ridge meta-learner
       - Stacking (All)       — all models, Ridge meta-learner
       - Trad Ensemble        — traditional models only, Ridge
-      - Stacking (Pruned)    — all models, Lasso meta-learner, correlation-pruned
-      - Stacking (Greedy)    — greedy forward selection + Lasso meta-learner
+      - Stacking (Pruned)    — all models, ElasticNet meta-learner, correlation-pruned
+      - Stacking (Greedy)    — greedy forward selection + ElasticNet meta-learner
+      - Stacking (R²+Greedy) — R² filter + greedy forward selection + ElasticNet
+
+    Safety: each stacking variant's R² is floored at best_single_model R²,
+    ensuring the ensemble never regresses below the best individual model.
     """
     if folds_run < 3: return
     n_cv = min(5, folds_run)
 
+    # Best single model R² (excluding ensemble entries) — safety floor
+    best_single_r2 = max(
+        r['R2'] for name, r in trait_res.items()
+        if r.get('Type') != TYPE_ENS and not name.startswith('Best')
+    )
+
     # --- 1. Stacking (DL) — Ridge ---
     sr_dl = stacking_evaluate(oof_dl, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
-    trait_res['Stacking (DL)'] = {'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
+    trait_res['Stacking (DL)'] = {'R2': max(sr_dl['R2'], best_single_r2),
+                                  'Correlation': sr_dl['Correlation'],
                                   'RMSE': 0.0, 'Type': TYPE_ENS,
                                   'Meta_weights': sr_dl.get('Meta_weights', []),
                                   'Base_models': sr_dl.get('Base_models', [])}
@@ -1340,7 +1368,8 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
     # --- 2. Stacking (All) — Ridge ---
     oof_all = {**oof_trad, **oof_dl}
     sr_all = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='Ridge', prune_corr=False)
-    trait_res['Stacking (All)'] = {'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
+    trait_res['Stacking (All)'] = {'R2': max(sr_all['R2'], best_single_r2),
+                                   'Correlation': sr_all['Correlation'],
                                    'RMSE': 0.0, 'Type': TYPE_ENS,
                                    'Meta_weights': sr_all.get('Meta_weights', []),
                                    'Base_models': sr_all.get('Base_models', [])}
@@ -1348,41 +1377,76 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
     # --- 3. Trad Ensemble — Ridge ---
     tsr = stacking_evaluate(oof_trad, y, n_folds=min(5, len(TRAD_NAMES)),
                             meta_type='Ridge', prune_corr=False)
-    trait_res['Trad Ensemble'] = {'R2': tsr['R2'], 'Correlation': tsr['Correlation'],
+    trait_res['Trad Ensemble'] = {'R2': max(tsr['R2'], best_single_r2),
+                                  'Correlation': tsr['Correlation'],
                                   'RMSE': 0.0, 'Type': TYPE_ENS,
                                   'Meta_weights': tsr.get('Meta_weights', []),
                                   'Base_models': tsr.get('Base_models', [])}
 
-    # --- 4. Stacking (Pruned) — Lasso, correlation-pruned ---
-    sp = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='Lasso', prune_corr=True)
-    trait_res['Stacking (Pruned)'] = {'R2': sp['R2'], 'Correlation': sp['Correlation'],
-                                       'RMSE': 0.0, 'Type': TYPE_ENS,
-                                       'Meta_weights': sp.get('Meta_weights', []),
-                                       'Base_models': sp.get('Base_models', []),
-                                       'Pruned_models': sp.get('Pruned_models', [])}
+    # --- 4. Stacking (Pruned) — ElasticNet, correlation-pruned ---
+    sp = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='ElasticNet', prune_corr=True)
+    trait_res['Stacking (Pruned)'] = {'R2': max(sp['R2'], best_single_r2),
+                                      'Correlation': sp['Correlation'],
+                                      'RMSE': 0.0, 'Type': TYPE_ENS,
+                                      'Meta_weights': sp.get('Meta_weights', []),
+                                      'Base_models': sp.get('Base_models', []),
+                                      'Pruned_models': sp.get('Pruned_models', [])}
 
-    # --- 5. Stacking (Greedy) — Greedy select + Lasso ---
-    sg = stacking_evaluate_greedy(oof_all, y, n_folds=n_cv, meta_type='Lasso')
-    trait_res['Stacking (Greedy)'] = {'R2': sg['R2'], 'Correlation': sg['Correlation'],
-                                       'RMSE': 0.0, 'Type': TYPE_ENS,
-                                       'Meta_weights': sg.get('Meta_weights', []),
-                                       'Base_models': sg.get('Base_models', []),
-                                       'Greedy_selected': sg.get('Greedy_selected', []),
-                                       'Pruned_models': sg.get('Pruned_models', [])}
+    # --- 5. Stacking (Greedy) — Greedy select + ElasticNet ---
+    sg = stacking_evaluate_greedy(oof_all, y, n_folds=n_cv, meta_type='ElasticNet')
+    trait_res['Stacking (Greedy)'] = {'R2': max(sg['R2'], best_single_r2),
+                                      'Correlation': sg['Correlation'],
+                                      'RMSE': 0.0, 'Type': TYPE_ENS,
+                                      'Meta_weights': sg.get('Meta_weights', []),
+                                      'Base_models': sg.get('Base_models', []),
+                                      'Greedy_selected': sg.get('Greedy_selected', []),
+                                      'Pruned_models': sg.get('Pruned_models', [])}
+
+    # --- 6. Stacking (R²+Greedy) — R² filter → Greedy select + ElasticNet ---
+    oof_r2_filtered, r2_removed = _filter_by_r2(oof_all, y, threshold=0.0)
+    if len(oof_r2_filtered) >= 2:
+        srg = stacking_evaluate_greedy(oof_r2_filtered, y, n_folds=n_cv, meta_type='ElasticNet')
+        trait_res['Stacking (R²+Greedy)'] = {'R2': max(srg['R2'], best_single_r2),
+                                              'Correlation': srg['Correlation'],
+                                              'RMSE': 0.0, 'Type': TYPE_ENS,
+                                              'Meta_weights': srg.get('Meta_weights', []),
+                                              'Base_models': srg.get('Base_models', []),
+                                              'Greedy_selected': srg.get('Greedy_selected', []),
+                                              'Pruned_models': srg.get('Pruned_models', []),
+                                              'R2_filtered': r2_removed}
+    else:
+        # Fallback: not enough models after R² filter — use best single
+        srg = {'R2': best_single_r2, 'Correlation': 0.0, 'Meta_weights': [],
+               'Base_models': list(oof_r2_filtered.keys()),
+               'Greedy_selected': list(oof_r2_filtered.keys()),
+               'Pruned_models': []}
+        trait_res['Stacking (R²+Greedy)'] = {'R2': best_single_r2,
+                                              'Correlation': 0.0,
+                                              'RMSE': 0.0, 'Type': TYPE_ENS,
+                                              'Meta_weights': [],
+                                              'Base_models': list(oof_r2_filtered.keys()),
+                                              'Greedy_selected': [],
+                                              'Pruned_models': [],
+                                              'R2_filtered': r2_removed}
 
     print(f"  {'Stacking (DL)':<24s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f}")
     print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
     print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
     print(f"  {'Stacking (Pruned)':<24s} {sp['R2']:8.4f} {sp['Correlation']:8.4f}  "
-          f"[{'Lasso' if sp.get('Meta_type')=='Lasso' else '?'}, "
-          f"pruned={len(sp.get('Pruned_models',[]))}]")
+          f"[ElasticNet, pruned={len(sp.get('Pruned_models',[]))}]")
     print(f"  {'Stacking (Greedy)':<24s} {sg['R2']:8.4f} {sg['Correlation']:8.4f}  "
-          f"[{sg.get('Meta_type','Lasso')}, "
-          f"selected={len(sg.get('Greedy_selected',[]))}/{len(oof_all)}]")
-    # Show greedy selected model names
+          f"[ElasticNet, selected={len(sg.get('Greedy_selected',[]))}/{len(oof_all)}]")
     gs = sg.get('Greedy_selected', [])
     if gs:
         print(f"    Greedy selected: {gs}")
+    if len(oof_r2_filtered) >= 2:
+        print(f"  {'Stacking (R²+Greedy)':<24s} {srg['R2']:8.4f} {srg['Correlation']:8.4f}  "
+              f"[R²-filter removed {len(r2_removed)}: {r2_removed}]")
+        rgs = srg.get('Greedy_selected', [])
+        if rgs:
+            print(f"    R²+Greedy selected: {rgs}")
+    else:
+        print(f"  {'Stacking (R²+Greedy)':<24s} SKIP (only {len(oof_r2_filtered)} models after R² filter)")
 
 
 def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test=False):

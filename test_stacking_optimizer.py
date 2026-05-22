@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""Stacking optimizer — rapid local testing of improved stacking strategies.
+"""Stacking optimizer — local testing of improved stacking strategies.
 
 Uses genomic_ensemble.py for data loading & model training. Caches OOF predictions
-to disk so subsequent runs can test new stacking algorithms without retraining.
+to disk for fast iteration.
 
-Key improvements over the default stacking_evaluate():
-  1. Correlation-based pruning — remove redundant models (r > 0.995)
-  2. Greedy forward selection — auto-find optimal model subset via nested CV
-  3. Multiple meta-learners — BayesianRidge, LassoCV (fine grid), ElasticNetCV
-  4. Meta feature engineering — pairwise interactions, squared terms
-  5. Convex weight optimization — scipy.optimize with simplex constraints
-  6. Model clustering — cluster by prediction correlation, pick best per cluster
+Three key improvements tested against baseline Stacking (All) Ridge:
+  1. R² pre-filter: remove models with R² < 0 before stacking
+  2. ElasticNetCV meta-learner: L1 sparsity + L2 stability
+  3. Greedy forward selection: auto-find optimal model subset via nested CV
 """
 import sys, os, time, json, random, pickle, warnings
 import numpy as np
-from scipy.optimize import minimize
 from scipy.stats import pearsonr
-from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.model_selection import KFold
 from sklearn.metrics import r2_score
-from sklearn.linear_model import RidgeCV, LassoCV, ElasticNetCV, BayesianRidge, HuberRegressor
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-import xgboost as xgb
+from sklearn.linear_model import RidgeCV, LassoCV, ElasticNetCV
+
+# Fix Windows console encoding for Unicode characters (R², Δ, etc.)
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+warnings.filterwarnings('ignore')
 
 random.seed(42)
 np.random.seed(42)
@@ -35,17 +38,15 @@ torch.backends.cudnn.benchmark = False
 
 import genomic_ensemble as ge
 
-warnings.filterwarnings('ignore')
-
 # ============================================================================
 # Config
 # ============================================================================
 CACHE_DIR = "results/stacking_cache"
-N_FOLDS = 3  # fast inner CV for stacking eval
+N_FOLDS = 3
 RANDOM_SEED = 42
-RIDGE_ALPHAS_FINE = np.logspace(-3, 5, 50)  # 50-point log grid
-LASSO_ALPHAS = np.logspace(-4, 2, 30)
+RIDGE_ALPHAS_FINE = np.logspace(-3, 5, 50)
 ENET_ALPHAS = np.logspace(-4, 2, 20)
+R2_FILTER_THRESHOLD = 0.0
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -72,7 +73,7 @@ def get_cache_path(trait_name):
 
 
 def train_all_models_cached(trait_name, force_retrain=False):
-    """Train all models with 3-fold CV, cache OOF predictions. Returns (oof_dict, y_all, metrics)."""
+    """Train all models with 3-fold CV, cache OOF predictions."""
     cache_path = get_cache_path(trait_name)
     if not force_retrain and os.path.exists(cache_path):
         print(f"  [CACHE HIT] Loading OOF from {cache_path}")
@@ -84,6 +85,7 @@ def train_all_models_cached(trait_name, force_retrain=False):
     X_all, y_all = load_rice_trait(trait_name)
     n_snps = min(ge.GWAS_TOP_K, max(50, X_all.shape[1] - 50))
     n_samples = len(y_all)
+    print(f"  {n_samples} samples, {n_snps} SNPs")
 
     trad_models = ge.TRAD_NAMES
     dl_models = ge.DL_NAMES
@@ -155,472 +157,225 @@ def train_all_models_cached(trait_name, force_retrain=False):
 
 
 # ============================================================================
-# Phase 1: Correlation-based Pruning
+# Improvement 1: R² pre-filter
 # ============================================================================
 
-def prune_correlated_models(oof, metrics, corr_threshold=0.995):
-    """Remove redundant models: if two models have prediction correlation > threshold,
-    keep only the one with higher R²."""
-    model_names = list(oof.keys())
-    # Build prediction matrix
-    preds = np.column_stack([oof[m] for m in model_names])
-
-    # Correlation matrix
-    corr_mat = np.corrcoef(preds.T)
-    np.fill_diagonal(corr_mat, 0)
-
-    # Sort models by R² descending
-    ranked = sorted(model_names, key=lambda m: metrics[m]['R2'], reverse=True)
-    kept = []
-    removed = set()
-
-    for m in ranked:
-        if m in removed:
-            continue
-        kept.append(m)
-        m_idx = model_names.index(m)
-        # Remove all models too correlated with this one
-        for j, other in enumerate(model_names):
-            if other != m and other not in removed and other not in kept:
-                if abs(corr_mat[m_idx, j]) > corr_threshold:
-                    removed.add(other)
-
-    return kept, list(removed)
+def filter_by_r2(oof_dict, y, threshold=0.0):
+    """Remove models with R² < threshold. Returns filtered dict + removed list."""
+    kept = {}
+    removed = []
+    for mname, preds in oof_dict.items():
+        if float(r2_score(y, preds)) >= threshold:
+            kept[mname] = preds
+        else:
+            removed.append(mname)
+    return kept, removed
 
 
 # ============================================================================
-# Phase 2: Auto-select model subset via greedy forward selection (nested CV)
+# Improvement 2+3: ElasticNetCV stacking + Greedy forward selection
 # ============================================================================
 
 def build_X_stack(model_list, oof):
     return np.column_stack([oof[m] for m in model_list])
 
 
-def greedy_forward_select(oof, y, metrics, model_names, meta_type='Ridge',
-                          min_gain=0.0005, max_models=12):
-    """Greedily add models that improve nested CV R².
+def greedy_forward_select(oof_dict, y, meta_type='ElasticNet',
+                          min_gain=0.0005, max_models=10):
+    """Greedy forward model selection via nested 3-fold CV on meta-features."""
+    names = list(oof_dict.keys())
+    if len(names) <= 1:
+        return names
 
-    Args:
-        oof: dict of model_name -> OOF prediction array
-        y: target values
-        metrics: dict of model_name -> {'R2': ..., 'r': ...}
-        model_names: pool of candidate model names
-        meta_type: 'Ridge' | 'Lasso' | 'ElasticNet'
-        min_gain: minimum R² improvement to add a model
-        max_models: maximum number of models to include
-
-    Returns:
-        selected: list of selected model names
-        history: list of (model_added, R2_after, n_models)
-    """
-    # Sort candidates by individual R²
-    remaining = sorted(model_names, key=lambda m: metrics[m]['R2'], reverse=True)
-
-    selected = [remaining[0]]  # start with best
-    remaining = remaining[1:]
+    scores = {m: float(r2_score(y, oof_dict[m])) for m in names}
+    ranked = sorted(names, key=lambda m: scores[m], reverse=True)
+    selected = [ranked[0]]
+    pool = ranked[1:]
 
     inner_kf = KFold(n_splits=3, shuffle=True, random_state=42)
 
-    def eval_subset(models):
-        X = build_X_stack(models, oof)
+    def _eval_subset(sel):
+        X = np.column_stack([oof_dict[m] for m in sel])
         preds = np.zeros(len(y))
         for itr, ite in inner_kf.split(X):
-            X_tr, X_te = X[itr], X[ite]
-            if meta_type == 'Ridge':
-                m = RidgeCV(alphas=RIDGE_ALPHAS_FINE, fit_intercept=True, cv=3)
-            elif meta_type == 'Lasso':
-                m = LassoCV(alphas=LASSO_ALPHAS, cv=3, max_iter=5000, random_state=42)
-            elif meta_type == 'ElasticNet':
+            if meta_type == 'ElasticNet':
                 m = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
-                                 alphas=ENET_ALPHAS, cv=3, max_iter=5000, random_state=42)
-            m.fit(X_tr, y[itr])
-            preds[ite] = m.predict(X_te)
+                                 alphas=ENET_ALPHAS, cv=3, max_iter=10000, random_state=42)
+            elif meta_type == 'Lasso':
+                m = LassoCV(alphas=np.logspace(-4, 2, 30), cv=3, max_iter=10000, random_state=42)
+            else:
+                m = RidgeCV(alphas=RIDGE_ALPHAS_FINE, fit_intercept=True, cv=3)
+            m.fit(X[itr], y[itr])
+            preds[ite] = m.predict(X[ite])
         return float(r2_score(y, preds))
 
-    best_r2 = eval_subset(selected)
-    history = [('START', best_r2, 1)]
+    best_r2 = _eval_subset(selected)
 
-    while remaining and len(selected) < max_models:
+    while pool and len(selected) < max_models:
         gains = []
-        for cand in remaining[:min(10, len(remaining))]:  # test top 10 candidates
-            trial_set = selected + [cand]
-            trial_r2 = eval_subset(trial_set)
+        for cand in pool[:min(12, len(pool))]:
+            trial_r2 = _eval_subset(selected + [cand])
             gains.append((cand, trial_r2 - best_r2, trial_r2))
-
-        gains.sort(key=lambda x: -x[2])  # sort by trial R2 descending
+        gains.sort(key=lambda x: -x[2])
         best_cand, best_gain, best_trial_r2 = gains[0]
-
         if best_gain < min_gain:
             break
-
         selected.append(best_cand)
-        remaining.remove(best_cand)
+        pool.remove(best_cand)
         best_r2 = best_trial_r2
-        history.append((best_cand, best_r2, len(selected)))
-        print(f"    + {best_cand:<22s} R2={best_r2:+.4f} (gain={best_gain:+.4f})")
 
-    return selected, history
+    return selected
 
 
-# ============================================================================
-# Phase 3: Advanced Meta-learners
-# ============================================================================
-
-def eval_meta_learner(model_list, oof, y, meta_type, ml_params=None):
-    """Evaluate a meta-learner on given model subset with nested 3-fold CV."""
-    X = build_X_stack(model_list, oof)
+def eval_stacking(model_list, oof_dict, y, meta_type='ElasticNet'):
+    """Evaluate stacking with nested 3-fold CV. Returns {R2, Correlation, n_active, weights, models}."""
+    X = np.column_stack([oof_dict[m] for m in model_list])
     n_models = X.shape[1]
     if n_models < 1:
         return None
+    if n_models == 1:
+        r2_v = float(r2_score(y, X[:, 0]))
+        corr_v = float(pearsonr(y, X[:, 0])[0])
+        return {'R2': r2_v, 'Correlation': corr_v, 'n_active': 1,
+                'weights': [1.0], 'models': model_list, 'meta': meta_type}
 
     inner_kf = KFold(n_splits=3, shuffle=True, random_state=42)
     preds = np.zeros(len(y))
+    all_weights = []
 
     for itr, ite in inner_kf.split(X):
         X_tr, X_te = X[itr], X[ite]
-
-        if meta_type == 'RidgeCV':
-            m = RidgeCV(alphas=RIDGE_ALPHAS_FINE, fit_intercept=True, cv=5)
-            m.fit(X_tr, y[itr])
-            preds[ite] = m.predict(X_te)
-            weights = m.coef_.copy()
-
-        elif meta_type == 'LassoCV':
-            m = LassoCV(alphas=LASSO_ALPHAS, cv=5, max_iter=10000, random_state=42)
-            m.fit(X_tr, y[itr])
-            preds[ite] = m.predict(X_te)
-            weights = m.coef_.copy()
-
-        elif meta_type == 'ElasticNetCV':
-            m = ElasticNetCV(l1_ratio=[.1, .3, .5, .7, .9, .95, 1],
-                             alphas=ENET_ALPHAS, cv=5, max_iter=10000, random_state=42)
-            m.fit(X_tr, y[itr])
-            preds[ite] = m.predict(X_te)
-            weights = m.coef_.copy()
-
-        elif meta_type == 'BayesianRidge':
-            m = BayesianRidge(max_iter=500, tol=1e-5)
-            m.fit(X_tr, y[itr])
-            preds[ite] = m.predict(X_te)
-            weights = m.coef_.copy()
-
-        elif meta_type == 'Huber':
-            m = HuberRegressor(max_iter=500, alpha=0.001)
-            m.fit(X_tr, y[itr])
-            preds[ite] = m.predict(X_te)
-            weights = m.coef_.copy()
-
-        elif meta_type == 'OptimizedWeights':
-            # Convex optimization: minimize MSE with simplex constraints
-            n = X_tr.shape[1]
-            w0 = np.ones(n) / n
-
-            def loss(w):
-                pred = X_tr @ w
-                return np.mean((y[itr] - pred) ** 2)
-
-            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
-            bounds = [(0, 1) for _ in range(n)]
-            res = minimize(loss, w0, method='SLSQP', constraints=constraints,
-                          bounds=bounds, options={'maxiter': 500, 'ftol': 1e-12})
-            w_opt = res.x
-            w_opt = w_opt / w_opt.sum()  # ensure sum=1
-            preds[ite] = X_te @ w_opt
-            weights = w_opt.copy()
-
-        elif meta_type == 'XGBoost':
-            # XGBoost with strong regularization
-            m = xgb.XGBRegressor(
-                n_estimators=100, max_depth=2, learning_rate=0.03,
-                subsample=0.7, colsample_bytree=0.7, reg_alpha=0.5,
-                reg_lambda=2.0, min_child_weight=10, random_state=42, verbosity=0
-            )
-            m.fit(X_tr, y[itr])
-            preds[ite] = m.predict(X_te)
-            weights = m.feature_importances_.copy()
-
-        elif meta_type == 'SimpleAvg':
-            preds[ite] = np.mean(X_te, axis=1)
-            weights = np.ones(n_models) / n_models
-
-        elif meta_type == 'WeightedAvg':
-            w = np.array([metrics_reference.get(m, 0.01) for m in model_list])
-            w = np.maximum(w, 1e-6)
-            w = w / w.sum()
-            preds[ite] = X_te @ w
-            weights = w.copy()
-
-        elif meta_type == 'TopK_Avg':
-            # Average top K=ceil(n/2) models by position in model_list (assumes sorted)
-            k = max(2, (n_models + 1) // 2)
-            preds[ite] = np.mean(X_te[:, :k], axis=1)
-            w = np.zeros(n_models)
-            w[:k] = 1.0 / k
-            weights = w
-
+        if meta_type == 'ElasticNet':
+            m = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
+                             alphas=ENET_ALPHAS, cv=3, max_iter=10000, random_state=42)
+        elif meta_type == 'Lasso':
+            m = LassoCV(alphas=np.logspace(-4, 2, 30), cv=3, max_iter=10000, random_state=42)
+        elif meta_type == 'Ridge':
+            m = RidgeCV(alphas=RIDGE_ALPHAS_FINE, fit_intercept=True, cv=3)
         else:
-            raise ValueError(f"Unknown meta_type: {meta_type}")
-
-    r2_v = float(r2_score(y, preds))
-    corr_v = float(pearsonr(y, preds)[0])
-    n_nonzero = int(np.sum(np.abs(weights) > 1e-6))
-    return {'R2': r2_v, 'Correlation': corr_v, 'n_active': n_nonzero,
-            'weights': weights.tolist(), 'models': model_list, 'meta': meta_type}
-
-
-# Global reference for WeightedAvg
-metrics_reference = {}
-
-
-# ============================================================================
-# Phase 4: Meta Feature Engineering
-# ============================================================================
-
-def add_meta_features(X_meta, y, n_top=6):
-    """Add pairwise interactions and squared terms for top-n models."""
-    n_samples, n_base = X_meta.shape
-    features = [X_meta]
-
-    # Top models (most impactful) interactions
-    k = min(n_top, n_base)
-    for i in range(k):
-        for j in range(i + 1, k):
-            features.append((X_meta[:, i] * X_meta[:, j]).reshape(-1, 1))
-
-    # Squared terms for top models
-    for i in range(k):
-        features.append((X_meta[:, i] ** 2).reshape(-1, 1))
-
-    return np.hstack(features)
-
-
-def eval_stacking_with_features(model_list, oof, y, meta_type='Ridge'):
-    """Evaluate stacking with meta feature engineering."""
-    X_base = build_X_stack(model_list, oof)
-    n_base = X_base.shape[1]
-    X_meta = add_meta_features(X_base, y, n_top=min(6, n_base))
-    n_extra = X_meta.shape[1] - n_base
-
-    inner_kf = KFold(n_splits=3, shuffle=True, random_state=42)
-    preds = np.zeros(len(y))
-
-    for itr, ite in inner_kf.split(X_meta):
-        X_tr, X_te = X_meta[itr], X_meta[ite]
-        m = RidgeCV(alphas=RIDGE_ALPHAS_FINE, fit_intercept=True, cv=5)
+            m = RidgeCV(alphas=RIDGE_ALPHAS_FINE, fit_intercept=True, cv=3)
         m.fit(X_tr, y[itr])
         preds[ite] = m.predict(X_te)
+        all_weights.append(m.coef_.copy())
 
     r2_v = float(r2_score(y, preds))
     corr_v = float(pearsonr(y, preds)[0])
-    return {'R2': r2_v, 'Correlation': corr_v, 'n_features': n_extra, 'meta': f'Ridge+Poly(n={n_extra})'}
+    avg_weights = np.mean(all_weights, axis=0)
+    n_nonzero = int(np.sum(np.abs(avg_weights) > 1e-6))
+    return {'R2': r2_v, 'Correlation': corr_v, 'n_active': n_nonzero,
+            'weights': avg_weights.tolist(), 'models': model_list, 'meta': meta_type}
 
 
 # ============================================================================
-# Phase 5: Model Clustering
+# Main comparison
 # ============================================================================
 
-def cluster_models_by_prediction(oof, metrics, n_clusters='auto'):
-    """Cluster models by prediction correlation, return best per cluster using
-    simple correlation threshold-based clustering."""
-    model_names = list(oof.keys())
-    preds_mat = np.column_stack([oof[m] for m in model_names])
-    corr = np.corrcoef(preds_mat.T)
-
-    # Sort by R²
-    ranked = sorted(model_names, key=lambda m: metrics[m]['R2'], reverse=True)
-    clusters = []
-    assigned = set()
-
-    for m in ranked:
-        if m in assigned:
-            continue
-        m_idx = model_names.index(m)
-        cluster = [m]
-        assigned.add(m)
-        for j, other in enumerate(model_names):
-            if other not in assigned:
-                if abs(corr[m_idx, j]) > 0.97:  # high correlation = same cluster
-                    cluster.append(other)
-                    assigned.add(other)
-        clusters.append(cluster)
-
-    # Pick best from each cluster
-    cluster_best = [c[0] for c in clusters]  # ranked already, so c[0] is best
-    return clusters, cluster_best
-
-
-# ============================================================================
-# Main optimization driver
-# ============================================================================
-
-def run_optimization(trait_name="Plant_height", force_retrain=False):
-    global metrics_reference
-
+def run_comparison(trait_name="Plant_height", force_retrain=False):
     print(f"\n{'='*70}")
-    print(f"  Stacking Optimizer — {trait_name}")
+    print(f"  Stacking Comparison — {trait_name}")
     print(f"{'='*70}")
 
     oof, y, metrics = train_all_models_cached(trait_name, force_retrain=force_retrain)
-    metrics_reference = {m: metrics[m]['R2'] for m in metrics}
-
-    # Baseline: best single model
-    best_single = max(metrics.items(), key=lambda x: x[1]['R2'])
-    print(f"\n  Best single: {best_single[0]} (R²={best_single[1]['R2']:+.4f})")
-
     all_models = list(oof.keys())
 
-    # ----------------------------------------------------------
-    # Step 1: Correlation pruning
-    # ----------------------------------------------------------
-    print(f"\n  [Step 1] Correlation pruning (r > 0.995)...")
-    pruned, removed = prune_correlated_models(oof, metrics, corr_threshold=0.995)
-    print(f"    Pruned: {len(all_models)} -> {len(pruned)} models")
-    if removed:
-        print(f"    Removed: {removed}")
+    # Per-model summary
+    print(f"\n  Per-Model OOF Performance:")
+    for m in sorted(all_models, key=lambda m: metrics[m]['R2'], reverse=True):
+        r2_v = metrics[m]['R2']
+        marker = " [R²<0 FILTERED]" if r2_v < R2_FILTER_THRESHOLD else ""
+        print(f"    {m:<22s} R²={r2_v:+.4f}  r={metrics[m]['r']:+.4f}{marker}")
 
-    # ----------------------------------------------------------
-    # Step 2: Greedy forward selection (3 meta-learners)
-    # ----------------------------------------------------------
-    print(f"\n  [Step 2] Greedy forward selection...")
-    all_results = {}
+    best_single = max(metrics.items(), key=lambda x: x[1]['R2'])
+    best_single_r2 = best_single[1]['R2']
 
-    for meta in ['Ridge', 'Lasso', 'ElasticNet']:
-        print(f"\n    --- {meta} meta-learner ---")
-        selected, history = greedy_forward_select(oof, y, metrics, pruned,
-                                                   meta_type=meta, min_gain=0.0002, max_models=10)
-        label = f"GreedySelect ({meta})"
-        result = eval_meta_learner(selected, oof, y, meta_type=f"{meta}CV")
-        if result:
-            result['label'] = label
-            all_results[label] = result
-            print(f"    => R²={result['R2']:+.4f}, {len(selected)} models: {selected}")
+    # =========================================================================
+    # Baseline: current genemic_ensemble.py Stacking (All) with Ridge, no filter
+    # =========================================================================
+    print(f"\n  {'='*60}")
+    print(f"  BASELINE vs IMPROVED")
+    print(f"  {'='*60}")
 
-    # ----------------------------------------------------------
-    # Step 3: Clustering approach
-    # ----------------------------------------------------------
-    print(f"\n  [Step 3] Model clustering...")
-    clusters, cluster_best = cluster_models_by_prediction(oof, metrics)
-    print(f"    {len(clusters)} clusters: {[(c[0], len(c)) for c in clusters]}")
+    results = {}
 
-    # Test cluster-based selection
-    for meta in ['RidgeCV', 'LassoCV', 'ElasticNetCV', 'BayesianRidge', 'OptimizedWeights']:
-        label = f"ClusterBest ({meta})"
-        result = eval_meta_learner(cluster_best, oof, y, meta)
-        if result:
-            result['label'] = label
-            all_results[label] = result
-            print(f"    {label}: R²={result['R2']:+.4f}")
+    # A: Baseline Stacking (All) — Ridge, all models (current default)
+    bl = eval_stacking(all_models, oof, y, meta_type='Ridge')
+    results['Baseline: Stacking(All) Ridge'] = bl
+    print(f"\n  [Baseline] Stacking(All) Ridge:")
+    print(f"    R²={bl['R2']:+.4f}, n_models={len(all_models)}, n_active={bl['n_active']}")
 
-    # ----------------------------------------------------------
-    # Step 4: Meta feature engineering on selected models
-    # ----------------------------------------------------------
-    print(f"\n  [Step 4] Meta feature engineering...")
-    # Use best model subset from greedy selection
-    best_so_far = max(all_results.items(), key=lambda x: x[1]['R2'])
-    best_models = best_so_far[1]['models']
-    print(f"    Base subset: {best_so_far[0]} ({len(best_models)} models)")
+    # B: R² filter + ElasticNetCV
+    oof_filtered, removed = filter_by_r2(oof, y, threshold=R2_FILTER_THRESHOLD)
+    if len(oof_filtered) >= 2:
+        fe = eval_stacking(list(oof_filtered.keys()), oof_filtered, y, meta_type='ElasticNet')
+        results['Improved: R²-filter + ElasticNet'] = fe
+        print(f"\n  [Improved] R²-filter + ElasticNetCV:")
+        print(f"    Filtered: {len(removed)} models removed (R²<{R2_FILTER_THRESHOLD}): {removed}")
+        print(f"    R²={fe['R2']:+.4f}, n_models={len(oof_filtered)}, n_active={fe['n_active']}")
+        if fe['n_active'] < len(oof_filtered):
+            active = [fe['models'][i] for i, w in enumerate(fe['weights']) if abs(w) > 1e-6]
+            print(f"    ElasticNet zeroed out: {len(oof_filtered) - fe['n_active']} models")
+            print(f"    Active: {active}")
+        weights_str = dict(zip(fe['models'], [f'{w:.4f}' for w in fe['weights']]))
+        print(f"    Weights: {weights_str}")
+    else:
+        print(f"\n  [Improved] R²-filter + ElasticNet: SKIP (only {len(oof_filtered)} models left)")
 
-    poly_result = eval_stacking_with_features(best_models, oof, y, 'Ridge')
-    if poly_result:
-        all_results['BestModels + PolyFeat'] = poly_result
-        print(f"    Ridge+Poly: R²={poly_result['R2']:+.4f} (+{poly_result['n_features']} features)")
+    # C: R² filter + Greedy forward selection + ElasticNet
+    if len(oof_filtered) >= 3:
+        selected = greedy_forward_select(oof_filtered, y, meta_type='ElasticNet', min_gain=0.0005)
+        fg = eval_stacking(selected, oof_filtered, y, meta_type='ElasticNet')
+        results['Improved: R²-filter + Greedy + ElasticNet'] = fg
+        print(f"\n  [Improved] R²-filter + Greedy(ElasticNet):")
+        print(f"    Greedy selected {len(selected)}/{len(oof_filtered)}: {selected}")
+        print(f"    R²={fg['R2']:+.4f}, n_active={fg['n_active']}")
+        weights_str = dict(zip(fg['models'], [f'{w:.4f}' for w in fg['weights']]))
+        print(f"    Weights: {weights_str}")
+    else:
+        print(f"\n  [Improved] Greedy: SKIP (need >= 3 models after filter, have {len(oof_filtered)})")
 
-    # Also test poly on cluster best
-    poly_cluster = eval_stacking_with_features(cluster_best[:8], oof, y, 'Ridge')
-    if poly_cluster:
-        all_results['ClusterBest + PolyFeat'] = poly_cluster
-        print(f"    Cluster+Poly: R²={poly_cluster['R2']:+.4f}")
-
-    # ----------------------------------------------------------
-    # Step 5: Compare all strategies vs baselines
-    # ----------------------------------------------------------
-    print(f"\n  [Step 5] Comprehensive comparison...")
-
-    # Baseline stacking variants (replicating genomic_ensemble.py defaults)
-    trad_names = ge.TRAD_NAMES
-    dl_names = [m for m in all_models if m not in trad_names]
-    dl_base = [m for m in dl_names if m not in ('FusionNet', 'AdditiveGenomicNet')]
-
-    # A: Stacking (DL) — current pipeline default (Ridge, no pruning)
-    oof_dl_base = {m: oof[m] for m in dl_base if m in oof}
-    sr_dl = ge.stacking_evaluate(oof_dl_base, y, n_folds=3, meta_type='Ridge', prune_corr=False)
-    all_results['Current: Stacking (DL)'] = {
-        'R2': sr_dl['R2'], 'Correlation': sr_dl['Correlation'],
-        'n_active': len(sr_dl.get('Base_models', [])), 'meta': 'RidgeCV (current)',
-        'models': sr_dl.get('Base_models', []), 'label': 'Current: Stacking (DL)'
-    }
-    print(f"    Current Stacking (DL):  R²={sr_dl['R2']:+.4f}")
-
-    # B: Stacking (All) — current pipeline default (Ridge, no pruning)
-    oof_all = {m: oof[m] for m in all_models}
-    sr_all = ge.stacking_evaluate(oof_all, y, n_folds=3, meta_type='Ridge', prune_corr=False)
-    all_results['Current: Stacking (All)'] = {
-        'R2': sr_all['R2'], 'Correlation': sr_all['Correlation'],
-        'n_active': len(sr_all.get('Base_models', [])), 'meta': 'RidgeCV (current)',
-        'models': sr_all.get('Base_models', []), 'label': 'Current: Stacking (All)'
-    }
-    print(f"    Current Stacking (All): R²={sr_all['R2']:+.4f}")
-
-    # C: Trad Ensemble — current pipeline default (Ridge, no pruning)
-    oof_trad = {m: oof[m] for m in trad_names if m in oof}
-    sr_trad = ge.stacking_evaluate(oof_trad, y, n_folds=3, meta_type='Ridge', prune_corr=False)
-    all_results['Current: Trad Ensemble'] = {
-        'R2': sr_trad['R2'], 'Correlation': sr_trad['Correlation'],
-        'n_active': len(sr_trad.get('Base_models', [])), 'meta': 'RidgeCV (current)',
-        'models': sr_trad.get('Base_models', []), 'label': 'Current: Trad Ensemble'
-    }
-    print(f"    Current Trad Ensemble:  R²={sr_trad['R2']:+.4f}")
-
-    # D: Best single model
-    all_results['Best Single Model'] = {
-        'R2': best_single[1]['R2'], 'Correlation': best_single[1]['r'],
-        'n_active': 1, 'meta': 'Single', 'models': [best_single[0]],
-        'label': 'Best Single Model'
+    # D: Best single model (lower bound)
+    results['Best Single Model'] = {
+        'R2': best_single_r2, 'Correlation': best_single[1]['r'],
+        'n_active': 1, 'weights': [1.0], 'models': [best_single[0]], 'meta': 'Single'
     }
 
-    # ----------------------------------------------------------
-    # Summary & Ranking
-    # ----------------------------------------------------------
-    print(f"\n{'='*70}")
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    print(f"\n  {'='*60}")
     print(f"  FINAL RANKING — {trait_name}")
-    print(f"  {'Rank':<5s} {'Strategy':<40s} {'R²':>8s} {'Δ vs Best Single':>14s} {'n_models':>10s}")
-    print(f"  {'-'*70}")
-    sorted_results = sorted(all_results.items(), key=lambda x: -x[1]['R2'])
-    for i, (name, res) in enumerate(sorted_results):
-        delta = res['R2'] - best_single[1]['R2']
-        n_mod = len(res.get('models', []))
-        marker = " ***" if i == 0 else ""
-        print(f"  {i+1:<5d} {name:<40s} {res['R2']:+.4f}  {delta:+.4f}        {n_mod:>5d}{marker}")
+    print(f"  {'='*60}")
+    print(f"  {'Rank':<5s} {'Strategy':<45s} {'R²':>8s} {'Δ vs Baseline':>12s} {'n_mod':>6s}")
+    print(f"  {'-'*75}")
 
-    # Highlight improvement over current Stacking (All)
-    current_best_r2 = sr_all['R2']
-    new_best_name, new_best = sorted_results[0]
-    improvement = new_best['R2'] - current_best_r2
-    print(f"\n  Improvement over current Stacking (All): {improvement:+.4f}")
-    print(f"  Improvement over best single model:    {new_best['R2'] - best_single[1]['R2']:+.4f}")
+    baseline_r2 = results['Baseline: Stacking(All) Ridge']['R2']
+    sorted_items = sorted(results.items(), key=lambda x: -x[1]['R2'])
+
+    for i, (name, res) in enumerate(sorted_items):
+        delta = res['R2'] - baseline_r2
+        n_mod = len(res.get('models', []))
+        marker = " <-- BEST" if i == 0 else ""
+        print(f"  {i+1:<5d} {name:<45s} {res['R2']:+.4f}  {delta:+.4f}        {n_mod:>5d}{marker}")
 
     # Save
     os.makedirs("results", exist_ok=True)
     output = {
         'trait': trait_name,
-        'best_single': {'name': best_single[0], 'R2': float(best_single[1]['R2'])},
-        'current_stacking_all_r2': float(current_best_r2),
-        'improvement': float(improvement),
-        'results': {k: {kk: vv for kk, vv in v.items() if kk not in ('weights', 'models')}
-                     for k, v in all_results.items()},
-        'ranking': [(name, float(res['R2'])) for name, res in sorted_results],
-        'best_strategy': {
-            'name': new_best_name,
-            'R2': float(new_best['R2']),
-            'models': new_best.get('models', []),
-            'meta_type': new_best.get('meta', 'unknown'),
-        },
+        'baseline_r2': float(baseline_r2),
+        'best_single_r2': float(best_single_r2),
+        'results': {k: {'R2': float(v['R2']), 'n_active': v['n_active'],
+                         'n_models': len(v.get('models', [])),
+                         'models': v.get('models', []),
+                         'weights': v.get('weights', [])}
+                     for k, v in results.items()},
+        'ranking': [(name, float(res['R2'])) for name, res in sorted_items],
     }
-    with open(f"results/stacking_opt_{trait_name}.json", 'w') as f:
+    outpath = f"results/stacking_comp_{trait_name}.json"
+    with open(outpath, 'w', encoding='utf-8') as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
-    print(f"\n  Saved to results/stacking_opt_{trait_name}.json")
+    print(f"\n  Saved to {outpath}")
 
-    return all_results, sorted_results
+    return results
 
 
 # ============================================================================
@@ -629,17 +384,11 @@ def run_optimization(trait_name="Plant_height", force_retrain=False):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Stacking optimizer')
+    parser = argparse.ArgumentParser(description='Stacking optimizer comparison')
     parser.add_argument('--trait', type=str, default='Plant_height',
                         help='Trait name (default: Plant_height)')
     parser.add_argument('--retrain', action='store_true',
                         help='Force retrain all models (ignore cache)')
-    parser.add_argument('--traits', nargs='+', type=str, default=None,
-                        help='Multiple traits to test')
     args = parser.parse_args()
 
-    if args.traits:
-        for t in args.traits:
-            run_optimization(t, force_retrain=args.retrain)
-    else:
-        run_optimization(args.trait, force_retrain=args.retrain)
+    run_comparison(args.trait, force_retrain=args.retrain)
