@@ -132,6 +132,63 @@ def compute_haplotype_scores(X, y, variant_types=None, maf=None):
                     'variant_types': variant_types}
 
 
+def eb_shrink_effects(effects, maf, n_bins=20):
+    """经验贝叶斯效应收缩 (GeneBayes 启发, s41588-024-01820-9)"""
+    p = len(effects); maf = np.asarray(maf, dtype=np.float64)
+    effects = np.asarray(effects, dtype=np.float64)
+    log_maf = np.log10(np.maximum(maf, MIN_MAF))
+    bins = np.percentile(log_maf, np.linspace(0, 100, n_bins + 1))
+    bins[0] -= 1e-8; bins[-1] += 1e-8
+    bin_idx = np.clip(np.digitize(log_maf, bins) - 1, 0, n_bins - 1)
+    shrunk = np.zeros(p)
+    for b in range(n_bins):
+        mask = bin_idx == b
+        if mask.sum() < 5: shrunk[mask] = effects[mask]; continue
+        gm = np.mean(effects[mask]); gv = np.var(effects[mask])
+        if gv < 1e-12: shrunk[mask] = gm; continue
+        dp = maf[mask] * (1.0 - maf[mask]) + 1e-8
+        dn = 1.0 / dp; an = np.mean(dn)
+        sv = max(gv - an, 0.0)
+        lam = dn / (dn + sv + 1e-12)
+        shrunk[mask] = (1.0 - lam) * effects[mask] + lam * gm
+    return np.abs(shrunk)
+
+
+def ld_aware_scores(X, raw_scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
+    """LD 感知软加权 — 替代硬剪枝 (GeneBayes 启发)"""
+    n, p = X.shape
+    X_c = X - X.mean(axis=0, keepdims=True)
+    X_n = X_c / (np.linalg.norm(X_c, axis=0, keepdims=True) + 1e-12)
+    order = np.argsort(-raw_scores)
+    adjusted = raw_scores.copy().astype(np.float64)
+    processed = []
+    for idx in order:
+        mr2 = 0.0; xj = X_n[:, idx]
+        for pidx, px in processed:
+            if abs(idx - pidx) <= window:
+                r2 = np.dot(xj, px) ** 2
+                if r2 > mr2: mr2 = r2
+        if mr2 > r2_thresh:
+            adjusted[idx] *= max(1.0 - np.sqrt(mr2), 0.01)
+        processed.append((idx, xj))
+    return adjusted
+
+
+def haplotype_select_eb(X, y, k, variant_types=None, window=DEFAULT_WINDOW,
+                        r2_thresh=DEFAULT_R2_THRESH, n_eb_bins=20):
+    """GeneBayes 增强版: EB收缩 + LD软加权"""
+    af = X.mean(axis=0) / 2.0; maf = np.minimum(af, 1.0 - af)
+    effects_raw = _compute_univariate_effects(X, y)
+    effects_shrunk = eb_shrink_effects(effects_raw, maf, n_bins=n_eb_bins)
+    rarity_w = np.maximum(-np.log10(np.maximum(maf, MIN_MAF)), 1.0)
+    raw_scores = rarity_w * (1.0 + effects_shrunk)
+    n_cand = min(3 * k, X.shape[1])
+    cand_idx = np.argsort(-raw_scores)[:n_cand]
+    X_cand = X[:, cand_idx]; scores_cand = raw_scores[cand_idx]
+    adjusted = ld_aware_scores(X_cand, scores_cand, window, r2_thresh)
+    return np.sort(cand_idx[np.argsort(-adjusted)[:k]])
+
+
 def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
     n, p = X.shape
     X_c = X - X.mean(axis=0, keepdims=True)

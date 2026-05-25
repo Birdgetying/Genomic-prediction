@@ -156,6 +156,173 @@ def variant_type_enrichment(selected_indices, variant_types, top_k=None):
     }
 
 
+# ============================================================================
+# GeneBayes 启发改进 (s41588-024-01820-9)
+# ============================================================================
+# 思路 1: 经验贝叶斯效应收缩 — "稀有变异向 MAF 组均值借用信息"
+#   类似 GeneBayes: 短基因(少LOF)向相似基因借用约束信息
+#   我们: 稀有变异(低MAF→效应噪声大)向同MAF组均值收缩
+# 思路 2: LD 感知软加权 — "不硬删, 只降权"
+#   类似 GeneBayes: 不丢弃低信息基因, 用先验补充
+#   我们: 不丢弃高LD位点, 用LD系数降权
+
+def eb_shrink_effects(effects, maf, n_bins=20):
+    """经验贝叶斯效应收缩 (GeneBayes 启发)
+
+    核心思想: 稀有变异(低MAF)的效应估计噪声大, 向同MAF组的均值收缩。
+    收缩量 = data_noise / (data_noise + group_signal)
+    - 高MAF → 效应可靠 → 几乎不收缩
+    - 低MAF → 效应噪声大 → 向组均值收缩
+
+    Args:
+        effects: (p,) 原始 |β|
+        maf: (p,) minor allele frequency
+        n_bins: MAF 分箱数
+
+    Returns:
+        shrunk: (p,) 收缩后的效应估计
+    """
+    p = len(effects)
+    maf = np.asarray(maf, dtype=np.float64)
+    effects = np.asarray(effects, dtype=np.float64)
+
+    # Log-scale binning: 更多 bin 在低 MAF 区间 (那里噪声差异大)
+    log_maf = np.log10(np.maximum(maf, MIN_MAF))
+    bins = np.percentile(log_maf, np.linspace(0, 100, n_bins + 1))
+    bins[0] = log_maf.min() - 1e-8
+    bins[-1] = log_maf.max() + 1e-8
+    bin_idx = np.digitize(log_maf, bins) - 1
+    bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+
+    shrunk = np.zeros(p)
+    for b in range(n_bins):
+        mask = bin_idx == b
+        n_b = mask.sum()
+        if n_b < 5:
+            shrunk[mask] = effects[mask]
+            continue
+
+        group_mean = np.mean(effects[mask])
+        group_var = np.var(effects[mask])
+
+        if group_var < 1e-12:
+            shrunk[mask] = group_mean
+            continue
+
+        # 每个位点的效应估计精度 ∝ MAF × (1-MAF) (二项式方差倒数)
+        # 噪声方差 ∝ 1 / precision
+        data_precision = maf[mask] * (1.0 - maf[mask]) + 1e-8
+        data_noise = 1.0 / data_precision  # 高 MAF → 低噪声
+
+        # 组内方差 = signal_var + avg_noise
+        # shrinkage = noise_i / (noise_i + signal_var)
+        avg_noise = np.mean(data_noise)
+        signal_var = max(group_var - avg_noise, 0.0)
+
+        # 经验贝叶斯收缩因子
+        noise = data_noise
+        total = noise + signal_var + 1e-12
+        lam = noise / total  # 收缩力度
+
+        shrunk[mask] = (1.0 - lam) * effects[mask] + lam * group_mean
+
+    return np.abs(shrunk)  # 保持非负
+
+
+def ld_aware_scores(X, raw_scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
+    """LD 感知软加权 (GeneBayes 启发)
+
+    替代硬剪枝: 如果位点 j 与更高分位点 i 的 r² > thresh,
+    则 score_j *= (1 - sqrt(r²)), 而非直接删除 j。
+    这保留了位点在 LD 块内的独立信号贡献。
+
+    直觉: GeneBayes 不让短基因被直接丢弃, 而是用先验补充信息。
+    我们: 不让高LD位点被直接丢弃, 而是用LD系数降权。
+
+    Args:
+        X: (n, p) 基因型矩阵 (已中心化最好, 但函数内会处理)
+        raw_scores: (p,) 原始打分
+        window: LD 窗口大小
+        r2_thresh: LD r² 阈值 (高于此值开始降权)
+
+    Returns:
+        adjusted_scores: (p,) 软加权后的得分
+    """
+    n, p = X.shape
+    X_c = X - X.mean(axis=0, keepdims=True)
+    X_n = X_c / (np.linalg.norm(X_c, axis=0, keepdims=True) + 1e-12)
+
+    order = np.argsort(-raw_scores)
+    adjusted = raw_scores.copy().astype(np.float64)
+    processed = []  # list of (idx, x_normalized)
+
+    for idx in order:
+        max_r2 = 0.0
+        xj = X_n[:, idx]
+        for pidx, px in processed:
+            if abs(idx - pidx) <= window:
+                r = np.dot(xj, px)
+                r2 = r * r
+                if r2 > max_r2:
+                    max_r2 = r2
+
+        if max_r2 > r2_thresh:
+            # soft penalty: score *= (1 - sqrt(max_r2))
+            # 例如 r²=0.64 → 惩罚系数 = 1-0.8 = 0.2, 即降到原来的20%
+            penalty = 1.0 - np.sqrt(max_r2)
+            adjusted[idx] *= max(penalty, 0.01)  # 地板 1%，不完全归零
+
+        processed.append((idx, xj))
+
+    return adjusted
+
+
+def haplotype_select_eb(X, y, k, variant_types=None, window=DEFAULT_WINDOW,
+                        r2_thresh=DEFAULT_R2_THRESH, show_enrichment=False,
+                        n_eb_bins=20):
+    """GeneBayes 增强版标记筛选: EB 收缩 + LD 软加权
+
+    流程: 效应估计 → EB 收缩 → 原始打分 → LD 软加权 → 取 top k
+
+    对比原始 haplotype_select:
+      - 加了 EB 收缩: 稀有变异不会因为噪声效应被高估或低估
+      - 加了 LD 软加权: 不会直接丢弃高 LD 位点, 保留独立信号
+    """
+    af = X.mean(axis=0) / 2.0
+    maf = np.minimum(af, 1.0 - af)
+
+    # Step 1: 原始效应估计
+    effects_raw = _compute_univariate_effects(X, y)
+
+    # Step 2: 经验贝叶斯收缩 (GeneBayes 思路 1)
+    effects_shrunk = eb_shrink_effects(effects_raw, maf, n_bins=n_eb_bins)
+
+    # Step 3: 原始打分 (变异类型不参与)
+    rarity_w = np.maximum(-np.log10(np.maximum(maf, MIN_MAF)), 1.0)
+    raw_scores = rarity_w * (1.0 + effects_shrunk)
+
+    # Step 4: LD 软加权 (GeneBayes 思路 2) — 替代硬剪枝
+    n_candidates = min(3 * k, X.shape[1])
+    cand_idx = np.argsort(-raw_scores)[:n_candidates]
+    X_cand = X[:, cand_idx]
+    scores_cand = raw_scores[cand_idx]
+
+    adjusted_scores = ld_aware_scores(X_cand, scores_cand, window, r2_thresh)
+
+    # Step 5: 按调整后得分取 top k
+    top_k = cand_idx[np.argsort(-adjusted_scores)[:k]]
+    result = np.sort(top_k)
+
+    # 后验富集分析
+    if show_enrichment and variant_types is not None:
+        enrich = variant_type_enrichment(result, variant_types)
+        has_non_snp = any(vt not in (0,) for vt in np.unique(variant_types))
+        if has_non_snp:
+            print(f"  [富集分析] {enrich['summary']}")
+
+    return result
+
+
 def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
     """LD 剪枝: 滑动窗口内保留得分最高的标记"""
     n, p = X.shape
