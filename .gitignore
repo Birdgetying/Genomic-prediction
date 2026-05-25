@@ -32,3 +32,8 @@
 !test_diverse_stacking.py
 !test_stacking_optimizer.py
 !submit_wheat_ensemble_v2.jsub
+!resume_maize.py
+!rice_add_stacking.py
+!plot_final_results.py
+!plot_all_figures.py
+!submit_plot_figures.jsub

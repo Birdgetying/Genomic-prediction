@@ -1,0 +1,82 @@
+#!/bin/bash
+# ============================================================================
+# Generate ALL final figures on HPC GPU node
+# 使用: jsub < submit_plot_figures.jsub
+# ============================================================================
+#JSUB -q gpu
+#JSUB -n 1
+#JSUB -J plot_figures
+#JSUB -o logs/plot_figures_%J.out
+#JSUB -e logs/plot_figures_%J.err
+
+echo "======================================================================"
+echo "Plot Final Figures — Job started at $(date)"
+echo "======================================================================"
+
+module load pytorch-2.3.0_py311
+echo "Module loaded: pytorch-2.3.0_py311"
+
+export PYTHONHASHSEED=42
+
+cd $HOME/genomic_prediction 2>/dev/null || \
+cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+    echo "ERROR: Cannot find project directory"
+    exit 1
+}
+echo "Working directory: $(pwd)"
+
+# 确保 cyvcf2 已安装（wheat VCF 解析必需）
+python -c "import cyvcf2" 2>/dev/null || {
+    echo "Installing cyvcf2 from internal mirror..."
+    pip install -i http://10.105.32.248/pypi/simple/ --trusted-host 10.105.32.248 cyvcf2
+}
+
+python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
+
+mkdir -p logs figures results/oof_cache
+
+echo ""
+echo "Data files check..."
+# Check maize data
+if [ -f "data2/Iranian_Samples.csv" ]; then
+    echo "  [OK] Maize data"
+else
+    echo "  [WARN] Maize data missing — will skip maize"
+fi
+
+# Check rice data
+if [ -f "results/rice_data/genotype_matrix.npz" ]; then
+    echo "  [OK] Rice data"
+else
+    echo "  [WARN] Rice data missing"
+fi
+
+# Check wheat data
+WHEAT_BASE="/storage/public/home/2024110093/data/Variation/CSIAAS"
+if [ -f "$WHEAT_BASE/Phe.txt" ]; then
+    echo "  [OK] Wheat data"
+else
+    echo "  [WARN] Wheat data missing at $WHEAT_BASE"
+fi
+
+echo ""
+echo "======================================================================"
+echo "Starting plot generation — $(date)"
+echo "======================================================================"
+
+T0=$(date +%s)
+python -u plot_all_figures.py 2>&1 | tee "logs/plot_figures_$(date +%Y%m%d_%H%M%S).log"
+EXIT_CODE=${PIPESTATUS[0]}
+T1=$(date +%s)
+
+echo ""
+echo "======================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "SUCCESS — Total time: $(((T1-T0)/60)) min — $(date)"
+    echo "Figures saved to: $(pwd)/figures/"
+    ls -lh figures/*.png
+else
+    echo "FAILED with exit code $EXIT_CODE — $(date)"
+fi
+echo "======================================================================"
+exit $EXIT_CODE
