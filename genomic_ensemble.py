@@ -144,33 +144,34 @@ def eb_shrink_effects(effects, maf, n_bins=20):
     for b in range(n_bins):
         mask = bin_idx == b
         if mask.sum() < 5: shrunk[mask] = effects[mask]; continue
-        gm = np.mean(effects[mask]); gv = np.var(effects[mask])
-        if gv < 1e-12: shrunk[mask] = gm; continue
-        dp = maf[mask] * (1.0 - maf[mask]) + 1e-8
-        dn = 1.0 / dp; an = np.mean(dn)
-        sv = max(gv - an, 0.0)
-        lam = dn / (dn + sv + 1e-12)
-        shrunk[mask] = (1.0 - lam) * effects[mask] + lam * gm
+        group_mean = np.mean(effects[mask]); group_var = np.var(effects[mask])
+        if group_var < 1e-12: shrunk[mask] = group_mean; continue
+        data_precision = maf[mask] * (1.0 - maf[mask]) + 1e-8
+        data_noise = 1.0 / data_precision; avg_noise = np.mean(data_noise)
+        signal_var = max(group_var - avg_noise, 0.0)
+        lam = data_noise / (data_noise + signal_var + 1e-12)
+        shrunk[mask] = (1.0 - lam) * effects[mask] + lam * group_mean
     return np.abs(shrunk)
 
 
 def ld_aware_scores(X, raw_scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
-    """LD 感知软加权 — 替代硬剪枝 (GeneBayes 启发)"""
+    """LD 感知软加权, O(p×window) 用位置字典"""
     n, p = X.shape
     X_c = X - X.mean(axis=0, keepdims=True)
     X_n = X_c / (np.linalg.norm(X_c, axis=0, keepdims=True) + 1e-12)
     order = np.argsort(-raw_scores)
     adjusted = raw_scores.copy().astype(np.float64)
-    processed = []
+    pos_map = {}
     for idx in order:
-        mr2 = 0.0; xj = X_n[:, idx]
-        for pidx, px in processed:
-            if abs(idx - pidx) <= window:
+        max_r2 = 0.0; xj = X_n[:, idx]
+        for pos in range(max(0, idx - window), min(p, idx + window + 1)):
+            if pos in pos_map:
+                _, px = pos_map[pos]
                 r2 = np.dot(xj, px) ** 2
-                if r2 > mr2: mr2 = r2
-        if mr2 > r2_thresh:
-            adjusted[idx] *= max(1.0 - np.sqrt(mr2), 0.01)
-        processed.append((idx, xj))
+                if r2 > max_r2: max_r2 = r2
+        if max_r2 > r2_thresh:
+            adjusted[idx] *= max(1.0 - np.sqrt(max_r2), 0.01)
+        pos_map[idx] = (idx, xj)
     return adjusted
 
 
@@ -190,17 +191,18 @@ def haplotype_select_eb(X, y, k, variant_types=None, window=DEFAULT_WINDOW,
 
 
 def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
+    """LD 剪枝, O(p×window) 用位置集合"""
     n, p = X.shape
     X_c = X - X.mean(axis=0, keepdims=True)
     X_n = X_c / (np.linalg.norm(X_c, axis=0, keepdims=True) + 1e-12)
-    order = np.argsort(-scores); kept = []; kept_positions = []
+    order = np.argsort(-scores); kept = []; kept_set = set()
     for idx in order:
         redundant = False; xj = X_n[:, idx]
-        for kp in kept_positions:
-            if abs(idx - kp) <= window:
-                r = np.dot(xj, X_n[:, kp])
-                if r * r > r2_thresh: redundant = True; break
-        if not redundant: kept.append(idx); kept_positions.append(idx)
+        for pos in range(max(0, idx - window), min(p, idx + window + 1)):
+            if pos in kept_set:
+                if np.dot(xj, X_n[:, pos]) ** 2 > r2_thresh:
+                    redundant = True; break
+        if not redundant: kept.append(idx); kept_set.add(idx)
     return np.array(kept, dtype=int)
 
 

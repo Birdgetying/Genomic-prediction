@@ -111,18 +111,16 @@ def variant_type_enrichment(selected_indices, variant_types, top_k=None):
 
     vt = np.asarray(variant_types, dtype=int)
 
-    # 全基因组背景
+    # 单次扫描: np.bincount 一次性统计所有类型
     total_bg = len(vt)
-    bg_counts = {}
-    for tid, tname in VARIANT_TYPE_NAMES.items():
-        bg_counts[tname] = int(np.sum(vt == tid))
+    bg_bc = np.bincount(vt, minlength=len(VARIANT_TYPE_NAMES))
+    bg_counts = {VARIANT_TYPE_NAMES[t]: int(bg_bc[t]) for t in VARIANT_TYPE_NAMES}
 
     # 选中位点
     vt_sel = vt[idx]
     total_sel = len(vt_sel)
-    sel_counts = {}
-    for tid, tname in VARIANT_TYPE_NAMES.items():
-        sel_counts[tname] = int(np.sum(vt_sel == tid))
+    sel_bc = np.bincount(vt_sel, minlength=len(VARIANT_TYPE_NAMES))
+    sel_counts = {VARIANT_TYPE_NAMES[t]: int(sel_bc[t]) for t in VARIANT_TYPE_NAMES}
 
     # 富集倍数 = (选中比例 / 背景比例)
     enrichment = {}
@@ -155,16 +153,6 @@ def variant_type_enrichment(selected_indices, variant_types, top_k=None):
         'summary': summary,
     }
 
-
-# ============================================================================
-# GeneBayes 启发改进 (s41588-024-01820-9)
-# ============================================================================
-# 思路 1: 经验贝叶斯效应收缩 — "稀有变异向 MAF 组均值借用信息"
-#   类似 GeneBayes: 短基因(少LOF)向相似基因借用约束信息
-#   我们: 稀有变异(低MAF→效应噪声大)向同MAF组均值收缩
-# 思路 2: LD 感知软加权 — "不硬删, 只降权"
-#   类似 GeneBayes: 不丢弃低信息基因, 用先验补充
-#   我们: 不丢弃高LD位点, 用LD系数降权
 
 def eb_shrink_effects(effects, maf, n_bins=20):
     """经验贝叶斯效应收缩 (GeneBayes 启发)
@@ -230,49 +218,32 @@ def eb_shrink_effects(effects, maf, n_bins=20):
 
 
 def ld_aware_scores(X, raw_scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
-    """LD 感知软加权 (GeneBayes 启发)
-
-    替代硬剪枝: 如果位点 j 与更高分位点 i 的 r² > thresh,
-    则 score_j *= (1 - sqrt(r²)), 而非直接删除 j。
-    这保留了位点在 LD 块内的独立信号贡献。
-
-    直觉: GeneBayes 不让短基因被直接丢弃, 而是用先验补充信息。
-    我们: 不让高LD位点被直接丢弃, 而是用LD系数降权。
-
-    Args:
-        X: (n, p) 基因型矩阵 (已中心化最好, 但函数内会处理)
-        raw_scores: (p,) 原始打分
-        window: LD 窗口大小
-        r2_thresh: LD r² 阈值 (高于此值开始降权)
-
-    Returns:
-        adjusted_scores: (p,) 软加权后的得分
-    """
+    """LD 感知软加权 — 替代硬剪枝, 用位置字典 O(p×window) 替代 O(p²)"""
     n, p = X.shape
     X_c = X - X.mean(axis=0, keepdims=True)
     X_n = X_c / (np.linalg.norm(X_c, axis=0, keepdims=True) + 1e-12)
 
     order = np.argsort(-raw_scores)
     adjusted = raw_scores.copy().astype(np.float64)
-    processed = []  # list of (idx, x_normalized)
+    # 位置 → (idx, x_normalized) 字典, 仅保留窗口内的已处理标记
+    pos_map = {}
 
     for idx in order:
         max_r2 = 0.0
         xj = X_n[:, idx]
-        for pidx, px in processed:
-            if abs(idx - pidx) <= window:
-                r = np.dot(xj, px)
-                r2 = r * r
+        # 仅检查窗口范围内的已处理标记 (O(window) 而非 O(processed_count))
+        for pos in range(max(0, idx - window), min(p, idx + window + 1)):
+            if pos in pos_map:
+                pidx, px = pos_map[pos]
+                r2 = np.dot(xj, px) ** 2
                 if r2 > max_r2:
                     max_r2 = r2
 
         if max_r2 > r2_thresh:
-            # soft penalty: score *= (1 - sqrt(max_r2))
-            # 例如 r²=0.64 → 惩罚系数 = 1-0.8 = 0.2, 即降到原来的20%
             penalty = 1.0 - np.sqrt(max_r2)
-            adjusted[idx] *= max(penalty, 0.01)  # 地板 1%，不完全归零
+            adjusted[idx] *= max(penalty, 0.01)
 
-        processed.append((idx, xj))
+        pos_map[idx] = (idx, xj)
 
     return adjusted
 
@@ -324,28 +295,28 @@ def haplotype_select_eb(X, y, k, variant_types=None, window=DEFAULT_WINDOW,
 
 
 def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
-    """LD 剪枝: 滑动窗口内保留得分最高的标记"""
+    """LD 剪枝: 滑动窗口内保留得分最高的标记, O(p×window)"""
     n, p = X.shape
-    # Pre-center + normalize columns for fast r = dot(x_j, x_k)
     X_c = X - X.mean(axis=0, keepdims=True)
     X_n = X_c / (np.linalg.norm(X_c, axis=0, keepdims=True) + 1e-12)
 
     order = np.argsort(-scores)
     kept = []
-    kept_positions = []
+    kept_set = set()  # 快速成员检查
 
     for idx in order:
         redundant = False
         xj = X_n[:, idx]
-        for kp in kept_positions:
-            if abs(idx - kp) <= window:
-                r = np.dot(xj, X_n[:, kp])
+        # 仅检查窗口范围内的已保留标记
+        for pos in range(max(0, idx - window), min(p, idx + window + 1)):
+            if pos in kept_set:
+                r = np.dot(xj, X_n[:, pos])
                 if r * r > r2_thresh:
                     redundant = True
                     break
         if not redundant:
             kept.append(idx)
-            kept_positions.append(idx)
+            kept_set.add(idx)
 
     return np.array(kept, dtype=int)
 
