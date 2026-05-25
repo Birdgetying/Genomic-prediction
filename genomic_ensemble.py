@@ -107,7 +107,6 @@ def _model_type(mname):
 # ============================================================================
 # Section C: Haplotype Scoring (from haplotype_scoring.py)
 # ============================================================================
-VARIANT_TYPE_WEIGHTS = {0: 1.0, 1: 3.5, 2: 3.0}
 DEFAULT_WINDOW = 50
 DEFAULT_R2_THRESH = 0.6
 MIN_MAF = 1e-4
@@ -121,15 +120,16 @@ def _compute_univariate_effects(X, y):
 
 
 def compute_haplotype_scores(X, y, variant_types=None, maf=None):
+    """变异类型不参与打分, 仅传回 components 供后验富集分析"""
     p = X.shape[1]
-    func_w = np.array([VARIANT_TYPE_WEIGHTS.get(int(vt), 1.0) for vt in variant_types]) if variant_types is not None else np.ones(p)
     if maf is None:
         af = X.mean(axis=0) / 2.0
         maf = np.minimum(af, 1.0 - af)
     rarity_w = np.maximum(-np.log10(np.maximum(maf, MIN_MAF)), 1.0)
     effects = _compute_univariate_effects(X, y)
-    scores = func_w * rarity_w * (1.0 + effects)
-    return scores, {'func': func_w, 'rarity': rarity_w, 'effect': effects}
+    scores = rarity_w * (1.0 + effects)
+    return scores, {'rarity': rarity_w, 'effect': effects,
+                    'variant_types': variant_types}
 
 
 def ld_prune_markers(X, scores, window=DEFAULT_WINDOW, r2_thresh=DEFAULT_R2_THRESH):
