@@ -75,19 +75,41 @@ def avg_r2(data, m):
 # Load all results
 # ============================================================================
 print("\nLoading results...")
-wheat = json.load(open(SCRIPT_DIR/"results/wheat_ensemble/ensemble_intermediate.json", 'r', encoding='utf-8'))
-rice = json.load(open(SCRIPT_DIR/"results/rice_ensemble/ensemble_intermediate.json", 'r', encoding='utf-8'))
-maize = json.load(open(SCRIPT_DIR/"results/maize_ensemble/ensemble_intermediate.json", 'r', encoding='utf-8'))
 
-W_TRAITS = list(wheat.keys())  # 1 trait
-R_TRAITS = sorted(rice.keys())  # 10 traits
-M_TRAITS = sorted(maize.keys())  # 4 traits
+def _load_json(path):
+    if path.exists():
+        return json.load(open(path, 'r', encoding='utf-8'))
+    print(f"  WARNING: {path} not found — skipping this dataset")
+    return None
 
-DATASETS = [
-    ('Wheat',  wheat,  W_TRAITS),
-    ('Rice',   rice,   R_TRAITS),
-    ('Maize',  maize,  M_TRAITS),
-]
+wheat = _load_json(SCRIPT_DIR/"results/wheat_ensemble/ensemble_intermediate.json")
+rice = _load_json(SCRIPT_DIR/"results/rice_ensemble/ensemble_intermediate.json")
+maize = _load_json(SCRIPT_DIR/"results/maize_ensemble/ensemble_intermediate.json")
+
+if wheat is None and rice is None and maize is None:
+    print("ERROR: No result files found. Upload results/*/ensemble_intermediate.json first.")
+    sys.exit(1)
+
+# Build DATASETS list, skipping missing
+DATASETS = []
+if wheat is not None:
+    W_TRAITS = list(wheat.keys())
+    DATASETS.append(('Wheat', wheat, W_TRAITS))
+else: W_TRAITS = []
+if rice is not None:
+    R_TRAITS = sorted(rice.keys())
+    DATASETS.append(('Rice', rice, R_TRAITS))
+else: R_TRAITS = []
+if maize is not None:
+    M_TRAITS = sorted(maize.keys())
+    DATASETS.append(('Maize', maize, M_TRAITS))
+else: M_TRAITS = []
+
+if not DATASETS:
+    print("ERROR: No datasets loaded. Check intermediate JSON files.")
+    sys.exit(1)
+
+print(f"Loaded {len(DATASETS)} dataset(s): {[d[0] for d in DATASETS]}")
 
 # ============================================================================
 # Figure 01: Per-dataset bar charts
@@ -188,8 +210,11 @@ plt.close()
 # ============================================================================
 # Figure 04: Rice per-trait detail
 # ============================================================================
-print("[04/11] Rice per-trait detail...")
-all_rice_models = list(rice[R_TRAITS[0]].keys())
+if rice is None:
+    print("[04/11] Rice data not available — skipping")
+else:
+ print("[04/11] Rice per-trait detail...")
+ all_rice_models = list(rice[R_TRAITS[0]].keys())
 rice_means = {m: np.mean([rice[t][m]['R2'] for t in R_TRAITS if m in rice[t]]) for m in all_rice_models}
 top_rice = sorted([m for m in all_rice_models if rice_means[m] > -1], key=lambda m: rice_means[m], reverse=True)[:12]
 
@@ -252,10 +277,11 @@ def get_single_model_oof(X_all_t, y, n_snps, model_name, vt_all=None):
     for fi, (tr, te) in enumerate(kf.split(X_all_t)):
         Xtr_raw, Xte_raw = X_all_t[tr], X_all_t[te]
         ytr, yte = y[tr], y[te]
+        vt_current = vt_all  # don't mutate input
         maf_idx = ge.maf_filter(Xtr_raw, ge.MAF_THRESHOLD)
         if len(maf_idx) >= n_snps:
             Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]
-            if vt_all is not None: vt_all = vt_all[maf_idx]
+            if vt_current is not None: vt_current = vt_current[maf_idx]
 
         gidx_gwas = ge.gwas_select(Xtr_raw, ytr, n_snps)
         Xtr = Xtr_raw[:, gidx_gwas]; Xte = Xte_raw[:, gidx_gwas]
@@ -270,7 +296,7 @@ def get_single_model_oof(X_all_t, y, n_snps, model_name, vt_all=None):
                     tm = bf(); fi_fn(tm, Xtr_s, ytr); oof[te] = pf(tm, Xte_s)
                     break
         else:
-            gidx_dl, _, Xtr_dl, Xte_dl = ge._select_dl_markers(Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_all, n_snps)
+            gidx_dl, _, Xtr_dl, Xte_dl = ge._select_dl_markers(Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_current, n_snps)
             model = ge.create_model(model_name, n_snps)
             bs = 32 if model_name.startswith('FGN') or model_name == 'GenomicFM' else 64
             wd = 5e-3 if model_name == 'AdditiveGenomicNet' else 1e-3
