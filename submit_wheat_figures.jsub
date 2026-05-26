@@ -1,17 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# Generate ALL final figures on HPC GPU node
-# 使用: jsub < submit_plot_figures.jsub
+# Generate wheat scatter plots ONLY (Fig 10): XGBoost + Stacking (Greedy)
+# 使用: jsub < submit_wheat_figures.jsub
+# 说明: 与其他脚本独立，不依赖 plot_all_figures.py
 # ============================================================================
 #JSUB -q gpu
 #JSUB -n 2
 #JSUB -gpgpu 1
-#JSUB -J plot_figures
-#JSUB -o logs/plot_figures_%J.out
-#JSUB -e logs/plot_figures_%J.err
+#JSUB -J wheat_figures
+#JSUB -o logs/wheat_figures_%J.out
+#JSUB -e logs/wheat_figures_%J.err
 
 echo "======================================================================"
-echo "Plot Final Figures — Job started at $(date)"
+echo "Wheat Figures — Job started at $(date)"
 echo "======================================================================"
 
 module load pytorch-2.3.0_py311
@@ -19,8 +20,7 @@ echo "Module loaded: pytorch-2.3.0_py311"
 
 export PYTHONHASHSEED=42
 
-cd $HOME/genomic_prediction 2>/dev/null || \
-cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+cd /storage/public/home/2024110093/genomic_prediction || {
     echo "ERROR: Cannot find project directory"
     exit 1
 }
@@ -34,40 +34,16 @@ python -c "import cyvcf2" 2>/dev/null || {
 
 python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
 
-mkdir -p logs figures results/oof_cache
-
-echo ""
-echo "Data files check..."
-# Check maize data
-if [ -f "data2/Iranian_Samples.csv" ]; then
-    echo "  [OK] Maize data"
-else
-    echo "  [WARN] Maize data missing — will skip maize"
-fi
-
-# Check rice data
-if [ -f "results/rice_data/genotype_matrix.npz" ]; then
-    echo "  [OK] Rice data"
-else
-    echo "  [WARN] Rice data missing"
-fi
-
-# Check wheat data
-WHEAT_BASE="/storage/public/home/2024110093/data/Variation/CSIAAS"
-if [ -f "$WHEAT_BASE/Phe.txt" ]; then
-    echo "  [OK] Wheat data"
-else
-    echo "  [WARN] Wheat data missing at $WHEAT_BASE"
-fi
+mkdir -p logs figures
 
 echo ""
 echo "======================================================================"
-echo "Starting plot generation — $(date)"
+echo "Starting wheat scatter plot generation — $(date)"
 echo "======================================================================"
 
 T0=$(date +%s)
-python -u plot_all_figures.py 2>&1 | tee "logs/plot_figures_$(date +%Y%m%d_%H%M%S).log"
-EXIT_CODE=${PIPESTATUS[0]}
+python -u plot_wheat_figures.py 2>&1
+EXIT_CODE=$?
 T1=$(date +%s)
 
 echo ""
@@ -75,7 +51,7 @@ echo "======================================================================"
 if [ $EXIT_CODE -eq 0 ]; then
     echo "SUCCESS — Total time: $(((T1-T0)/60)) min — $(date)"
     echo "Figures saved to: $(pwd)/figures/"
-    ls -lh figures/*.png
+    ls -lh figures/*wheat*.png
 else
     echo "FAILED with exit code $EXIT_CODE — $(date)"
 fi

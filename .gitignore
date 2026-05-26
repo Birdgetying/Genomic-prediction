@@ -37,3 +37,5 @@
 !plot_final_results.py
 !plot_all_figures.py
 !submit_plot_figures.jsub
+!plot_wheat_figures.py
+!submit_wheat_figures.jsub
