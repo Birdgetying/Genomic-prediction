@@ -125,7 +125,7 @@ def stacking_greedy_oof(X_all, y, n_snps, vt_all=None):
                 tm = bf(); fi_fn(tm, Xitr_ts, yitr); base_train[tname][ite_idx] = pf(tm, Xite_ts)
 
             sub_gidx_dl, _, Xitr_dl, Xite_dl = ge._select_dl_markers(
-                Xitr, Xite, yitr, sub_gidx, vt_maf[sub_gidx] if vt_maf is not None else None, n_snps)
+                Xitr, Xite, yitr, sub_gidx, vt_maf, n_snps)
             for mname in ge.DL_NAMES:
                 m2 = ge.create_model(mname, n_snps)
                 bs2 = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else 64
