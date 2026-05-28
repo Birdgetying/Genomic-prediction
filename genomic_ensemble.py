@@ -2168,24 +2168,26 @@ def _load_json_safe(path):
     return None
 
 
+# Module-level color constants — used by _model_color()
+_MODEL_COLORS_TRAD = {'RRBLUP': '#90CAF9', 'GBLUP': '#64B5F6', 'XGBoost': '#1565C0',
+                      'ElasticNet': '#42A5F5', 'GWAS_RRBLUP': '#1E88E5'}
+_MODEL_COLORS_DL = {'FGN': '#FFB74D', 'FGN v2': '#FF9800', 'FGN v4': '#F57C00',
+                    'FGN v5': '#E65100', 'FGN v6': '#BF360C', 'FGN v7': '#FFD54F',
+                    'FGN v9': '#FFCC80', 'FGN v10': '#FFE082', 'FGN v11': '#FFECB3',
+                    'FGNplus': '#A1887F', 'FGN PCA': '#BCAAA4', 'GenomicFM': '#D7CCC8',
+                    'FusionNet': '#E91E63', 'AdditiveGenomicNet': '#F48FB1',
+                    'DeepKernelGP': '#CE93D8', 'EFM v3': '#BA68C8', 'FGN v3': '#AB47BC',
+                    'MICNN': '#9C27B0', 'MICNN v2': '#6A1B9A', 'PreFGN': '#8E24AA',
+                    'ResFGN': '#4A148C'}
+_MODEL_COLORS_ENS = {'Stacking (DL)': '#66BB6A', 'Stacking (All)': '#2E7D32',
+                     'Trad Ensemble': '#0D47A1', 'Stacking (Pruned)': '#43A047',
+                     'Stacking (Greedy)': '#1B5E20', 'Stacking (R²+Greedy)': '#388E3C'}
+
+
 def _model_color(name):
-    """Color map for consistent figure styling."""
-    trad = {'RRBLUP': '#90CAF9', 'GBLUP': '#64B5F6', 'XGBoost': '#1565C0',
-            'ElasticNet': '#42A5F5', 'GWAS_RRBLUP': '#1E88E5'}
-    dl = {'FGN': '#FFB74D', 'FGN v2': '#FF9800', 'FGN v4': '#F57C00',
-          'FGN v5': '#E65100', 'FGN v6': '#BF360C', 'FGN v7': '#FFD54F',
-          'FGN v9': '#FFCC80', 'FGN v10': '#FFE082', 'FGN v11': '#FFECB3',
-          'FGNplus': '#A1887F', 'FGN PCA': '#BCAAA4', 'GenomicFM': '#D7CCC8',
-          'FusionNet': '#E91E63', 'AdditiveGenomicNet': '#F48FB1',
-          'DeepKernelGP': '#CE93D8', 'EFM v3': '#BA68C8', 'FGN v3': '#AB47BC',
-          'MICNN': '#9C27B0', 'MICNN v2': '#6A1B9A', 'PreFGN': '#8E24AA',
-          'ResFGN': '#4A148C'}
-    ens = {'Stacking (DL)': '#66BB6A', 'Stacking (All)': '#2E7D32',
-           'Trad Ensemble': '#0D47A1', 'Stacking (Pruned)': '#43A047',
-           'Stacking (Greedy)': '#1B5E20', 'Stacking (R²+Greedy)': '#388E3C'}
-    if name in trad: return trad[name]
-    if name in dl: return dl[name]
-    if name in ens: return ens[name]
+    if name in _MODEL_COLORS_TRAD: return _MODEL_COLORS_TRAD[name]
+    if name in _MODEL_COLORS_DL: return _MODEL_COLORS_DL[name]
+    if name in _MODEL_COLORS_ENS: return _MODEL_COLORS_ENS[name]
     return '#BDBDBD'
 
 
@@ -2204,20 +2206,21 @@ def generate_bar_charts(fig_dir=None):
       04_rice_per_trait_detail.png    — rice top-12 models per trait
       07_combined_ranking.png         — three-dataset average ranking
     """
-    import matplotlib
-    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from sklearn.metrics import r2_score as _r2
 
     SCRIPT_DIR = Path(__file__).resolve().parent
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
     DATASETS = []
+    rice_data_for_fig04 = None
     for tag, sub in [('Wheat', 'wheat'), ('Rice', 'rice'), ('Maize', 'maize')]:
         d = _load_json_safe(SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
         if d:
-            DATASETS.append((tag, d, sorted(d.keys()) if sub != 'wheat' else list(d.keys())))
+            traits = sorted(d.keys())
+            DATASETS.append((tag, d, traits))
+            if sub == 'rice':
+                rice_data_for_fig04 = (d, traits)
 
     if len(DATASETS) < 2:
         print("  [plot] Need at least 2 dataset JSONs for bar charts, skipping.")
@@ -2232,7 +2235,7 @@ def generate_bar_charts(fig_dir=None):
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
         ax = axes[ax_idx]
         all_models = list(data[traits[0]].keys())
-        means = {m: np.mean([data[t][m]['R2'] for t in traits if m in data[t]]) for m in all_models}
+        means = {m: _mean_r2(data, m) for m in all_models}
         sorted_m = sorted([m for m in all_models if means[m] > -5], key=lambda m: means[m], reverse=True)[:20]
         vals = [means[m] for m in sorted_m]
         colors = [_model_color(m) for m in sorted_m]
@@ -2307,11 +2310,10 @@ def generate_bar_charts(fig_dir=None):
     print("  -> 03_stacking_gain_scatter.png")
 
     # --- Fig 04: Rice per-trait detail ---
-    rice_d = _load_json_safe(SCRIPT_DIR / "results/rice_ensemble/ensemble_intermediate.json")
-    if rice_d:
-        rice_traits = sorted(rice_d.keys())
+    if rice_data_for_fig04:
+        rice_d, rice_traits = rice_data_for_fig04
         all_rm = list(rice_d[rice_traits[0]].keys())
-        rice_means = {m: np.mean([rice_d[t][m]['R2'] for t in rice_traits if m in rice_d[t]]) for m in all_rm}
+        rice_means = {m: _mean_r2(rice_d, m) for m in all_rm}
         top_rice = sorted([m for m in all_rm if rice_means[m] > -1], key=lambda m: rice_means[m], reverse=True)[:12]
         fig, axes = plt.subplots(5, 2, figsize=(28, 32))
         fig.suptitle('Rice: Per-Trait Model Comparison (5-fold CV R²)', fontsize=18, fontweight='bold')
@@ -2366,10 +2368,7 @@ def generate_scatter_plots(fig_dir=None):
     For each trait, generates a scatter for the best single model (non-stacking, non-ensemble).
     Rice → one multi-panel figure; Maize → one figure; Wheat → one figure.
     """
-    import matplotlib
-    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from sklearn.metrics import r2_score as _r2
 
     SCRIPT_DIR = Path(__file__).resolve().parent
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
@@ -2390,7 +2389,6 @@ def generate_scatter_plots(fig_dir=None):
         if not npz_files:
             continue
 
-        # Determine best model per trait from JSON
         json_path = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json"
         results_d = _load_json_safe(json_path)
         if not results_d:
@@ -2410,24 +2408,19 @@ def generate_scatter_plots(fig_dir=None):
         for idx, npz_path in enumerate(npz_files):
             trait = npz_path.stem.replace('_oof', '')
             ax = axes[idx//ncols][idx%ncols]
-            data = np.load(npz_path, allow_pickle=True)
-            y_true = data['_y_true']
+            npz_data = np.load(npz_path, allow_pickle=True)
+            y_true = npz_data['_y_true']
 
-            # Pick best single model for this trait
-            if trait in results_d:
-                single_r2 = {m: results_d[trait][m]['R2']
-                             for m in results_d[trait]
-                             if 'Stacking' not in m and 'Ensemble' not in m and m in data}
-                if single_r2:
-                    best_model = max(single_r2, key=single_r2.get)
-                else:
-                    best_model = model_hint
-            else:
-                best_model = model_hint
+            single_r2 = {
+                m: results_d.get(trait, {}).get(m, {}).get('R2', -999)
+                for m in results_d.get(trait, {})
+                if 'Stacking' not in m and 'Ensemble' not in m and m in npz_data
+            }
+            best_model = max(single_r2, key=single_r2.get) if single_r2 else model_hint
 
-            if best_model in data:
-                oof = data[best_model]
-                r2_val = _r2(y_true, oof)
+            if best_model in npz_data:
+                oof = npz_data[best_model]
+                r2_val = r2_score(y_true, oof)
                 color = _model_color(best_model)
                 ax.scatter(y_true, oof, alpha=0.5, s=20, c=color, edgecolors='none', zorder=3)
                 mn = min(y_true.min(), oof.min()); mx = max(y_true.max(), oof.max())
