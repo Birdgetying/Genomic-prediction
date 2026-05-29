@@ -898,6 +898,51 @@ class FGN_PCA(nn.Module):
 # Section E: Bagged TinyNet Ensemble (Random-Forest style)
 # ============================================================================
 
+class WheatGPModel(nn.Module):
+    """WheatGP: 5-slice CNN + LSTM ensemble — from WheatGP paper (2022).
+
+    Each slice: Conv1d(1→2→4→8) with kernel sizes 1,3,9 → AdaptiveAvgPool1d(16).
+    All slices concatenated → LSTM(640, 128) → FC(128, 1).
+    """
+    def __init__(self, n_features, n_subnetworks=5, hidden_dim=128):
+        super().__init__()
+        self.n_subnetworks = n_subnetworks
+        self.chunk_size = n_features // n_subnetworks
+
+        self.subnetworks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 2, kernel_size=1),
+                nn.ReLU(),
+                nn.Conv1d(2, 4, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv1d(4, 8, kernel_size=9, padding=4),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.AdaptiveAvgPool1d(16)
+            )
+            for _ in range(n_subnetworks)
+        ])
+
+        self.lstm = nn.LSTM(8 * 16 * n_subnetworks, hidden_dim, batch_first=True)
+        self.lstm_drop = nn.Dropout(0.3)
+        self.fc = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        outputs = []
+        for i, subnet in enumerate(self.subnetworks):
+            start = i * self.chunk_size
+            end = (start + self.chunk_size if i < self.n_subnetworks - 1
+                   else x.size(1))
+            chunk = x[:, start:end].unsqueeze(1)
+            out = subnet(chunk)
+            outputs.append(out.view(batch_size, -1))
+        combined = torch.cat(outputs, dim=1).unsqueeze(1)
+        lstm_out, _ = self.lstm(combined)
+        lstm_out = self.lstm_drop(lstm_out)
+        return self.fc(lstm_out[:, -1, :]).squeeze(-1)
+
+
 class TinySNPNet(nn.Module):
     """Ultra-lightweight network for bagging ensemble — ~200 params."""
     def __init__(self, n_features, hidden=8, dropout=0.3):
@@ -1181,6 +1226,10 @@ def create_model(name, n_snps, overrides=None):
         return GenomicFM(n_snps=n_snps, k=o.get('k', 4),
                          dropout=o.get('dropout', 0.2),
                          mlp_hidden=o.get('mlp_hidden', 16))
+    if name == 'WheatGP':
+        return WheatGPModel(n_features=n_snps,
+                            n_subnetworks=o.get('n_subnetworks', 5),
+                            hidden_dim=o.get('hidden_dim', 128))
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -1189,7 +1238,7 @@ LASSO_ALPHAS = np.logspace(-4, 2, 30)
 ENET_ALPHAS = np.logspace(-4, 2, 20)
 
 TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
-DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGN v6', 'FGN v7', 'FGN v9', 'FGN v10', 'FGN v11', 'FGNplus', 'GenomicFM', 'FGN PCA']
+DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGN v6', 'FGN v7', 'FGN v9', 'FGN v10', 'FGN v11', 'FGNplus', 'GenomicFM', 'FGN PCA', 'WheatGP']
 DL_NAMES = DL_BASE_NAMES + ['FusionNet', 'AdditiveGenomicNet']
 ALL_NAMES = TRAD_NAMES + DL_NAMES
 
@@ -1541,7 +1590,7 @@ def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test
         wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
         pat = tp.get('patience', 30)
         bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
-        bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
+        bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
         model = train_torch_model(model, X_s, y, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
         torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
         print(f"    [saved] {mname}.pt")
@@ -1787,56 +1836,162 @@ def load_wheat2000_data():
     """
     print(f"\n{'='*70}\nWheat2000 CSV Data Loading\n{'='*70}")
 
-    # 1. Genotype matrix
+    # 1. Genotype matrix (skip row-0 column-headers, col-0 row-index)
     print(f"\n[1/2] Loading genotype matrix ...")
-    if not os.path.exists(WHEAT2000_GENO):
-        raise FileNotFoundError(f"Genotype file not found: {WHEAT2000_GENO}")
-    raw = pd.read_csv(WHEAT2000_GENO, header=None)
-    # First row is column index header, first column is row index
-    X_all = raw.iloc[1:, 1:].values.astype(np.float32)
+    X_all = pd.read_csv(WHEAT2000_GENO, skiprows=1, index_col=0,
+                        dtype=np.float32, header=None).values
     n_samples, n_markers = X_all.shape
-    unique_vals = np.unique(X_all)
     print(f"  文件: {WHEAT2000_GENO}")
-    print(f"  基因型矩阵: {n_samples} samples × {n_markers} markers")
-    print(f"  取值范围: {unique_vals}")
+    print(f"  基因型矩阵: {n_samples} samples × {n_markers} markers (binary 0/1)")
 
     # 2. Phenotype files
     print(f"\n[2/2] Loading phenotypes ...")
     trait_data = {}
     for tname, fname in WHEAT2000_TRAITS.items():
         fpath = os.path.join(WHEAT2000_DATA_DIR, fname)
-        if not os.path.exists(fpath):
-            print(f"  {tname}: SKIP (file not found: {fpath})")
-            continue
         with open(fpath) as f:
-            lines = f.read().strip().split('\n')
-        # Skip header line
-        y = np.array([float(l) for l in lines[1:] if l.strip()], dtype=np.float32)
-        n_phe = len(y)
-        # Use min(n_phe, n_samples) to handle potential mismatch
-        n_common = min(n_samples, n_phe)
-        X_t = X_all[:n_common]
-        y_t = y[:n_common]
-        trait_data[tname] = (X_t, y_t, None)  # no variant type info
-        print(f"  {tname}: {n_common} samples, "
-              f"mean={np.mean(y_t):.4f}, std={np.std(y_t):.4f}")
+            body = f.read().strip().split('\n')
+        if len(body) < 2:
+            raise ValueError(f"Phenotype file too short: {fpath} ({len(body)} lines)")
+        y = np.array([float(l) for l in body[1:]], dtype=np.float32)
+        trait_data[tname] = (X_all[:len(y)], y, None)
+        print(f"  {tname}: {len(y)} samples, "
+              f"mean={np.mean(y):.4f}, std={np.std(y):.4f}")
     return trait_data
 
 
-def run_wheat2000(quick_test=True):
-    """Run wheat2000 ensemble pipeline on CSV-format dnngp data.
+def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
+                        quick_test):
+    """Run ensemble pipeline for a single trait. Returns trait_res dict.
 
-    Shares the same core logic as run_wheat() but loads from CSV files
-    instead of VCF, and every trait has no variant-type annotation (vt=None).
+    Shared by run_wheat(), run_wheat2000(), run_rice(), run_maize().
+    vt_all can be None (CSV data w/o variant type annotations) or a real
+    per-marker variant-type array (VCF data).
     """
-    _script_dir = Path(__file__).resolve().parent
-    output_dir = _script_dir / "results" / "wheat2000_ensemble"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    y = y.astype(np.float32)
+    n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
+    print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
 
-    print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
-    if DEVICE.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-    trait_data = load_wheat2000_data()
+    tuned_params = {}
+    if not quick_test:
+        print(f"\n  [AutoML] Tuning hyperparams ...")
+        maf_tune = maf_filter(X_all)
+        if len(maf_tune) >= n_snps:
+            gidx_t = gwas_select(X_all[:, maf_tune], y, n_snps)
+            X_tune = X_all[:, maf_tune][:, gidx_t]
+        else:
+            X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
+        sc_tune = StandardScaler()
+        X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
+        for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet',
+                          'AdditiveGenomicNet', 'GenomicFM']:
+            best_p, best_r2 = tune_model_hyperparams(
+                tune_name, X_tune_s, y, n_snps, n_trials=15)
+            tuned_params[tune_name] = best_p
+            pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
+            print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
+
+    kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
+    results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
+               for m in ALL_NAMES}
+    oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+    oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+
+    for fi, (tr, te) in enumerate(kf.split(X_all)):
+        print(f"\n  --- Fold {fi+1}/{folds_run} ---")
+        Xtr_raw, Xte_raw = X_all[tr], X_all[te]
+        ytr, yte = y[tr], y[te]
+        maf_idx = maf_filter(Xtr_raw)
+        if len(maf_idx) >= n_snps:
+            Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]
+            vt_maf = vt_all[maf_idx] if vt_all is not None else None
+        else:
+            vt_maf = vt_all
+
+        # Traditional models
+        gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
+        Xtr_trad = Xtr_raw[:, gidx_gwas]
+        Xte_trad = Xte_raw[:, gidx_gwas]
+        sc_trad = StandardScaler()
+        Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
+        Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
+        G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps
+        G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
+
+        trad_configs = _make_trad_configs(
+            G_fold_train, G_fold_te_tr, n_snps, len(tr))
+        for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
+            t0 = time.time()
+            tmodel = build_fn()
+            fit_fn(tmodel, Xtr_trad_s, ytr)
+            preds = pred_fn(tmodel, Xte_trad_s)
+            results[tname]['preds'].extend(preds.tolist())
+            results[tname]['targets'].extend(yte.tolist())
+            results[tname]['time'] += time.time() - t0
+            if fi == 0:
+                results[tname]['params'] = param_count
+            oof_trad[tname][te] = preds
+            print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
+
+        # DL models
+        gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
+            Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps)
+
+        for mi, mname in enumerate(DL_NAMES):
+            tp = tuned_params.get(mname, {})
+            model = create_model(mname, n_snps, overrides=tp)
+            t0 = time.time()
+            if fi == 0:
+                results[mname]['params'] = sum(
+                    p.numel() for p in model.parameters())
+            bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+            bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
+            lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+            wd = tp.get('weight_decay',
+                        5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
+            pat = tp.get('patience', 30)
+            model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300,
+                                      batch_size=bs, lr=lr,
+                                      weight_decay=wd, patience=pat)
+            preds = predict_torch_model(model, Xte_dl_s)
+            elapsed = time.time() - t0
+            results[mname]['preds'].extend(preds.tolist())
+            results[mname]['targets'].extend(yte.tolist())
+            results[mname]['time'] += elapsed
+            print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+            if mname in DL_BASE_NAMES:
+                oof_dl[mname][te] = preds
+        torch.cuda.empty_cache()
+
+    # Trait summary
+    print(f"\n  {'-'*70}\n  {trait_name} Final Results:\n  "
+          f"{'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
+    trait_res = {}
+    for mname in ALL_NAMES:
+        p = np.array(results[mname]['preds'])
+        t = np.array(results[mname]['targets'])
+        r2_v = float(r2_score(t, p))
+        corr_v = float(pearsonr(t, p)[0])
+        rmse_v = float(np.sqrt(np.mean((p - t) ** 2)))
+        mtype = _model_type(mname)
+        tag_map = {TYPE_TRAD: ' [Trad]', TYPE_DL: ' [DL]'}
+        tag = tag_map.get(mtype, '')
+        trait_res[mname] = {
+            'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+            'Type': mtype, 'Time': results[mname]['time'] / folds_run}
+        print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} "
+              f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
+
+    _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+    _save_oof_npz(results, ALL_NAMES, y, output_dir, trait_name)
+    if not quick_test:
+        deploy_models(X_all, y, n_snps, trait_name, output_dir,
+                      tuned_params, quick_test)
+    return trait_res
+
+
+def _run_ensemble_traits(trait_data, output_dir, crop_label, quick_test):
+    """Load and run ensemble pipeline across all traits. Returns all_results."""
     trait_names = sorted(trait_data.keys())
     print(f"\n实验性状: {trait_names}")
 
@@ -1851,133 +2006,31 @@ def run_wheat2000(quick_test=True):
     for t_idx, trait in enumerate(traits_run):
         print(f"\n{'='*80}\n  TRAIT [{t_idx+1}/{len(traits_run)}]: {trait}\n{'='*80}")
         X_all, y, vt_all = trait_data[trait]
-        y = y.astype(np.float32)
-        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        # AutoML
-        tuned_params = {}
-        if not quick_test:
-            print(f"\n  [AutoML] Tuning hyperparams ...")
-            maf_tune = maf_filter(X_all)
-            if len(maf_tune) >= n_snps:
-                gidx_t = gwas_select(X_all[:, maf_tune], y, n_snps)
-                X_tune = X_all[:, maf_tune][:, gidx_t]
-            else:
-                X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
-            sc_tune = StandardScaler()
-            X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
-            for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet',
-                              'AdditiveGenomicNet', 'GenomicFM']:
-                best_p, best_r2 = tune_model_hyperparams(
-                    tune_name, X_tune_s, y, n_snps, n_trials=15)
-                tuned_params[tune_name] = best_p
-                pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
-                print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
-
-        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
-                   for m in ALL_NAMES}
-        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-
-        for fi, (tr, te) in enumerate(kf.split(X_all)):
-            print(f"\n  --- Fold {fi+1}/{folds_run} ---")
-            Xtr_raw, Xte_raw = X_all[tr], X_all[te]
-            ytr, yte = y[tr], y[te]
-            maf_idx = maf_filter(Xtr_raw)
-            if len(maf_idx) >= n_snps:
-                Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]
-                # vt_all is None for CSV data
-            # vt_maf remains None (no variant types in CSV data)
-
-            # Traditional models — GWAS markers
-            gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
-            Xtr_trad = Xtr_raw[:, gidx_gwas]
-            Xte_trad = Xte_raw[:, gidx_gwas]
-            sc_trad = StandardScaler()
-            Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
-            Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
-            G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps
-            G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
-
-            trad_configs = _make_trad_configs(
-                G_fold_train, G_fold_te_tr, n_snps, len(tr))
-            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
-                t0 = time.time()
-                tmodel = build_fn()
-                fit_fn(tmodel, Xtr_trad_s, ytr)
-                preds = pred_fn(tmodel, Xte_trad_s)
-                results[tname]['preds'].extend(preds.tolist())
-                results[tname]['targets'].extend(yte.tolist())
-                results[tname]['time'] += time.time() - t0
-                if fi == 0:
-                    results[tname]['params'] = param_count
-                oof_trad[tname][te] = preds
-                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
-
-            # DL models — no variant type, pass None
-            gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
-                Xtr_raw, Xte_raw, ytr, gidx_gwas, None, n_snps)
-
-            for mi, mname in enumerate(DL_NAMES):
-                tp = tuned_params.get(mname, {})
-                model = create_model(mname, n_snps, overrides=tp)
-                t0 = time.time()
-                if fi == 0:
-                    results[mname]['params'] = sum(
-                        p.numel() for p in model.parameters())
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
-                bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
-                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-                wd = tp.get('weight_decay',
-                            5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
-                pat = tp.get('patience', 30)
-                model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300,
-                                          batch_size=bs, lr=lr,
-                                          weight_decay=wd, patience=pat)
-                preds = predict_torch_model(model, Xte_dl_s)
-                elapsed = time.time() - t0
-                results[mname]['preds'].extend(preds.tolist())
-                results[mname]['targets'].extend(yte.tolist())
-                results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-                if mname in DL_BASE_NAMES:
-                    oof_dl[mname][te] = preds
-            torch.cuda.empty_cache()
-
-        # Trait summary
-        print(f"\n  {'-'*70}\n  {trait} Final Results:\n  "
-              f"{'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
-        trait_res = {}
-        for mname in ALL_NAMES:
-            p = np.array(results[mname]['preds'])
-            t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p))
-            corr_v = float(pearsonr(t, p)[0])
-            rmse_v = float(np.sqrt(np.mean((p - t) ** 2)))
-            mtype = _model_type(mname)
-            tag_map = {TYPE_TRAD: ' [Trad]', TYPE_DL: ' [DL]'}
-            tag = tag_map.get(mtype, '')
-            trait_res[mname] = {
-                'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                'Type': mtype, 'Time': results[mname]['time'] / folds_run}
-            print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} "
-                  f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
-
-        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        trait_res = _run_trait_pipeline(
+            X_all, y, vt_all, trait, folds_run, output_dir, quick_test)
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w',
                   encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, y, output_dir, trait)
-        if not quick_test:
-            deploy_models(X_all, y, n_snps, trait, output_dir,
-                          tuned_params, quick_test)
 
     if not quick_test:
         _print_final_summary(all_results, traits_run, output_dir, total_t0,
-                             'Wheat2000')
+                             crop_label)
+    return all_results
+
+
+def run_wheat2000(quick_test=True):
+    """Wheat2000 ensemble pipeline on CSV-format dnngp data
+    (2000 lines × 33K binary SNPs, 6 agronomic traits)."""
+    _script_dir = Path(__file__).resolve().parent
+    output_dir = _script_dir / "results" / "wheat2000_ensemble"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
+    if DEVICE.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    trait_data = load_wheat2000_data()
+    _run_ensemble_traits(trait_data, output_dir, 'Wheat2000', quick_test)
 
 
 def run_wheat(quick_test=True):
@@ -1988,118 +2041,7 @@ def run_wheat(quick_test=True):
     print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
     if DEVICE.type == 'cuda': print(f"GPU: {torch.cuda.get_device_name(0)}")
     trait_data = load_wheat_data()
-    trait_names = sorted(trait_data.keys())
-    print(f"\n实验性状: {trait_names}")
-
-    traits_run = trait_names[:1] if quick_test else trait_names
-    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
-    if quick_test: print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
-
-    all_results = {}; total_t0 = time.time()
-
-    for t_idx, trait in enumerate(traits_run):
-        print(f"\n{'='*80}\n  TRAIT [{t_idx+1}/{len(traits_run)}]: {trait}\n{'='*80}")
-        X_all, y, vt_all = trait_data[trait]; y = y.astype(np.float32)
-        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        # AutoML
-        tuned_params = {}
-        if not quick_test:
-            print(f"\n  [AutoML] Tuning hyperparams ...")
-            maf_tune = maf_filter(X_all)
-            if len(maf_tune) >= n_snps:
-                gidx_t = gwas_select(X_all[:, maf_tune], y, n_snps)
-                X_tune = X_all[:, maf_tune][:, gidx_t]
-            else: X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
-            sc_tune = StandardScaler(); X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
-            for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet', 'AdditiveGenomicNet', 'GenomicFM']:
-                best_p, best_r2 = tune_model_hyperparams(tune_name, X_tune_s, y, n_snps, n_trials=15)
-                tuned_params[tune_name] = best_p
-                pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
-                print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
-
-        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0} for m in ALL_NAMES}
-        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-
-        for fi, (tr, te) in enumerate(kf.split(X_all)):
-            print(f"\n  --- Fold {fi+1}/{folds_run} ---")
-            Xtr_raw, Xte_raw = X_all[tr], X_all[te]
-            ytr, yte = y[tr], y[te]
-            maf_idx = maf_filter(Xtr_raw)
-            if len(maf_idx) >= n_snps: Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]; vt_maf = vt_all[maf_idx]
-            else: vt_maf = vt_all
-
-            # Traditional models: ALWAYS use GWAS markers
-            gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
-            Xtr_trad = Xtr_raw[:, gidx_gwas]; Xte_trad = Xte_raw[:, gidx_gwas]
-            sc_trad = StandardScaler(); Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
-            Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
-            G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps
-            G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
-
-            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr))
-            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
-                t0 = time.time(); tmodel = build_fn()
-                fit_fn(tmodel, Xtr_trad_s, ytr)
-                preds = pred_fn(tmodel, Xte_trad_s)
-                results[tname]['preds'].extend(preds.tolist())
-                results[tname]['targets'].extend(yte.tolist())
-                results[tname]['time'] += time.time() - t0
-                if fi == 0: results[tname]['params'] = param_count
-                oof_trad[tname][te] = preds
-                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
-
-            gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
-                Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps)
-
-            # DL models
-            for mi, mname in enumerate(DL_NAMES):
-                tp = tuned_params.get(mname, {})
-                model = create_model(mname, n_snps, overrides=tp)
-                t0 = time.time()
-                if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
-                bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
-                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-                wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
-                pat = tp.get('patience', 30)
-                model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300,
-                                          batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                preds = predict_torch_model(model, Xte_dl_s)
-                elapsed = time.time() - t0
-                results[mname]['preds'].extend(preds.tolist())
-                results[mname]['targets'].extend(yte.tolist())
-                results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-                if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
-            torch.cuda.empty_cache()
-
-        # Trait summary
-        print(f"\n  {'-'*70}\n  {trait} Final Results:\n  {'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
-        trait_res = {}
-        for mname in ALL_NAMES:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0])
-            rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            mtype = _model_type(mname)
-            tag_map = {TYPE_TRAD: ' [Trad]', TYPE_DL: ' [DL]'}
-            tag = tag_map.get(mtype, '')
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run}
-            print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} {rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
-
-        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-        all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
-            json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, y, output_dir, trait)
-        if not quick_test:
-            deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
-
-    if not quick_test:
-        _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Wheat')
+    _run_ensemble_traits(trait_data, output_dir, 'Wheat', quick_test)
 
 
 # ============================================================================
@@ -2204,7 +2146,7 @@ def run_rice(quick_test=True):
                 model = create_model(mname, n_snps, overrides=tp)
                 t0 = time.time()
                 if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                 wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
                 pat = tp.get('patience', 30)
@@ -2341,7 +2283,7 @@ def run_maize(quick_test=True):
                 model = create_model(mname, n_snps)
                 t0 = time.time()
                 if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
                 wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
                 model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
                 preds = predict_torch_model(model, Xte_s)
@@ -2445,7 +2387,8 @@ def generate_bar_charts(fig_dir=None):
 
     DATASETS = []
     rice_data_for_fig04 = None
-    for tag, sub in [('Wheat', 'wheat'), ('Rice', 'rice'), ('Maize', 'maize')]:
+    for tag, sub in [('Wheat', 'wheat'), ('Wheat2000', 'wheat2000'),
+                     ('Rice', 'rice'), ('Maize', 'maize')]:
         d = _load_json_safe(SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
         if d:
             traits = sorted(d.keys())
@@ -2460,7 +2403,10 @@ def generate_bar_charts(fig_dir=None):
     print("\n[plot] Generating bar chart figures (01-04, 07)...")
 
     # --- Fig 01: Per-dataset bar charts ---
-    fig, axes = plt.subplots(1, 3, figsize=(36, 14))
+    n_datasets = len(DATASETS)
+    fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 14))
+    if n_datasets == 1:
+        axes = [axes]
     fig.suptitle('Genomic Prediction Ensemble — Per-Dataset Model Comparison (5-fold CV R²)',
                  fontsize=22, fontweight='bold', y=1.01)
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
@@ -2515,7 +2461,9 @@ def generate_bar_charts(fig_dir=None):
     print("  -> 02_cross_dataset_comparison.png")
 
     # --- Fig 03: Stacking gain scatter ---
-    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+    fig, axes = plt.subplots(1, n_datasets, figsize=(8 * n_datasets, 8))
+    if n_datasets == 1:
+        axes = [axes]
     fig.suptitle('Stacking (Greedy) vs Best Single Model — Per Trait', fontsize=16, fontweight='bold')
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
         ax = axes[ax_idx]
@@ -2583,8 +2531,8 @@ def generate_bar_charts(fig_dir=None):
         tag = 'Trad' if m in TRAD_NAMES else ('Ensemble' if 'Stacking' in m or 'Ensemble' in m else 'DL')
         ax.text(-0.35, i, f'{m} [{tag}]', va='center', ha='right', fontsize=9,
                 fontweight='bold' if 'Stacking' in m or 'Ensemble' in m else 'normal')
-    ax.set_yticks([]); ax.set_xlabel('Mean R² (Wheat + Rice + Maize avg)', fontsize=12)
-    ax.set_title('Three-Dataset Combined Ranking', fontsize=15, fontweight='bold')
+    ax.set_yticks([]); ax.set_xlabel('Mean R² (all-dataset avg)', fontsize=12)
+    ax.set_title('Multi-Dataset Combined Ranking', fontsize=15, fontweight='bold')
     ax.grid(axis='x', alpha=0.25); ax.set_xlim(-0.75, max(vals_r)+0.08); ax.invert_yaxis()
     fig.tight_layout()
     fig.savefig(fig_dir/'07_combined_ranking.png', dpi=180, bbox_inches='tight', facecolor='white')
@@ -2612,6 +2560,7 @@ def generate_scatter_plots(fig_dir=None):
         ('Rice', 'rice', 4, '05', 'XGBoost'),
         ('Maize', 'maize', 2, '06', 'GBLUP'),
         ('Wheat', 'wheat', 2, '10', 'XGBoost'),
+        ('Wheat2000', 'wheat2000', 3, '11', 'XGBoost'),
     ]:
         oof_dir = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "oof_predictions"
         if not oof_dir.exists():
