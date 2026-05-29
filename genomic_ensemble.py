@@ -899,13 +899,14 @@ class FGN_PCA(nn.Module):
 # ============================================================================
 
 class WheatGPModel(nn.Module):
-    """WheatGP: 5-slice CNN + LSTM ensemble — from WheatGP paper (2022).
+    """WheatGP: 5-slice CNN + LSTM — from WheatGP paper (2022)."""
+    CNN_OUT_CH = 8
+    POOL_SIZE = 16
 
-    Each slice: Conv1d(1→2→4→8) with kernel sizes 1,3,9 → AdaptiveAvgPool1d(16).
-    All slices concatenated → LSTM(640, 128) → FC(128, 1).
-    """
     def __init__(self, n_features, n_subnetworks=5, hidden_dim=128):
         super().__init__()
+        if n_features < n_subnetworks:
+            raise ValueError(f"n_features ({n_features}) < n_subnetworks ({n_subnetworks})")
         self.n_subnetworks = n_subnetworks
         self.chunk_size = n_features // n_subnetworks
 
@@ -915,28 +916,29 @@ class WheatGPModel(nn.Module):
                 nn.ReLU(),
                 nn.Conv1d(2, 4, kernel_size=3, padding=1),
                 nn.ReLU(),
-                nn.Conv1d(4, 8, kernel_size=9, padding=4),
+                nn.Conv1d(4, self.CNN_OUT_CH, kernel_size=9, padding=4),
                 nn.ReLU(),
                 nn.Dropout(0.5),
-                nn.AdaptiveAvgPool1d(16)
+                nn.AdaptiveAvgPool1d(self.POOL_SIZE)
             )
             for _ in range(n_subnetworks)
         ])
 
-        self.lstm = nn.LSTM(8 * 16 * n_subnetworks, hidden_dim, batch_first=True)
+        lstm_in = self.CNN_OUT_CH * self.POOL_SIZE * n_subnetworks
+        self.lstm = nn.LSTM(lstm_in, hidden_dim, batch_first=True)
         self.lstm_drop = nn.Dropout(0.3)
         self.fc = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
         batch_size = x.size(0)
+        out_dim = self.CNN_OUT_CH * self.POOL_SIZE
         outputs = []
         for i, subnet in enumerate(self.subnetworks):
             start = i * self.chunk_size
             end = (start + self.chunk_size if i < self.n_subnetworks - 1
                    else x.size(1))
             chunk = x[:, start:end].unsqueeze(1)
-            out = subnet(chunk)
-            outputs.append(out.view(batch_size, -1))
+            outputs.append(subnet(chunk).view(batch_size, out_dim))
         combined = torch.cat(outputs, dim=1).unsqueeze(1)
         lstm_out, _ = self.lstm(combined)
         lstm_out = self.lstm_drop(lstm_out)
@@ -1241,6 +1243,17 @@ TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
 DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGN v6', 'FGN v7', 'FGN v9', 'FGN v10', 'FGN v11', 'FGNplus', 'GenomicFM', 'FGN PCA', 'WheatGP']
 DL_NAMES = DL_BASE_NAMES + ['FusionNet', 'AdditiveGenomicNet']
 ALL_NAMES = TRAD_NAMES + DL_NAMES
+
+# Per-model batch size overrides (default 128; 32 for FGN-prefixed models)
+_MODEL_BS = {'FusionNet': 64, 'AdditiveGenomicNet': 64, 'WheatGP': 32, 'GenomicFM': 32}
+WHEAT_ONLY_DL = {'WheatGP'}
+
+
+def _get_batch_size(mname):
+    """Return training batch size for a DL model name."""
+    if mname in _MODEL_BS:
+        return _MODEL_BS[mname]
+    return 32 if mname.startswith('FGN') else 128
 
 
 def _make_trad_configs(G_train, G_te_tr, n_snps, n_train):
@@ -1589,8 +1602,7 @@ def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test
         lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
         wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
         pat = tp.get('patience', 30)
-        bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
-        bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
+        bs = _get_batch_size(mname)
         model = train_torch_model(model, X_s, y, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
         torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
         print(f"    [saved] {mname}.pt")
@@ -2142,11 +2154,12 @@ def run_rice(quick_test=True):
                 Xtr_raw, Xte_raw, ytr, gidx_gwas, None, n_snps)
 
             for mi, mname in enumerate(DL_NAMES):
+                if mname in WHEAT_ONLY_DL: continue
                 tp = tuned_params.get(mname, {})
                 model = create_model(mname, n_snps, overrides=tp)
                 t0 = time.time()
                 if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
+                bs = _get_batch_size(mname)
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                 wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
                 pat = tp.get('patience', 30)
@@ -2162,6 +2175,7 @@ def run_rice(quick_test=True):
         print(f"\n  {trait} Final Results:")
         trait_res = {}
         for mname in ALL_NAMES:
+            if mname in WHEAT_ONLY_DL and len(results[mname]['preds']) == 0: continue
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
@@ -2280,10 +2294,11 @@ def run_maize(quick_test=True):
 
             # DL
             for mi, mname in enumerate(DL_NAMES):
+                if mname in WHEAT_ONLY_DL: continue
                 model = create_model(mname, n_snps)
                 t0 = time.time()
                 if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128; bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
+                bs = _get_batch_size(mname)
                 wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
                 model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
                 preds = predict_torch_model(model, Xte_s)
@@ -2296,6 +2311,7 @@ def run_maize(quick_test=True):
         # Summary
         trait_res = {}
         for mname in ALL_NAMES:
+            if mname in WHEAT_ONLY_DL and len(results[mname]['preds']) == 0: continue
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
@@ -2349,6 +2365,7 @@ _MODEL_COLORS_DL = {'FGN': '#FFB74D', 'FGN v2': '#FF9800', 'FGN v4': '#F57C00',
                     'FGN v9': '#FFCC80', 'FGN v10': '#FFE082', 'FGN v11': '#FFECB3',
                     'FGNplus': '#A1887F', 'FGN PCA': '#BCAAA4', 'GenomicFM': '#D7CCC8',
                     'FusionNet': '#E91E63', 'AdditiveGenomicNet': '#F48FB1',
+                    'WheatGP': '#78909C',
                     'DeepKernelGP': '#CE93D8', 'EFM v3': '#BA68C8', 'FGN v3': '#AB47BC',
                     'MICNN': '#9C27B0', 'MICNN v2': '#6A1B9A', 'PreFGN': '#8E24AA',
                     'ResFGN': '#4A148C'}
@@ -2404,13 +2421,13 @@ def generate_bar_charts(fig_dir=None):
 
     # --- Fig 01: Per-dataset bar charts ---
     n_datasets = len(DATASETS)
-    fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 14))
-    if n_datasets == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 14),
+                             squeeze=False)
+    # axes is always 2D with squeeze=False; flatten to 1D for indexing
     fig.suptitle('Genomic Prediction Ensemble — Per-Dataset Model Comparison (5-fold CV R²)',
                  fontsize=22, fontweight='bold', y=1.01)
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
-        ax = axes[ax_idx]
+        ax = axes[0, ax_idx]
         all_models = list(data[traits[0]].keys())
         means = {m: _mean_r2(data, m) for m in all_models}
         sorted_m = sorted([m for m in all_models if means[m] > -5], key=lambda m: means[m], reverse=True)[:20]
@@ -2461,12 +2478,11 @@ def generate_bar_charts(fig_dir=None):
     print("  -> 02_cross_dataset_comparison.png")
 
     # --- Fig 03: Stacking gain scatter ---
-    fig, axes = plt.subplots(1, n_datasets, figsize=(8 * n_datasets, 8))
-    if n_datasets == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(1, n_datasets, figsize=(8 * n_datasets, 8),
+                             squeeze=False)
     fig.suptitle('Stacking (Greedy) vs Best Single Model — Per Trait', fontsize=16, fontweight='bold')
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
-        ax = axes[ax_idx]
+        ax = axes[0, ax_idx]
         singles = [m for m in data[traits[0]].keys() if 'Stacking' not in m and 'Ensemble' not in m]
         stk_key = 'Stacking (Greedy)' if 'Stacking (Greedy)' in data[traits[0]] else 'Stacking (All)'
         xs, ys = [], []
