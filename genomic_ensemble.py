@@ -2470,7 +2470,7 @@ def generate_bar_charts(fig_dir=None):
     ax.axhline(y=0, color='#666', linewidth=1)
     ax.set_xticks(x); ax.set_xticklabels(common_sorted, rotation=45, ha='right', fontsize=9)
     ax.set_ylabel('R²', fontsize=13)
-    ax.set_title('Cross-Dataset Comparison — Models Common to All Three Datasets', fontsize=15, fontweight='bold')
+    ax.set_title(f'Cross-Dataset Comparison — Models Common to {n_datasets} Datasets', fontsize=15, fontweight='bold')
     ax.legend(fontsize=11, loc='upper right'); ax.grid(axis='y', alpha=0.3)
     fig.tight_layout()
     fig.savefig(fig_dir/'02_cross_dataset_comparison.png', dpi=180, bbox_inches='tight', facecolor='white')
@@ -2672,7 +2672,8 @@ if __name__ == '__main__':
     if crop == 'all':
         import subprocess
         procs = []
-        for c in ['wheat', 'rice', 'maize']:
+        all_crops = ['wheat', 'wheat2000', 'rice', 'maize']
+        for c in all_crops:
             cmd = [sys.executable, __file__, c]
             if full_mode:
                 cmd.append('--full')
@@ -2680,7 +2681,7 @@ if __name__ == '__main__':
             procs.append(subprocess.Popen(cmd))
         for i, p in enumerate(procs):
             p.wait()
-            print(f"  Subprocess {['wheat','rice','maize'][i]} finished (rc={p.returncode})")
+            print(f"  Subprocess {all_crops[i]} finished (rc={p.returncode})")
     else:
         if crop == 'wheat': run_wheat(quick_test=not full_mode)
         if crop == 'wheat2000': run_wheat2000(quick_test=not full_mode)

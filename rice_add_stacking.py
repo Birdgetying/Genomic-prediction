@@ -106,8 +106,7 @@ for trait in traits:
         for mi, mname in enumerate(ge.DL_NAMES):
             model = ge.create_model(mname, n_snps)
             t0 = time.time()
-            bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
-            bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
+            bs = ge._get_batch_size(mname)
             wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
             lr = 1e-3 if mname == 'FusionNet' else 2e-3
             model = ge.train_torch_model(model, Xtr_dl_s, ytr, epochs=300,

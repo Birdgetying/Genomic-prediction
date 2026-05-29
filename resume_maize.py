@@ -109,8 +109,7 @@ for trait in remaining:
             t0 = time.time()
             if fold_i == 0:
                 results[mname]['params'] = sum(p.numel() for p in model.parameters())
-            bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
-            bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
+            bs = ge._get_batch_size(mname)
             wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
             model = ge.train_torch_model(model, Xtr_s, ytr, epochs=300,
                                          batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)

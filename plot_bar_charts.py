@@ -52,6 +52,7 @@ def _load_json(path):
     return None
 
 wheat = _load_json(SCRIPT_DIR/"results/wheat_ensemble/ensemble_intermediate.json")
+wheat2000 = _load_json(SCRIPT_DIR/"results/wheat2000_ensemble/ensemble_intermediate.json")
 rice = _load_json(SCRIPT_DIR/"results/rice_ensemble/ensemble_intermediate.json")
 maize = _load_json(SCRIPT_DIR/"results/maize_ensemble/ensemble_intermediate.json")
 
@@ -60,6 +61,10 @@ if wheat is not None:
     W_TRAITS = list(wheat.keys())
     DATASETS.append(('Wheat', wheat, W_TRAITS))
 else: W_TRAITS = []
+if wheat2000 is not None:
+    W2_TRAITS = sorted(wheat2000.keys())
+    DATASETS.append(('Wheat2000', wheat2000, W2_TRAITS))
+else: W2_TRAITS = []
 if rice is not None:
     R_TRAITS = sorted(rice.keys())
     DATASETS.append(('Rice', rice, R_TRAITS))
@@ -75,12 +80,13 @@ print(f"Loaded {len(DATASETS)} dataset(s): {[d[0] for d in DATASETS]}")
 # Figure 01: Per-dataset bar charts
 # ============================================================================
 print("[01] Per-dataset bar charts...")
-fig, axes = plt.subplots(1, 3, figsize=(36, 14))
+n_datasets = len(DATASETS)
+fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 14), squeeze=False)
 fig.suptitle('Genomic Prediction Ensemble — Per-Dataset Model Comparison (5-fold CV R²)',
              fontsize=22, fontweight='bold', y=1.01)
 
 for ax_idx, (dname, data, traits) in enumerate(DATASETS):
-    ax = axes[ax_idx]
+    ax = axes[0, ax_idx]
     all_models = list(data[traits[0]].keys())
     means = {m: np.mean([data[t][m]['R2'] for t in traits if m in data[t]]) for m in all_models}
     sorted_m = sorted([m for m in all_models if means[m] > -5], key=lambda m: means[m], reverse=True)[:20]
@@ -114,20 +120,18 @@ print("  -> 01_per_dataset_bar_charts.png")
 # Figure 02: Cross-dataset comparison
 # ============================================================================
 print("[02] Cross-dataset comparison...")
-w_models = set(wheat[W_TRAITS[0]].keys()) if wheat else set()
-r_models = set(rice[R_TRAITS[0]].keys()) if rice else set()
-m_models = set(maize[M_TRAITS[0]].keys()) if maize else set()
-common = w_models & r_models & m_models
-common_sorted = sorted(common, key=lambda m: (avg_r2(wheat,m)+avg_r2(rice,m)+avg_r2(maize,m))/3, reverse=True)
+model_sets = [set(data[traits[0]].keys()) for _, data, traits in DATASETS]
+common = model_sets[0]
+for s in model_sets[1:]: common = common & s
+common_sorted = sorted(common, key=lambda m: np.mean([avg_r2(d, m) for _, d, _ in DATASETS]), reverse=True)
 
 fig, ax = plt.subplots(figsize=(18, 10))
 x = np.arange(len(common_sorted)); bar_w = 0.25
-w_vals = [avg_r2(wheat, m) for m in common_sorted]
-r_vals = [avg_r2(rice, m) for m in common_sorted]
-m_vals = [avg_r2(maize, m) for m in common_sorted]
-ax.bar(x - bar_w, w_vals, bar_w, color='#2196F3', edgecolor='white', label='Wheat (1 trait)', zorder=3)
-ax.bar(x, r_vals, bar_w, color='#FF9800', edgecolor='white', label='Rice (10 traits)', zorder=3)
-ax.bar(x + bar_w, m_vals, bar_w, color='#4CAF50', edgecolor='white', label='Maize (4 traits)', zorder=3)
+dataset_colors = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0', '#F44336']
+for bi, (dname, data, _) in enumerate(DATASETS):
+    vals = [avg_r2(data, m) for m in common_sorted]
+    ax.bar(x + (bi - (len(DATASETS)-1)/2) * bar_w, vals, bar_w, color=dataset_colors[bi % len(dataset_colors)],
+           edgecolor='white', label=f'{dname} ({len(DATASETS[bi][2])} trait{"s" if len(DATASETS[bi][2])>1 else ""})', zorder=3)
 ax.axhline(y=0, color='#666', linewidth=1)
 ax.set_xticks(x); ax.set_xticklabels(common_sorted, rotation=45, ha='right', fontsize=9)
 ax.set_ylabel('R²', fontsize=13)
@@ -142,11 +146,11 @@ print("  -> 02_cross_dataset_comparison.png")
 # Figure 03: Stacking gain scatter
 # ============================================================================
 print("[03] Stacking gain scatter...")
-fig, axes = plt.subplots(1, 3, figsize=(24, 8))
+fig, axes = plt.subplots(1, n_datasets, figsize=(8 * n_datasets, 8), squeeze=False)
 fig.suptitle('Stacking (Greedy) vs Best Single Model — Per Trait', fontsize=16, fontweight='bold')
 
 for ax_idx, (dname, data, traits) in enumerate(DATASETS):
-    ax = axes[ax_idx]
+    ax = axes[0, ax_idx]
     singles = [m for m in data[traits[0]].keys() if 'Stacking' not in m and 'Ensemble' not in m]
     stk_key = 'Stacking (Greedy)' if 'Stacking (Greedy)' in data[traits[0]] else 'Stacking (All)'
     xs, ys = [], []
@@ -208,8 +212,7 @@ else:
 print("[07] Combined ranking...")
 combined = {}
 for m in common:
-    w = avg_r2(wheat, m); r = avg_r2(rice, m); mz = avg_r2(maize, m)
-    combined[m] = (w + r + mz) / 3
+    combined[m] = np.mean([avg_r2(d, m) for _, d, _ in DATASETS])
 sorted_all = sorted(combined.items(), key=lambda x: x[1], reverse=True)
 
 fig, ax = plt.subplots(figsize=(14, 10))
@@ -222,8 +225,8 @@ for i, (m, v) in enumerate(zip(models_r, vals_r)):
     tag = 'Traditional' if m in TRAD_COLORS else ('Ensemble' if m in ENS_COLORS else 'DL')
     ax.text(-0.35, i, f'{m} [{tag}]', va='center', ha='right', fontsize=9,
             fontweight='bold' if 'Stacking' in m or 'Ensemble' in m else 'normal')
-ax.set_yticks([]); ax.set_xlabel('Mean R² (Wheat + Rice + Maize avg)', fontsize=12)
-ax.set_title('Three-Dataset Combined Ranking', fontsize=15, fontweight='bold')
+ax.set_yticks([]); ax.set_xlabel(f'Mean R² ({"+".join(d[0] for d in DATASETS)} avg)', fontsize=12)
+ax.set_title(f'{len(DATASETS)}-Dataset Combined Ranking', fontsize=15, fontweight='bold')
 ax.grid(axis='x', alpha=0.25); ax.set_xlim(-0.75, max(vals_r)+0.08); ax.invert_yaxis()
 fig.tight_layout()
 fig.savefig(FIG_DIR/'07_combined_ranking.png', dpi=180, bbox_inches='tight', facecolor='white')
