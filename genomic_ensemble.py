@@ -2465,8 +2465,8 @@ def generate_bar_charts(fig_dir=None):
     x = np.arange(len(common_sorted)); bar_w = 0.25
     for bi, (dname, data, _) in enumerate(DATASETS):
         vals = [_mean_r2(data, m) for m in common_sorted]
-        c = ['#2196F3', '#FF9800', '#4CAF50'][bi]
-        ax.bar(x + (bi-1)*bar_w, vals, bar_w, color=c, edgecolor='white', label=f'{dname} ({len(DATASETS[bi][2])} trait{"s" if len(DATASETS[bi][2])>1 else ""})', zorder=3)
+        c = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0', '#F44336'][bi]
+        ax.bar(x + (bi - (n_datasets-1)/2) * bar_w, vals, bar_w, color=c, edgecolor='white', label=f'{dname} ({len(DATASETS[bi][2])} trait{"s" if len(DATASETS[bi][2])>1 else ""})', zorder=3)
     ax.axhline(y=0, color='#666', linewidth=1)
     ax.set_xticks(x); ax.set_xticklabels(common_sorted, rotation=45, ha='right', fontsize=9)
     ax.set_ylabel('R²', fontsize=13)
