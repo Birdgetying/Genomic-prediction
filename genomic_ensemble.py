@@ -1678,14 +1678,27 @@ def load_wheat_data():
     print("\n[1/4] Loading phenotypes ...")
     df = pd.read_csv(WHEAT_PHENO, sep='\t', header=0)
     n_samples = len(df); traits = {}
+    skipped_id, skipped_nonnum, skipped_missing = [], [], []
+    print(f"  文件: {WHEAT_PHENO}")
+    print(f"  行数: {n_samples}, 列数: {len(df.columns)}")
+    print(f"  列名: {list(df.columns)}")
     for col in df.columns:
-        if col.lower() in ('sample', 'id', 'name', 'accession', 'line'): continue
+        if col.lower() in ('sample', 'id', 'name', 'accession', 'line'):
+            skipped_id.append(col); continue
         try:
             vals = pd.to_numeric(df[col], errors='coerce').values.astype(np.float32)
             mask = ~np.isnan(vals)
-            if mask.sum() > 0.5 * len(vals):
+            valid_pct = mask.sum() / len(vals) * 100
+            if valid_pct > 50:
                 traits[col] = (vals, mask)
-        except (ValueError, TypeError): pass
+                print(f"    [OK] {col}: {mask.sum()}/{len(vals)} ({valid_pct:.1f}%) valid")
+            else:
+                skipped_missing.append(f"{col}({valid_pct:.1f}%)")
+        except (ValueError, TypeError):
+            skipped_nonnum.append(col)
+    if skipped_id: print(f"  跳过ID列: {skipped_id}")
+    if skipped_nonnum: print(f"  跳过非数值列: {skipped_nonnum}")
+    if skipped_missing: print(f"  跳过缺失过多列: {skipped_missing}")
     if not traits:
         df = pd.read_csv(WHEAT_PHENO, sep='\t', header=None)
         vals = pd.to_numeric(df.iloc[:, 1], errors='coerce').values.astype(np.float32)
