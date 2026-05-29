@@ -69,6 +69,18 @@ WHEAT_PHENO     = WHEAT_DATA_BASE + "Phe.txt"
 WHEAT_VCF_ID    = WHEAT_DATA_BASE + "VCFID.txt"
 WHEAT_MAX_VARIANTS_PER_TYPE = 15000
 
+# Wheat2000 CSV data paths (dnngp format: binary marker matrix + per-trait phenotype files)
+WHEAT2000_DATA_DIR = PROJECT_DIR + "/dnngp_data/wheat2000/SNP_origin"
+WHEAT2000_GENO = WHEAT2000_DATA_DIR + "/2000gene.csv"
+WHEAT2000_TRAITS = {
+    'tkw':    '2000_1_phe.txt',   # 千粒重 (thousand kernel weight)
+    'testw':  '2000_2_phe.txt',   # 容重 (test weight)
+    'length': '2000_3_phe.txt',   # 粒长 (kernel length)
+    'width':  '2000_4_phe.txt',   # 粒宽 (kernel width)
+    'Hard':   '2000_5_phe.txt',   # 硬度 (hardness)
+    'Prot':   '2000_6_phe.txt',   # 蛋白质含量 (protein content)
+}
+
 # Rice data paths
 RICE_DATA_DIR = PROJECT_DIR + "/results/rice_data"
 
@@ -1762,6 +1774,212 @@ def load_wheat_data():
     return trait_data
 
 
+def load_wheat2000_data():
+    """Load wheat2000 CSV-format data from dnngp_data.
+
+    Genotype: 2000 lines × 33,709 binary SNPs (0/1) in 2000gene.csv
+    Phenotype: 6 traits in separate .txt files, one value per line with header.
+
+    Returns dict: {trait_name: (X, y, None)}
+        X — (n_samples, n_markers) float32 genotype matrix
+        y — (n_samples,) float32 phenotype values
+        vt — None (no variant type annotation in CSV format)
+    """
+    print(f"\n{'='*70}\nWheat2000 CSV Data Loading\n{'='*70}")
+
+    # 1. Genotype matrix
+    print(f"\n[1/2] Loading genotype matrix ...")
+    if not os.path.exists(WHEAT2000_GENO):
+        raise FileNotFoundError(f"Genotype file not found: {WHEAT2000_GENO}")
+    raw = pd.read_csv(WHEAT2000_GENO, header=None)
+    # First row is column index header, first column is row index
+    X_all = raw.iloc[1:, 1:].values.astype(np.float32)
+    n_samples, n_markers = X_all.shape
+    unique_vals = np.unique(X_all)
+    print(f"  文件: {WHEAT2000_GENO}")
+    print(f"  基因型矩阵: {n_samples} samples × {n_markers} markers")
+    print(f"  取值范围: {unique_vals}")
+
+    # 2. Phenotype files
+    print(f"\n[2/2] Loading phenotypes ...")
+    trait_data = {}
+    for tname, fname in WHEAT2000_TRAITS.items():
+        fpath = os.path.join(WHEAT2000_DATA_DIR, fname)
+        if not os.path.exists(fpath):
+            print(f"  {tname}: SKIP (file not found: {fpath})")
+            continue
+        with open(fpath) as f:
+            lines = f.read().strip().split('\n')
+        # Skip header line
+        y = np.array([float(l) for l in lines[1:] if l.strip()], dtype=np.float32)
+        n_phe = len(y)
+        # Use min(n_phe, n_samples) to handle potential mismatch
+        n_common = min(n_samples, n_phe)
+        X_t = X_all[:n_common]
+        y_t = y[:n_common]
+        trait_data[tname] = (X_t, y_t, None)  # no variant type info
+        print(f"  {tname}: {n_common} samples, "
+              f"mean={np.mean(y_t):.4f}, std={np.std(y_t):.4f}")
+    return trait_data
+
+
+def run_wheat2000(quick_test=True):
+    """Run wheat2000 ensemble pipeline on CSV-format dnngp data.
+
+    Shares the same core logic as run_wheat() but loads from CSV files
+    instead of VCF, and every trait has no variant-type annotation (vt=None).
+    """
+    _script_dir = Path(__file__).resolve().parent
+    output_dir = _script_dir / "results" / "wheat2000_ensemble"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
+    if DEVICE.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    trait_data = load_wheat2000_data()
+    trait_names = sorted(trait_data.keys())
+    print(f"\n实验性状: {trait_names}")
+
+    traits_run = trait_names[:1] if quick_test else trait_names
+    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
+    if quick_test:
+        print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
+
+    all_results = {}
+    total_t0 = time.time()
+
+    for t_idx, trait in enumerate(traits_run):
+        print(f"\n{'='*80}\n  TRAIT [{t_idx+1}/{len(traits_run)}]: {trait}\n{'='*80}")
+        X_all, y, vt_all = trait_data[trait]
+        y = y.astype(np.float32)
+        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
+        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
+
+        # AutoML
+        tuned_params = {}
+        if not quick_test:
+            print(f"\n  [AutoML] Tuning hyperparams ...")
+            maf_tune = maf_filter(X_all)
+            if len(maf_tune) >= n_snps:
+                gidx_t = gwas_select(X_all[:, maf_tune], y, n_snps)
+                X_tune = X_all[:, maf_tune][:, gidx_t]
+            else:
+                X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
+            sc_tune = StandardScaler()
+            X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
+            for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet',
+                              'AdditiveGenomicNet', 'GenomicFM']:
+                best_p, best_r2 = tune_model_hyperparams(
+                    tune_name, X_tune_s, y, n_snps, n_trials=15)
+                tuned_params[tune_name] = best_p
+                pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
+                print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
+
+        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
+                   for m in ALL_NAMES}
+        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+
+        for fi, (tr, te) in enumerate(kf.split(X_all)):
+            print(f"\n  --- Fold {fi+1}/{folds_run} ---")
+            Xtr_raw, Xte_raw = X_all[tr], X_all[te]
+            ytr, yte = y[tr], y[te]
+            maf_idx = maf_filter(Xtr_raw)
+            if len(maf_idx) >= n_snps:
+                Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]
+                # vt_all is None for CSV data
+            # vt_maf remains None (no variant types in CSV data)
+
+            # Traditional models — GWAS markers
+            gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr_trad = Xtr_raw[:, gidx_gwas]
+            Xte_trad = Xte_raw[:, gidx_gwas]
+            sc_trad = StandardScaler()
+            Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
+            Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
+            G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps
+            G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
+
+            trad_configs = _make_trad_configs(
+                G_fold_train, G_fold_te_tr, n_snps, len(tr))
+            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
+                t0 = time.time()
+                tmodel = build_fn()
+                fit_fn(tmodel, Xtr_trad_s, ytr)
+                preds = pred_fn(tmodel, Xte_trad_s)
+                results[tname]['preds'].extend(preds.tolist())
+                results[tname]['targets'].extend(yte.tolist())
+                results[tname]['time'] += time.time() - t0
+                if fi == 0:
+                    results[tname]['params'] = param_count
+                oof_trad[tname][te] = preds
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
+
+            # DL models — no variant type, pass None
+            gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
+                Xtr_raw, Xte_raw, ytr, gidx_gwas, None, n_snps)
+
+            for mi, mname in enumerate(DL_NAMES):
+                tp = tuned_params.get(mname, {})
+                model = create_model(mname, n_snps, overrides=tp)
+                t0 = time.time()
+                if fi == 0:
+                    results[mname]['params'] = sum(
+                        p.numel() for p in model.parameters())
+                bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
+                bs = 32 if mname.startswith('FGN') or mname == 'GenomicFM' else bs
+                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+                wd = tp.get('weight_decay',
+                            5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
+                pat = tp.get('patience', 30)
+                model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300,
+                                          batch_size=bs, lr=lr,
+                                          weight_decay=wd, patience=pat)
+                preds = predict_torch_model(model, Xte_dl_s)
+                elapsed = time.time() - t0
+                results[mname]['preds'].extend(preds.tolist())
+                results[mname]['targets'].extend(yte.tolist())
+                results[mname]['time'] += elapsed
+                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                if mname in DL_BASE_NAMES:
+                    oof_dl[mname][te] = preds
+            torch.cuda.empty_cache()
+
+        # Trait summary
+        print(f"\n  {'-'*70}\n  {trait} Final Results:\n  "
+              f"{'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
+        trait_res = {}
+        for mname in ALL_NAMES:
+            p = np.array(results[mname]['preds'])
+            t = np.array(results[mname]['targets'])
+            r2_v = float(r2_score(t, p))
+            corr_v = float(pearsonr(t, p)[0])
+            rmse_v = float(np.sqrt(np.mean((p - t) ** 2)))
+            mtype = _model_type(mname)
+            tag_map = {TYPE_TRAD: ' [Trad]', TYPE_DL: ' [DL]'}
+            tag = tag_map.get(mtype, '')
+            trait_res[mname] = {
+                'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+                'Type': mtype, 'Time': results[mname]['time'] / folds_run}
+            print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} "
+                  f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
+
+        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        all_results[trait] = trait_res
+        with open(output_dir / "ensemble_intermediate.json", 'w',
+                  encoding='utf-8') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        _save_oof_npz(results, ALL_NAMES, y, output_dir, trait)
+        if not quick_test:
+            deploy_models(X_all, y, n_snps, trait, output_dir,
+                          tuned_params, quick_test)
+
+    if not quick_test:
+        _print_final_summary(all_results, traits_run, output_dir, total_t0,
+                             'Wheat2000')
+
+
 def run_wheat(quick_test=True):
     _script_dir = Path(__file__).resolve().parent
     output_dir = _script_dir / "results" / "wheat_ensemble"
@@ -2470,13 +2688,14 @@ if __name__ == '__main__':
     crop = sys.argv[1] if len(sys.argv) > 1 else ''
     full_mode = '--full' in sys.argv
 
-    if crop not in ('wheat', 'rice', 'maize', 'all'):
-        print("Usage: python genomic_ensemble.py <wheat|rice|maize|all> [--full]")
-        print("  wheat  — Run wheat ensemble pipeline")
-        print("  rice   — Run rice ensemble pipeline")
-        print("  maize  — Run maize ensemble pipeline")
-        print("  all    — Run all three pipelines")
-        print("  --full — Full mode (all traits x 5 folds)")
+    if crop not in ('wheat', 'wheat2000', 'rice', 'maize', 'all'):
+        print("Usage: python genomic_ensemble.py <wheat|wheat2000|rice|maize|all> [--full]")
+        print("  wheat     — Run wheat ensemble pipeline (VCF data)")
+        print("  wheat2000 — Run wheat2000 ensemble pipeline (CSV data, 2000×33K)")
+        print("  rice      — Run rice ensemble pipeline")
+        print("  maize     — Run maize ensemble pipeline")
+        print("  all       — Run wheat+rice+maize pipelines")
+        print("  --full    — Full mode (all traits x 5 folds)")
         sys.exit(1)
 
     print(f"\n{'#'*80}")
@@ -2499,6 +2718,7 @@ if __name__ == '__main__':
             print(f"  Subprocess {['wheat','rice','maize'][i]} finished (rc={p.returncode})")
     else:
         if crop == 'wheat': run_wheat(quick_test=not full_mode)
+        if crop == 'wheat2000': run_wheat2000(quick_test=not full_mode)
         if crop == 'rice': run_rice(quick_test=not full_mode)
         if crop == 'maize': run_maize(quick_test=not full_mode)
 
