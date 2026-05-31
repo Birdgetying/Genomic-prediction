@@ -2081,9 +2081,10 @@ def load_rice_data():
         idxs = td['genotype_indices']
         y = np.array(td['values']).astype(np.float32)
         X_t = G[idxs]
-        mask = ~np.isnan(y)
+        mask = ~np.isnan(y) & (y > -8)  # -9 is missing-value sentinel
         trait_data[t] = (X_t[mask], y[mask])
-        print(f"  {t}: {mask.sum()} samples")
+        if mask.sum() < len(y):
+            print(f"  {t}: {mask.sum()} samples (removed {len(y) - mask.sum()} sentinel -9)")
     return trait_data
 
 
