@@ -89,7 +89,7 @@ for ax_idx, (dname, data, traits) in enumerate(DATASETS):
     ax = axes[0, ax_idx]
     all_models = list(data[traits[0]].keys())
     means = {m: np.mean([data[t][m]['R2'] for t in traits if m in data[t]]) for m in all_models}
-    sorted_m = sorted([m for m in all_models if means[m] > -5], key=lambda m: means[m], reverse=True)[:20]
+    sorted_m = sorted([m for m in all_models if means[m] > -1], key=lambda m: means[m], reverse=True)[:20]
     vals = [means[m] for m in sorted_m]
     colors = [model_color(m) for m in sorted_m]
 
