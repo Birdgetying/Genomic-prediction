@@ -123,7 +123,9 @@ print("[02] Cross-dataset comparison...")
 model_sets = [set(data[traits[0]].keys()) for _, data, traits in DATASETS]
 common = model_sets[0]
 for s in model_sets[1:]: common = common & s
-common_sorted = sorted(common, key=lambda m: np.mean([avg_r2(d, m) for _, d, _ in DATASETS]), reverse=True)
+all_common = sorted(common, key=lambda m: np.mean([avg_r2(d, m) for _, d, _ in DATASETS]), reverse=True)
+# Filter: models with mean R² < -1 across any dataset are noise
+common_sorted = [m for m in all_common if min(avg_r2(d, m) for _, d, _ in DATASETS) > -1]
 
 fig, ax = plt.subplots(figsize=(18, 10))
 x = np.arange(len(common_sorted)); bar_w = 0.25
@@ -211,8 +213,10 @@ else:
 # ============================================================================
 print("[07] Combined ranking...")
 combined = {}
-for m in common:
-    combined[m] = np.mean([avg_r2(d, m) for _, d, _ in DATASETS])
+for m in all_common:
+    avg = np.mean([avg_r2(d, m) for _, d, _ in DATASETS])
+    if min(avg_r2(d, m) for _, d, _ in DATASETS) > -1:
+        combined[m] = avg
 sorted_all = sorted(combined.items(), key=lambda x: x[1], reverse=True)
 
 fig, ax = plt.subplots(figsize=(14, 10))

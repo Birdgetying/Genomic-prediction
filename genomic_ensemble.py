@@ -2464,7 +2464,8 @@ def generate_bar_charts(fig_dir=None):
     model_sets = [set(data[traits[0]].keys()) for _, data, traits in DATASETS]
     common = model_sets[0]
     for s in model_sets[1:]: common = common & s
-    common_sorted = sorted(common, key=lambda m: np.mean([_mean_r2(d, m) for _, d, _ in DATASETS]), reverse=True)
+    all_common = sorted(common, key=lambda m: np.mean([_mean_r2(d, m) for _, d, _ in DATASETS]), reverse=True)
+    common_sorted = [m for m in all_common if min(_mean_r2(d, m) for _, d, _ in DATASETS) > -1]
 
     fig, ax = plt.subplots(figsize=(18, 10))
     x = np.arange(len(common_sorted)); bar_w = 0.25
@@ -2538,9 +2539,10 @@ def generate_bar_charts(fig_dir=None):
 
     # --- Fig 07: Combined ranking ---
     combined = {}
-    for m in common:
+    for m in all_common:
         v = np.mean([_mean_r2(d, m) for _, d, _ in DATASETS])
-        combined[m] = v
+        if min(_mean_r2(d, m) for _, d, _ in DATASETS) > -1:
+            combined[m] = v
     sorted_all = sorted(combined.items(), key=lambda x: x[1], reverse=True)
     fig, ax = plt.subplots(figsize=(14, 10))
     y_pos = range(len(sorted_all))
