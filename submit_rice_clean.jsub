@@ -1,0 +1,86 @@
+#!/bin/bash
+# ============================================================================
+# 水稻基因组预测 — 缺失值清洗后重跑（-9 sentinel 已过滤）
+#
+# 使用: jsub < submit_rice_clean.jsub
+# 修复: load_rice_data() 增加 (y > -8) 过滤 -9 缺失值编码
+# ============================================================================
+#JSUB -q gpu
+#JSUB -n 2
+#JSUB -gpgpu 1
+#JSUB -J rice_clean
+#JSUB -o logs/rice_clean_%J.out
+#JSUB -e logs/rice_clean_%J.err
+
+echo "======================================================================"
+echo "Rice Ensemble (Cleaned) — $(date)"
+echo "======================================================================"
+
+module load pytorch-2.3.0_py311
+echo "Module loaded: pytorch-2.3.0_py311"
+
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+export CUDA_LAUNCH_BLOCKING=0
+
+# 工作目录
+cd $HOME/genomic_prediction 2>/dev/null || \
+cd /storage/public/home/2024110093/genomic_prediction 2>/dev/null || {
+    echo "ERROR: Cannot find project directory"
+    exit 1
+}
+echo "Working directory: $(pwd)"
+
+# GPU 诊断
+echo "GPU Diagnostics:"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>&1 || echo "nvidia-smi not available"
+python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
+
+mkdir -p logs results/rice_ensemble
+
+# ============================================================================
+# Rice Ensemble (post-cleaning)
+# ============================================================================
+echo ""
+echo "======================================================================"
+echo "RICE ENSEMBLE — $(date)"
+echo "======================================================================"
+
+MISSING=0
+for f in "results/rice_data/genotype_matrix.npz" "results/rice_data/trait_data.json"; do
+    if [ -f "$f" ]; then
+        echo "  [OK] $f"
+    else
+        echo "  [MISSING] $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Missing rice data files"
+    exit 1
+fi
+
+# 备份旧结果
+if [ -f "results/rice_ensemble/ensemble_intermediate.json" ]; then
+    BACKUP="results/rice_ensemble/ensemble_intermediate_dirty_$(date +%Y%m%d_%H%M%S).json"
+    cp results/rice_ensemble/ensemble_intermediate.json "$BACKUP"
+    echo "Backed up dirty results to: $BACKUP"
+fi
+
+T0=$(date +%s)
+python -u genomic_ensemble.py rice --full 2>&1 | tee "logs/rice_clean_$(date +%Y%m%d_%H%M%S).log"
+RICE_EXIT=${PIPESTATUS[0]}
+T1=$(date +%s)
+echo "Rice finished in $(((T1-T0)/60)) min, exit=$RICE_EXIT"
+
+TOTAL_END=$(date +%s)
+echo ""
+echo "======================================================================"
+if [ $RICE_EXIT -eq 0 ]; then
+    echo "SUCCESS — Total time: $(((TOTAL_END-T0)/60)) min — $(date)"
+else
+    echo "FAILED (exit=$RICE_EXIT) — Total time: $(((TOTAL_END-T0)/60)) min — $(date)"
+fi
+echo "======================================================================"
+exit $RICE_EXIT
