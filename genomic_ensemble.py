@@ -1065,7 +1065,11 @@ def train_torch_model(model, X_train, y_train,
             Xv = Xv_full * cmask.float()
         else:
             Xt, Xv = Xt_full, Xv_full
-        dl = DataLoader(TensorDataset(Xt, yt), batch_size=min(batch_size, len(tr_idx)), shuffle=True)
+        bs = min(batch_size, len(tr_idx))
+        # Avoid batch of size 1 (kills BatchNorm): absorb singleton into previous batch
+        if len(tr_idx) % bs == 1 and bs > 1:
+            bs += 1
+        dl = DataLoader(TensorDataset(Xt, yt), batch_size=bs, shuffle=True)
         for bx, by in dl:
             if use_mixup and ep >= 5:
                 lam = np.random.beta(mixup_alpha, mixup_alpha)
