@@ -1067,7 +1067,7 @@ def train_torch_model(model, X_train, y_train,
             Xt, Xv = Xt_full, Xv_full
         bs = min(batch_size, len(tr_idx))
         # Avoid batch of size 1 (kills BatchNorm): absorb singleton into previous batch
-        if len(tr_idx) % bs == 1 and bs > 1:
+        while len(tr_idx) % bs == 1 and bs > 1:
             bs += 1
         dl = DataLoader(TensorDataset(Xt, yt), batch_size=bs, shuffle=True)
         for bx, by in dl:
