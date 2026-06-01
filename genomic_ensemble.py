@@ -1999,7 +1999,7 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
               f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
 
     _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-    _save_oof_npz(results, ALL_NAMES, y, output_dir, trait_name)
+    _save_oof_npz(results, ALL_NAMES, output_dir, trait_name)
     if not quick_test:
         deploy_models(X_all, y, n_snps, trait_name, output_dir,
                       tuned_params, quick_test)
@@ -2191,7 +2191,7 @@ def run_rice(quick_test=True):
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, y, output_dir, trait)
+        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
 
@@ -2327,7 +2327,7 @@ def run_maize(quick_test=True):
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, y, output_dir, trait)
+        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
 
@@ -2341,20 +2341,17 @@ def run_maize(quick_test=True):
 # Section L: Visualization
 # ============================================================================
 
-def _save_oof_npz(results, all_names, y_true, output_dir, trait_name):
+def _save_oof_npz(results, all_names, output_dir, trait_name):
     """Save per-model OOF predictions as NPZ for later scatter plot generation.
 
-    IMPORTANT: predictions are accumulated in fold-concatenation order, NOT
-    original sample order.  We must use results[m]['targets'] (which follows
-    the same fold accumulation) as the aligned ground-truth, NOT the raw
-    ``y_true`` parameter (which is in original sample order).  Using
-    misaligned y_true produces scatter plots with spuriously low correlation.
+    Uses results[m]['targets'] (fold-concatenation order) as the aligned
+    ground-truth — predictions are accumulated in the same fold order, so
+    both arrays remain correctly paired inside the NPZ.
     """
     oof_dir = output_dir / "oof_predictions"
     oof_dir.mkdir(parents=True, exist_ok=True)
-    # Derive aligned targets from the first model's fold-concatenated targets
-    ref_name = next((m for m in all_names if 'targets' in results.get(m, {})), all_names[0])
-    aligned_y = np.array(results[ref_name]['targets'], dtype=np.float32)
+    # All models share the same fold-concatenated target order
+    aligned_y = np.array(results[all_names[0]]['targets'], dtype=np.float32)
     data = {'_y_true': aligned_y}
     for m in all_names:
         p = np.array(results[m]['preds'], dtype=np.float32)
