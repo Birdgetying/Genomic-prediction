@@ -2342,13 +2342,23 @@ def run_maize(quick_test=True):
 # ============================================================================
 
 def _save_oof_npz(results, all_names, y_true, output_dir, trait_name):
-    """Save per-model OOF predictions as NPZ for later scatter plot generation."""
+    """Save per-model OOF predictions as NPZ for later scatter plot generation.
+
+    IMPORTANT: predictions are accumulated in fold-concatenation order, NOT
+    original sample order.  We must use results[m]['targets'] (which follows
+    the same fold accumulation) as the aligned ground-truth, NOT the raw
+    ``y_true`` parameter (which is in original sample order).  Using
+    misaligned y_true produces scatter plots with spuriously low correlation.
+    """
     oof_dir = output_dir / "oof_predictions"
     oof_dir.mkdir(parents=True, exist_ok=True)
-    data = {'_y_true': y_true.astype(np.float32)}
+    # Derive aligned targets from the first model's fold-concatenated targets
+    ref_name = next((m for m in all_names if 'targets' in results.get(m, {})), all_names[0])
+    aligned_y = np.array(results[ref_name]['targets'], dtype=np.float32)
+    data = {'_y_true': aligned_y}
     for m in all_names:
         p = np.array(results[m]['preds'], dtype=np.float32)
-        if len(p) == len(y_true):
+        if len(p) == len(aligned_y):
             data[m] = p
     path = oof_dir / f"{trait_name}_oof.npz"
     np.savez_compressed(path, **data)

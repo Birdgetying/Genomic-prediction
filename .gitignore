@@ -41,3 +41,4 @@
 !submit_wheat_figures.jsub
 !plot_bar_charts.py
 !submit_rice_clean.jsub
+!repair_oof_npz.py
