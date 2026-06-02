@@ -1250,7 +1250,6 @@ ALL_NAMES = TRAD_NAMES + DL_NAMES
 
 # Per-model batch size overrides (default 128; 32 for FGN-prefixed models)
 _MODEL_BS = {'FusionNet': 64, 'AdditiveGenomicNet': 64, 'WheatGP': 32, 'GenomicFM': 32}
-WHEAT_ONLY_DL = {'WheatGP'}
 
 
 def _get_batch_size(mname):
@@ -2159,7 +2158,6 @@ def run_rice(quick_test=True):
                 Xtr_raw, Xte_raw, ytr, gidx_gwas, None, n_snps)
 
             for mi, mname in enumerate(DL_NAMES):
-                if mname in WHEAT_ONLY_DL: continue
                 tp = tuned_params.get(mname, {})
                 model = create_model(mname, n_snps, overrides=tp)
                 t0 = time.time()
@@ -2180,7 +2178,6 @@ def run_rice(quick_test=True):
         print(f"\n  {trait} Final Results:")
         trait_res = {}
         for mname in ALL_NAMES:
-            if mname in WHEAT_ONLY_DL and len(results[mname]['preds']) == 0: continue
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
@@ -2299,7 +2296,6 @@ def run_maize(quick_test=True):
 
             # DL
             for mi, mname in enumerate(DL_NAMES):
-                if mname in WHEAT_ONLY_DL: continue
                 model = create_model(mname, n_snps)
                 t0 = time.time()
                 if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
@@ -2316,7 +2312,6 @@ def run_maize(quick_test=True):
         # Summary
         trait_res = {}
         for mname in ALL_NAMES:
-            if mname in WHEAT_ONLY_DL and len(results[mname]['preds']) == 0: continue
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
