@@ -1196,6 +1196,12 @@ def gwas_select(X, y, top_k):
     return np.argsort(np.abs(num / denom))[-top_k:]
 
 
+def random_snp_select(X, n_snps, seed):
+    """Randomly select n_snps indices from X columns (deterministic, seed-based)."""
+    rng = np.random.RandomState(seed)
+    return rng.choice(X.shape[1], min(n_snps, X.shape[1]), replace=False)
+
+
 def maf_filter(X, threshold=MAF_THRESHOLD):
     af = X.mean(axis=0) / 2.0; maf = np.minimum(af, 1.0 - af)
     return np.where(maf >= threshold)[0]
@@ -1214,6 +1220,68 @@ def _select_dl_markers(Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps):
     sc_dl = StandardScaler(); Xtr_dl_s = sc_dl.fit_transform(Xtr_dl).astype(np.float32)
     Xte_dl_s = sc_dl.transform(Xte_dl).astype(np.float32)
     return gidx_dl, vt_dl, Xtr_dl_s, Xte_dl_s
+
+
+def _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
+                          results, oof_trad_r, oof_dl_r):
+    """Train all models on randomly-selected SNPs (GWAS control experiment).
+
+    Called per-fold after the regular GWAS pass. Uses the same CV split
+    (tr/te) but a different set of SNPs, selected deterministically via
+    ``random_snp_select(seed=42 + fold_i)``.
+
+    Model names are suffixed with ``_random`` in results/oof dicts.
+    """
+    gidx_r = random_snp_select(Xtr_raw, n_snps, seed=42 + fold_i)
+    Xtr_r = Xtr_raw[:, gidx_r]; Xte_r = Xte_raw[:, gidx_r]
+    sc_r = StandardScaler()
+    Xtr_rs = sc_r.fit_transform(Xtr_r).astype(np.float32)
+    Xte_rs = sc_r.transform(Xte_r).astype(np.float32)
+
+    G_fold_train_r = Xtr_rs @ Xtr_rs.T / n_snps
+    G_fold_te_tr_r = Xte_rs @ Xtr_rs.T / n_snps
+
+    # Traditional models (random SNPs)
+    trad_configs_r = _make_trad_configs(G_fold_train_r, G_fold_te_tr_r, n_snps, len(Xtr_rs))
+    for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs_r:
+        t0 = time.time()
+        tmodel = build_fn()
+        fit_fn(tmodel, Xtr_rs, ytr)
+        preds = pred_fn(tmodel, Xte_rs)
+        rname = f'{tname}_random'
+        results[rname]['preds'].extend(preds.tolist())
+        results[rname]['targets'].extend(yte.tolist())
+        results[rname]['time'] += time.time() - t0
+        if fold_i == 0:
+            results[rname]['params'] = param_count
+        oof_trad_r[tname][te_idx] = preds
+
+    # DL models (random SNPs)
+    for mname in DL_NAMES:
+        model = create_model(mname, n_snps)
+        t0 = time.time()
+        if fold_i == 0:
+            results[f'{mname}_random']['params'] = sum(p.numel() for p in model.parameters())
+        bs = _get_batch_size(mname)
+        wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
+        if DEVICE.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        model = train_torch_model(model, Xtr_rs, ytr, epochs=300, batch_size=bs,
+                                  lr=2e-3, weight_decay=wd, patience=30)
+        if DEVICE.type == 'cuda':
+            results[f'{mname}_random']['gpu_mem'] = max(
+                results[f'{mname}_random']['gpu_mem'],
+                torch.cuda.max_memory_allocated() / (1024 * 1024))
+        preds = predict_torch_model(model, Xte_rs)
+        elapsed = time.time() - t0
+        rname = f'{mname}_random'
+        results[rname]['preds'].extend(preds.tolist())
+        results[rname]['targets'].extend(yte.tolist())
+        results[rname]['time'] += elapsed
+        print(f"    {rname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+        if mname in DL_BASE_NAMES:
+            oof_dl_r[mname][te_idx] = preds
+    torch.cuda.empty_cache()
 
 
 def create_model(name, n_snps, overrides=None):
@@ -1254,6 +1322,14 @@ TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
 DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGN v6', 'FGN v7', 'FGN v9', 'FGN v10', 'FGN v11', 'FGNplus', 'GenomicFM', 'FGN PCA', 'WheatGP']
 DL_NAMES = DL_BASE_NAMES + ['FusionNet', 'AdditiveGenomicNet']
 ALL_NAMES = TRAD_NAMES + DL_NAMES
+
+# ---- GWAS vs Random SNP control experiment ----
+# Each base model gets a _random twin trained on randomly-selected SNPs
+# (same CV folds, same hyperparams, different input features)
+ALL_NAMES_RANDOM = [f'{m}_random' for m in ALL_NAMES]
+TRAD_NAMES_R = [f'{m}_random' for m in TRAD_NAMES]
+DL_NAMES_R = [f'{m}_random' for m in DL_NAMES]
+DL_BASE_NAMES_R = [f'{m}_random' for m in DL_BASE_NAMES]
 
 # Per-model batch size overrides (default 128; 32 for FGN-prefixed models)
 _MODEL_BS = {'FusionNet': 64, 'AdditiveGenomicNet': 64, 'WheatGP': 32, 'GenomicFM': 32}
@@ -1485,10 +1561,10 @@ def stacking_evaluate_greedy(oof_preds_dict, targets, n_folds=5, meta_type='Elas
     return result
 
 
-def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
+def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run, suffix=''):
     """Run stacking ensembles and add results to trait_res.
 
-    Produces 6 ensemble variants:
+    Produces 6 ensemble variants (with optional ``suffix`` for _random models):
       - Stacking (DL)        — DL models only, Ridge meta-learner
       - Stacking (All)       — all models, Ridge meta-learner
       - Trad Ensemble        — traditional models only, Ridge
@@ -1515,11 +1591,11 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run):
         if r2 < best_single_r2:
             r2 = best_single_r2
             corr = best_single_corr
-        trait_res[name] = {'R2': r2, 'Correlation': corr, 'RMSE': 0.0,
-                           'Type': TYPE_ENS,
-                           'Meta_weights': result.get('Meta_weights', []),
-                           'Base_models': result.get('Base_models', []),
-                           **extra}
+        trait_res[name + suffix] = {'R2': r2, 'Correlation': corr, 'RMSE': 0.0,
+                                    'Type': TYPE_ENS,
+                                    'Meta_weights': result.get('Meta_weights', []),
+                                    'Base_models': result.get('Base_models', []),
+                                    **extra}
 
     oof_all = {**oof_trad, **oof_dl}
 
@@ -1916,9 +1992,11 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
 
     kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
     results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
-               for m in ALL_NAMES}
+               for m in ALL_NAMES + ALL_NAMES_RANDOM}
     oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
     oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+    oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+    oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
 
     for fi, (tr, te) in enumerate(kf.split(X_all)):
         print(f"\n  --- Fold {fi+1}/{folds_run} ---")
@@ -1990,7 +2068,11 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
                 oof_dl[mname][te] = preds
         torch.cuda.empty_cache()
 
-    # Trait summary
+        # Random SNP pass (GWAS control experiment)
+        _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te, n_snps, fi,
+                              results, oof_trad_r, oof_dl_r)
+
+    # Trait summary — GWAS
     print(f"\n  {'-'*70}\n  {trait_name} Final Results:\n  "
           f"{'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
     trait_res = {}
@@ -2011,9 +2093,27 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
             'GPUMem': results[mname].get('gpu_mem', 0.0)}
         print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} "
               f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
+    # Trait summary — Random SNP
+    for mname in ALL_NAMES_RANDOM:
+        p = np.array(results[mname]['preds'])
+        t = np.array(results[mname]['targets'])
+        r2_v = float(r2_score(t, p))
+        corr_v = float(pearsonr(t, p)[0])
+        rmse_v = float(np.sqrt(np.mean((p - t) ** 2)))
+        base = mname.replace('_random', '')
+        trait_res[mname] = {
+            'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+            'Type': _model_type(base),
+            'Time': results[mname]['time'] / folds_run,
+            'Params': results[mname].get('params', 0),
+            'GPUMem': results[mname].get('gpu_mem', 0.0)}
+        print(f"  {mname:<22s} {r2_v:8.4f} {corr_v:8.4f} "
+              f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
 
     _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+    _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
     _save_oof_npz(results, ALL_NAMES, output_dir, trait_name)
+    _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait_name}_random")
     if not quick_test:
         deploy_models(X_all, y, n_snps, trait_name, output_dir,
                       tuned_params, quick_test)
@@ -2144,9 +2244,12 @@ def run_rice(quick_test=True):
                 print(f"    {tune_name}: val R2={best_r2:.4f}")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
+                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
         oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
         oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
         for fi, (tr, te) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fi+1}/{folds_run} ---")
             Xtr_raw, Xte_raw = X_all[tr], X_all[te]; ytr, yte = y[tr], y[te]
@@ -2194,7 +2297,11 @@ def run_rice(quick_test=True):
                 if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
             torch.cuda.empty_cache()
 
-        # Summary
+            # Random SNP pass (GWAS control experiment)
+            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te, n_snps, fi,
+                                  results, oof_trad_r, oof_dl_r)
+
+        # Summary — GWAS
         print(f"\n  {trait} Final Results:")
         trait_res = {}
         for mname in ALL_NAMES:
@@ -2204,12 +2311,24 @@ def run_rice(quick_test=True):
             trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
             'GPUMem': results[mname].get('gpu_mem', 0.0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+        # Summary — Random SNP
+        for mname in ALL_NAMES_RANDOM:
+            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
+            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
+            base = mname.replace('_random', '')
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
+                                'Time': results[mname]['time']/folds_run,
+                                'Params': results[mname].get('params', 0),
+                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         _save_oof_npz(results, ALL_NAMES, output_dir, trait)
+        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
 
@@ -2293,9 +2412,12 @@ def run_maize(quick_test=True):
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
+                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
         oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
         oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
         for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
             Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
@@ -2338,7 +2460,11 @@ def run_maize(quick_test=True):
                 if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
             torch.cuda.empty_cache()
 
-        # Summary
+            # Random SNP pass (GWAS control experiment)
+            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
+                                  results, oof_trad_r, oof_dl_r)
+
+        # Summary — GWAS
         trait_res = {}
         for mname in ALL_NAMES:
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
@@ -2347,12 +2473,24 @@ def run_maize(quick_test=True):
             trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
             'GPUMem': results[mname].get('gpu_mem', 0.0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+        # Summary — Random SNP
+        for mname in ALL_NAMES_RANDOM:
+            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
+            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
+            base = mname.replace('_random', '')
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
+                                'Time': results[mname]['time']/folds_run,
+                                'Params': results[mname].get('params', 0),
+                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         _save_oof_npz(results, ALL_NAMES, output_dir, trait)
+        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
 
@@ -2462,9 +2600,12 @@ def run_soybean(quick_test=True):
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
+                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
         oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
         oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
         for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
             Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
@@ -2507,7 +2648,11 @@ def run_soybean(quick_test=True):
                 if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
             torch.cuda.empty_cache()
 
-        # Summary
+            # Random SNP pass (GWAS control experiment)
+            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
+                                  results, oof_trad_r, oof_dl_r)
+
+        # Summary — GWAS
         trait_res = {}
         for mname in ALL_NAMES:
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
@@ -2516,12 +2661,26 @@ def run_soybean(quick_test=True):
             trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
             'GPUMem': results[mname].get('gpu_mem', 0.0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+        # Summary — Random SNP
+        for mname in ALL_NAMES_RANDOM:
+            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
+            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
+            base = mname.replace('_random', '')
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
+                                'Time': results[mname]['time']/folds_run,
+                                'Params': results[mname].get('params', 0),
+                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run,
+                                 name_suffix='_random', trad_names=TRAD_NAMES_R,
+                                 dl_names=DL_BASE_NAMES_R)
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         _save_oof_npz(results, ALL_NAMES, output_dir, trait)
+        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
 
@@ -2560,9 +2719,12 @@ def run_wheat_gabi(quick_test=True):
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
+                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
         oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
         oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
         for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
             print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
             Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
@@ -2605,7 +2767,11 @@ def run_wheat_gabi(quick_test=True):
                 if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
             torch.cuda.empty_cache()
 
-        # Summary
+            # Random SNP pass (GWAS control experiment)
+            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
+                                  results, oof_trad_r, oof_dl_r)
+
+        # Summary — GWAS
         trait_res = {}
         for mname in ALL_NAMES:
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
@@ -2614,12 +2780,24 @@ def run_wheat_gabi(quick_test=True):
             trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
             'GPUMem': results[mname].get('gpu_mem', 0.0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+        # Summary — Random SNP
+        for mname in ALL_NAMES_RANDOM:
+            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
+            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
+            base = mname.replace('_random', '')
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
+                                'Time': results[mname]['time']/folds_run,
+                                'Params': results[mname].get('params', 0),
+                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         _save_oof_npz(results, ALL_NAMES, output_dir, trait)
+        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
         if not quick_test:
             deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
 
@@ -2671,8 +2849,11 @@ _MODEL_COLORS_ENS = {'Stacking (DL)': '#66BB6A', 'Stacking (All)': '#2E7D32',
 
 
 def _model_color(name):
-    if name in _MODEL_COLORS_TRAD: return _MODEL_COLORS_TRAD[name]
-    if name in _MODEL_COLORS_DL: return _MODEL_COLORS_DL[name]
+    # Strip _random suffix for color lookup (GWAS vs random share color)
+    base = name.replace('_random', '')
+    if base in _MODEL_COLORS_TRAD: return _MODEL_COLORS_TRAD[base]
+    if base in _MODEL_COLORS_DL: return _MODEL_COLORS_DL[base]
+    if base in _MODEL_COLORS_ENS: return _MODEL_COLORS_ENS[base]
     if name in _MODEL_COLORS_ENS: return _MODEL_COLORS_ENS[name]
     return '#BDBDBD'
 
@@ -2889,10 +3070,13 @@ def generate_scatter_plots(fig_dir=None):
     generated = 0
     N_TOP = 4
 
-    for tag, sub, fig_prefix in [
-        ('Rice', 'rice', '05'),
-        ('Maize', 'maize', '06'),
-        ('Wheat2000', 'wheat2000', '11'),
+    for tag, sub, fig_prefix, npz_suffix in [
+        ('Rice', 'rice', '05', ''),
+        ('Maize', 'maize', '06', ''),
+        ('Wheat2000', 'wheat2000', '11', ''),
+        ('Rice (random)', 'rice', '05r', '_random'),
+        ('Maize (random)', 'maize', '06r', '_random'),
+        ('Wheat2000 (random)', 'wheat2000', '11r', '_random'),
     ]:
         oof_dir = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "oof_predictions"
         if not oof_dir.exists():
@@ -2904,16 +3088,19 @@ def generate_scatter_plots(fig_dir=None):
             continue
 
         traits = sorted(results_d.keys())
+        # For random SNP pass, select only random models
+        model_filter_suffix = npz_suffix
         nrows = len(traits)
         ncols = N_TOP
         fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.8))
         if nrows == 1:
             axes = axes.reshape(1, -1)
-        fig.suptitle(f'{tag}: Top-{N_TOP} Single-Model OOF Predictions (per trait)',
+        snp_label = ' (Random SNPs)' if npz_suffix else ''
+        fig.suptitle(f'{tag}: Top-{N_TOP} Single-Model OOF Predictions{snp_label} (per trait)',
                      fontsize=14, fontweight='bold')
 
         for row_idx, trait in enumerate(traits):
-            npz_path = oof_dir / f"{trait}_oof.npz"
+            npz_path = oof_dir / f"{trait}{npz_suffix}_oof.npz"
             if not npz_path.exists():
                 for ci in range(ncols):
                     axes[row_idx, ci].axis('off')
@@ -2923,11 +3110,13 @@ def generate_scatter_plots(fig_dir=None):
             y_true = npz_data['_y_true']
             yt_min, yt_max = y_true.min(), y_true.max()
 
-            # Top-4 single models for this trait
+            # Top-4 single models for this trait (GWAS or random depending on suffix)
             single_r2 = {
                 m: results_d[trait][m]['R2']
                 for m in results_d[trait]
-                if 'Stacking' not in m and 'Ensemble' not in m and m in npz_data
+                if 'Stacking' not in m and 'Ensemble' not in m
+                and m.endswith(model_filter_suffix)
+                and m in npz_data
             }
             top_models = sorted(single_r2, key=single_r2.get, reverse=True)[:N_TOP]
 
