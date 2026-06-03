@@ -1886,7 +1886,8 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
                         quick_test):
     """Run ensemble pipeline for a single trait. Returns trait_res dict.
 
-    Shared by run_wheat(), run_wheat2000(), run_rice(), run_maize().
+    Shared by run_wheat() and run_wheat2000() only.
+    (run_rice, run_maize, run_soybean, run_wheat_gabi inline their own loops.)
     vt_all can be None (CSV data w/o variant type annotations) or a real
     per-marker variant-type array (VCF data).
     """
@@ -2389,6 +2390,14 @@ def load_easygese_data(data_dir, trait_names=None):
     with open(os.path.join(data_dir, "trait_data.json"), encoding='utf-8') as f:
         trait_info = json.load(f)
 
+    # Low-variance filter on full matrix (once, not per-trait)
+    var_thresh = 0.005
+    vars_per_marker = np.var(G, axis=0)
+    keep = vars_per_marker >= var_thresh
+    if keep.sum() < G.shape[1]:
+        G = G[:, keep]
+        print(f"  Low-variance filter: {G.shape[1]} markers kept ({G.shape[1]} -> {keep.sum()})")
+
     # Detect numeric trait keys (sorted by suffix number)
     num_keys = sorted([k for k in trait_info if k.startswith('trait_') and k[6:].isdigit()],
                       key=lambda k: int(k[6:]))
@@ -2535,8 +2544,6 @@ def run_wheat_gabi(quick_test=True):
     traits = sorted(trait_data.keys())
     print(f"\nTraits: {traits}")
 
-    var_thresh = 0.005
-
     traits_run = traits[:1] if quick_test else traits
     folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
     if quick_test: print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
@@ -2546,11 +2553,6 @@ def run_wheat_gabi(quick_test=True):
     for trait in traits_run:
         print(f"\n{'='*60}\nTrait: {trait}\n{'='*60}")
         X_all, y = trait_data[trait]; y = y.astype(np.float32)
-        # Low-variance filter per trait (samples may differ due to missing data)
-        vars_per_marker = np.var(X_all, axis=0); keep = vars_per_marker >= var_thresh
-        if keep.sum() < X_all.shape[1]:
-            X_all = X_all[:, keep]
-            print(f"  Low-variance filter: {X_all.shape[1]} markers kept")
         n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
 
