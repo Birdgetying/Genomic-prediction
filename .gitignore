@@ -43,3 +43,7 @@
 !submit_rice_clean.jsub
 !repair_oof_npz.py
 !figures/
+!results/
+results/*
+!results/soybean_SoySNP50K/
+!results/wheat_GABI/

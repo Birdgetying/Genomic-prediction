@@ -87,6 +87,13 @@ RICE_DATA_DIR = PROJECT_DIR + "/results/rice_data"
 # Maize data paths
 MAIZE_DATA_DIR = PROJECT_DIR + "/data2"
 
+# Soybean data paths (EasyGeSe benchmark — SoySNP50K chip)
+SOYBEAN_DATA_DIR = PROJECT_DIR + "/results/soybean_SoySNP50K"
+SOYBEAN_TRAIT_NAMES = ['Canopy_wilting', 'Water_use_efficiency']
+
+# Wheat GABI data paths (EasyGeSe benchmark — iSELECT 90k chip)
+WHEAT_GABI_DATA_DIR = PROJECT_DIR + "/results/wheat_GABI"
+
 # Seed
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
@@ -2353,8 +2360,268 @@ def run_maize(quick_test=True):
 
 
 # ============================================================================
-# Section L: Visualization
+# Section K2: EasyGeSe Benchmark Data Loader + Soybean / Wheat GABI Pipelines
 # ============================================================================
+
+def load_easygese_data(data_dir, trait_names=None):
+    """Generic loader for genotype_matrix.npz + trait_data.json format.
+
+    Automatically handles both numeric trait keys (trait_00, trait_01, …) and
+    semantic trait names via an optional ``_trait_names`` metadata field in the
+    JSON.
+
+    Parameters
+    ----------
+    data_dir : str
+        Path to the data directory containing ``genotype_matrix.npz`` and
+        ``trait_data.json``.
+    trait_names : list of str or None
+        Manual override for trait names.  If ``None`` the function tries to
+        read ``_trait_names`` from the JSON; if that is also missing the raw
+        numeric keys (``trait_00``, …) are used verbatim.
+
+    Returns
+    -------
+    trait_data : dict {trait_name: (X, y)}
+    """
+    data = np.load(os.path.join(data_dir, "genotype_matrix.npz"), allow_pickle=True)
+    G = data['G']
+    with open(os.path.join(data_dir, "trait_data.json"), encoding='utf-8') as f:
+        trait_info = json.load(f)
+
+    # Detect numeric trait keys (sorted by suffix number)
+    num_keys = sorted([k for k in trait_info if k.startswith('trait_') and k[6:].isdigit()],
+                      key=lambda k: int(k[6:]))
+    if not num_keys:
+        raise ValueError(f"No `trait_NN` keys found in {data_dir}/trait_data.json")
+
+    # Resolve semantic names
+    if trait_names is None:
+        trait_names = trait_info.get('_trait_names', None)
+    if trait_names is None:
+        trait_names = num_keys  # fall back to numeric keys
+
+    if len(trait_names) < len(num_keys):
+        print(f"  [WARN] Only {len(trait_names)} trait names for {len(num_keys)} keys; "
+              f"using provided names + numeric fallback")
+        trait_names = list(trait_names) + num_keys[len(trait_names):]
+
+    print(f"  {G.shape[0]} samples x {G.shape[1]} SNPs  |  {len(num_keys)} traits")
+
+    trait_data = {}
+    for i, key in enumerate(num_keys):
+        tname = trait_names[i]
+        td = trait_info[key]
+        idxs = td['genotype_indices']
+        y = np.array(td['values']).astype(np.float32)
+        X_t = G[idxs]
+        mask = ~np.isnan(y)
+        trait_data[tname] = (X_t[mask], y[mask])
+
+    return trait_data
+
+
+def run_soybean(quick_test=True):
+    """Soybean SoySNP50K ensemble pipeline.
+
+    Source: Kaler et al. (2017) TAG.  SoySNP50K chip, 346 US soybean genotypes,
+    20 526 SNPs, 2 abiotic-stress traits (canopy wilting, water-use efficiency).
+    """
+    _script_dir = Path(__file__).resolve().parent
+    output_dir = _script_dir / "results" / "soybean_ensemble"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
+    if DEVICE.type == 'cuda': print(f"GPU: {torch.cuda.get_device_name(0)}")
+    trait_data = load_easygese_data(SOYBEAN_DATA_DIR, SOYBEAN_TRAIT_NAMES)
+    traits = sorted(trait_data.keys())
+    print(f"\nTraits: {traits}")
+
+    traits_run = traits[:1] if quick_test else traits
+    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
+    if quick_test: print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
+
+    total_t0 = time.time(); all_results = {}
+
+    for trait in traits_run:
+        print(f"\n{'='*60}\nTrait: {trait}\n{'='*60}")
+        X_all, y = trait_data[trait]; y = y.astype(np.float32)
+        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
+        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
+
+        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
+        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+        for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
+            print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
+            Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
+            maf_idx = maf_filter(Xtr_raw, MAF_THRESHOLD)
+            if len(maf_idx) >= n_snps:
+                gidx = gwas_select(Xtr_raw[:, maf_idx], ytr, n_snps); gidx = maf_idx[gidx]
+            else: gidx = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr = Xtr_raw[:, gidx]; Xte = Xte_raw[:, gidx]
+            sc = StandardScaler(); Xtr_s = sc.fit_transform(Xtr).astype(np.float32); Xte_s = sc.transform(Xte).astype(np.float32)
+
+            G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
+
+            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr_idx))
+            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
+                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
+                preds = pred_fn(tmodel, Xte_s)
+                results[tname]['preds'].extend(preds.tolist()); results[tname]['targets'].extend(yte.tolist())
+                results[tname]['time'] += time.time() - t0
+                if fold_i == 0: results[tname]['params'] = param_count
+                oof_trad[tname][te_idx] = preds
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
+
+            # DL
+            for mi, mname in enumerate(DL_NAMES):
+                model = create_model(mname, n_snps)
+                t0 = time.time()
+                if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
+                bs = _get_batch_size(mname)
+                wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
+                if DEVICE.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats()
+                model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
+                if DEVICE.type == 'cuda':
+                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
+                        torch.cuda.max_memory_allocated() / (1024 * 1024))
+                preds = predict_torch_model(model, Xte_s)
+                elapsed = time.time() - t0
+                results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
+                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
+            torch.cuda.empty_cache()
+
+        # Summary
+        trait_res = {}
+        for mname in ALL_NAMES:
+            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
+            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
+            mtype = _model_type(mname)
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
+            'GPUMem': results[mname].get('gpu_mem', 0.0)}
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+
+        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        all_results[trait] = trait_res
+        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
+        if not quick_test:
+            deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
+
+    if not quick_test:
+        _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Soybean')
+    else:
+        print("\nSoybean Quick Test Done!")
+
+
+def run_wheat_gabi(quick_test=True):
+    """Wheat GABI iSELECT 90k ensemble pipeline.
+
+    Source: Gogna et al. (2022) Scientific Data.  iSELECT 90k SNP chip,
+    371 European elite winter/spring wheat lines, 12 546 SNPs, 16 traits.
+    """
+    _script_dir = Path(__file__).resolve().parent
+    output_dir = _script_dir / "results" / "wheat_gabi_ensemble"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
+    if DEVICE.type == 'cuda': print(f"GPU: {torch.cuda.get_device_name(0)}")
+    trait_data = load_easygese_data(WHEAT_GABI_DATA_DIR)
+    traits = sorted(trait_data.keys())
+    print(f"\nTraits: {traits}")
+
+    var_thresh = 0.005
+
+    traits_run = traits[:1] if quick_test else traits
+    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
+    if quick_test: print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
+
+    total_t0 = time.time(); all_results = {}
+
+    for trait in traits_run:
+        print(f"\n{'='*60}\nTrait: {trait}\n{'='*60}")
+        X_all, y = trait_data[trait]; y = y.astype(np.float32)
+        # Low-variance filter per trait (samples may differ due to missing data)
+        vars_per_marker = np.var(X_all, axis=0); keep = vars_per_marker >= var_thresh
+        if keep.sum() < X_all.shape[1]:
+            X_all = X_all[:, keep]
+            print(f"  Low-variance filter: {X_all.shape[1]} markers kept")
+        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
+        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
+
+        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
+        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
+        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+        for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
+            print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
+            Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
+            maf_idx = maf_filter(Xtr_raw, MAF_THRESHOLD)
+            if len(maf_idx) >= n_snps:
+                gidx = gwas_select(Xtr_raw[:, maf_idx], ytr, n_snps); gidx = maf_idx[gidx]
+            else: gidx = gwas_select(Xtr_raw, ytr, n_snps)
+            Xtr = Xtr_raw[:, gidx]; Xte = Xte_raw[:, gidx]
+            sc = StandardScaler(); Xtr_s = sc.fit_transform(Xtr).astype(np.float32); Xte_s = sc.transform(Xte).astype(np.float32)
+
+            G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
+
+            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr_idx))
+            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
+                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
+                preds = pred_fn(tmodel, Xte_s)
+                results[tname]['preds'].extend(preds.tolist()); results[tname]['targets'].extend(yte.tolist())
+                results[tname]['time'] += time.time() - t0
+                if fold_i == 0: results[tname]['params'] = param_count
+                oof_trad[tname][te_idx] = preds
+                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
+
+            # DL
+            for mi, mname in enumerate(DL_NAMES):
+                model = create_model(mname, n_snps)
+                t0 = time.time()
+                if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
+                bs = _get_batch_size(mname)
+                wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
+                if DEVICE.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats()
+                model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
+                if DEVICE.type == 'cuda':
+                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
+                        torch.cuda.max_memory_allocated() / (1024 * 1024))
+                preds = predict_torch_model(model, Xte_s)
+                elapsed = time.time() - t0
+                results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
+                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
+                if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
+            torch.cuda.empty_cache()
+
+        # Summary
+        trait_res = {}
+        for mname in ALL_NAMES:
+            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
+            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
+            mtype = _model_type(mname)
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
+            'GPUMem': results[mname].get('gpu_mem', 0.0)}
+            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
+
+        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
+        all_results[trait] = trait_res
+        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
+        if not quick_test:
+            deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
+
+    if not quick_test:
+        _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Wheat GABI')
+    else:
+        print("\nWheat GABI Quick Test Done!")
 
 def _save_oof_npz(results, all_names, output_dir, trait_name):
     """Save per-model OOF predictions as NPZ for later scatter plot generation.
@@ -2844,13 +3111,15 @@ if __name__ == '__main__':
     crop = sys.argv[1] if len(sys.argv) > 1 else ''
     full_mode = '--full' in sys.argv
 
-    if crop not in ('wheat', 'wheat2000', 'rice', 'maize', 'all'):
-        print("Usage: python genomic_ensemble.py <wheat|wheat2000|rice|maize|all> [--full]")
+    if crop not in ('wheat', 'wheat2000', 'rice', 'maize', 'soybean', 'wheatgabi', 'all'):
+        print("Usage: python genomic_ensemble.py <wheat|wheat2000|rice|maize|soybean|wheatgabi|all> [--full]")
         print("  wheat     — Run wheat ensemble pipeline (VCF data)")
         print("  wheat2000 — Run wheat2000 ensemble pipeline (CSV data, 2000×33K)")
         print("  rice      — Run rice ensemble pipeline")
         print("  maize     — Run maize ensemble pipeline")
-        print("  all       — Run wheat+rice+maize pipelines")
+        print("  soybean   — Run soybean SoySNP50K ensemble pipeline")
+        print("  wheatgabi — Run wheat GABI iSELECT 90k ensemble pipeline")
+        print("  all       — Run wheat+rice+maize+soybean+wheatgabi pipelines")
         print("  --full    — Full mode (all traits x 5 folds)")
         sys.exit(1)
 
@@ -2863,7 +3132,7 @@ if __name__ == '__main__':
     if crop == 'all':
         import subprocess
         procs = []
-        all_crops = ['wheat', 'wheat2000', 'rice', 'maize']
+        all_crops = ['wheat', 'wheat2000', 'rice', 'maize', 'soybean', 'wheatgabi']
         for c in all_crops:
             cmd = [sys.executable, __file__, c]
             if full_mode:
@@ -2878,6 +3147,8 @@ if __name__ == '__main__':
         if crop == 'wheat2000': run_wheat2000(quick_test=not full_mode)
         if crop == 'rice': run_rice(quick_test=not full_mode)
         if crop == 'maize': run_maize(quick_test=not full_mode)
+        if crop == 'soybean': run_soybean(quick_test=not full_mode)
+        if crop == 'wheatgabi': run_wheat_gabi(quick_test=not full_mode)
 
     # Auto-generate visualization figures in full mode
     if full_mode:
