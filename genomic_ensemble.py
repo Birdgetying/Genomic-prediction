@@ -372,7 +372,11 @@ class _SpectralBranch(nn.Module):
     def __init__(self, n_freq, n_spec, ch, dropout, max_freq=None):
         super().__init__()
         self.n_spec = n_spec
-        self.max_freq = max_freq or n_freq
+        # Clamp max_freq so we never exceed the actual FFT output size
+        raw_max = max_freq or n_freq
+        if raw_max > n_freq:
+            raw_max = n_freq
+        self.max_freq = raw_max
         self.spec_r = nn.Parameter(torch.randn(1, n_spec, self.max_freq) * 0.02)
         self.spec_i = nn.Parameter(torch.randn(1, n_spec, self.max_freq) * 0.02)
         self.freq_conv_r = nn.Sequential(
@@ -884,8 +888,8 @@ class FGN_PCA(nn.Module):
         self.conv_path = nn.Sequential(
             nn.Conv1d(1, hidden, 21, padding=10), nn.BatchNorm1d(hidden), nn.GELU(),
             nn.Dropout(dropout * 0.5))
-        self.V = nn.Parameter(torch.randn(n_features, fm_k) * 0.001)
-        self.fm_scale = nn.Parameter(torch.zeros(1))
+        self.V = nn.Parameter(torch.randn(n_features, fm_k) * 0.01)
+        self.fm_scale = nn.Parameter(torch.tensor(0.5))
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Sequential(
             nn.Linear(hidden * 2 + fm_k, hidden * 2), nn.GELU(), nn.Dropout(dropout),
@@ -1045,7 +1049,7 @@ def predict_bagged_ensemble(models, feat_indices, X):
 def train_torch_model(model, X_train, y_train,
                       epochs=300, batch_size=128, lr=1e-3, weight_decay=1e-4,
                       patience=30, val_ratio=0.15, grad_clip=1.0,
-                      use_swa=False, use_mixup=True, mixup_alpha=0.4,
+                      use_swa=False, use_mixup=False, mixup_alpha=0.4,
                       label_smooth=0.0, colsample=1.0, l1_lambda=0.0):
     model = model.to(DEVICE)
     n_total = len(X_train)
@@ -1967,8 +1971,7 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
             if fi == 0:
                 results[mname]['params'] = sum(
                     p.numel() for p in model.parameters())
-            bs = 64 if mname in ('FusionNet', 'AdditiveGenomicNet') else 128
-            bs = 32 if mname.startswith('FGN') or mname in ('GenomicFM', 'WheatGP') else bs
+            bs = _get_batch_size(mname)
             lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
             wd = tp.get('weight_decay',
                         5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
@@ -2941,6 +2944,7 @@ def generate_scatter_plots(fig_dir=None):
                 pad = (mx - mn) * 0.08
                 ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad],
                         '--', color='#E53935', alpha=0.4, lw=1.0)
+                r2_val = single_r2[mname]
                 ax.set_title(f'{mname}\nR²={r2_val:.3f}', fontsize=7, fontweight='bold')
                 ax.set_xlabel('True', fontsize=6)
                 ax.set_ylabel('Predicted', fontsize=6)
