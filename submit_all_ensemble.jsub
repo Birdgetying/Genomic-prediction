@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 全基因组预测集成系统 — 小麦(CSIAAS) + 小麦2000 + 水稻 + 玉米 超算 GPU 作业
+# 全基因组预测集成系统 — 小麦 + 小麦2000 + 水稻 + 玉米 + 大豆 + 小麦GABI 超算 GPU 作业
+# 包含 GWAS vs Random SNP 对照实验
 #
 # 使用: jsub < submit_all_ensemble.jsub
 # ============================================================================
@@ -12,7 +13,7 @@
 #JSUB -e logs/all_ensemble_%J.err
 
 echo "======================================================================"
-echo "All Ensemble System (Wheat + Wheat2000 + Rice + Maize) — $(date)"
+echo "All Ensemble System (Wheat/Wheat2000/Rice/Maize/Soybean/WheatGABI) — $(date)"
 echo "======================================================================"
 
 module load pytorch-2.3.0_py311
@@ -36,7 +37,9 @@ echo "GPU Diagnostics:"
 nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv 2>&1 || echo "nvidia-smi not available"
 python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
 
-mkdir -p logs results/wheat_ensemble results/wheat2000_ensemble results/rice_ensemble results/maize_ensemble
+mkdir -p logs \
+  results/wheat_ensemble results/wheat2000_ensemble results/rice_ensemble \
+  results/maize_ensemble results/soybean_ensemble results/wheat_gabi_ensemble
 
 EXIT_CODE=0
 TOTAL_START=$(date +%s)
@@ -46,7 +49,7 @@ TOTAL_START=$(date +%s)
 # ============================================================================
 echo ""
 echo "======================================================================"
-echo "[1/4] WHEAT ENSEMBLE (CSIAAS) — $(date)"
+echo "[1/6] WHEAT ENSEMBLE (CSIAAS) — $(date)"
 echo "======================================================================"
 
 DATA_BASE="/storage/public/home/2024110093/data/Variation/CSIAAS"
@@ -82,7 +85,7 @@ fi
 # ============================================================================
 echo ""
 echo "======================================================================"
-echo "[2/4] WHEAT2000 ENSEMBLE — $(date)"
+echo "[2/6] WHEAT2000 ENSEMBLE — $(date)"
 echo "======================================================================"
 
 WHEAT2000_DATA="dnngp_data/wheat2000/SNP_origin"
@@ -120,7 +123,7 @@ fi
 # ============================================================================
 echo ""
 echo "======================================================================"
-echo "[3/4] RICE ENSEMBLE — $(date)"
+echo "[3/6] RICE ENSEMBLE — $(date)"
 echo "======================================================================"
 
 MISSING=0
@@ -149,7 +152,7 @@ fi
 # ============================================================================
 echo ""
 echo "======================================================================"
-echo "[4/4] MAIZE ENSEMBLE (Iranian) — $(date)"
+echo "[4/6] MAIZE ENSEMBLE (Iranian) — $(date)"
 echo "======================================================================"
 
 MISSING=0
@@ -172,6 +175,64 @@ else
     T1=$(date +%s)
     echo "Maize finished in $(((T1-T0)/60)) min, exit=$MAIZE_EXIT"
     [ $MAIZE_EXIT -ne 0 ] && EXIT_CODE=$MAIZE_EXIT
+fi
+
+# ============================================================================
+# 5. Soybean SoySNP50K
+# ============================================================================
+echo ""
+echo "======================================================================"
+echo "[5/6] SOYBEAN ENSEMBLE (SoySNP50K) — $(date)"
+echo "======================================================================"
+
+MISSING=0
+for f in "results/soybean_SoySNP50K/genotype_matrix.npz" "results/soybean_SoySNP50K/trait_data.json"; do
+    if [ -f "$f" ]; then
+        echo "  [OK] $f"
+    else
+        echo "  [MISSING] $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Missing soybean data files, skipping"
+else
+    T0=$(date +%s)
+    python -u genomic_ensemble.py soybean --full 2>&1 | tee "logs/soybean_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    SOY_EXIT=${PIPESTATUS[0]}
+    T1=$(date +%s)
+    echo "Soybean finished in $(((T1-T0)/60)) min, exit=$SOY_EXIT"
+    [ $SOY_EXIT -ne 0 ] && EXIT_CODE=$SOY_EXIT
+fi
+
+# ============================================================================
+# 6. Wheat GABI iSELECT 90k
+# ============================================================================
+echo ""
+echo "======================================================================"
+echo "[6/6] WHEAT GABI ENSEMBLE (iSELECT 90k) — $(date)"
+echo "======================================================================"
+
+MISSING=0
+for f in "results/wheat_GABI/genotype_matrix.npz" "results/wheat_GABI/trait_data.json"; do
+    if [ -f "$f" ]; then
+        echo "  [OK] $f"
+    else
+        echo "  [MISSING] $f"
+        MISSING=1
+    fi
+done
+
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Missing wheat GABI data files, skipping"
+else
+    T0=$(date +%s)
+    python -u genomic_ensemble.py wheatgabi --full 2>&1 | tee "logs/wheatgabi_ensemble_$(date +%Y%m%d_%H%M%S).log"
+    WGABI_EXIT=${PIPESTATUS[0]}
+    T1=$(date +%s)
+    echo "Wheat GABI finished in $(((T1-T0)/60)) min, exit=$WGABI_EXIT"
+    [ $WGABI_EXIT -ne 0 ] && EXIT_CODE=$WGABI_EXIT
 fi
 
 # ============================================================================

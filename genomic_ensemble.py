@@ -1223,15 +1223,18 @@ def _select_dl_markers(Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps):
 
 
 def _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
-                          results, oof_trad_r, oof_dl_r):
+                          results, oof_trad_r, oof_dl_r, tuned_params=None):
     """Train all models on randomly-selected SNPs (GWAS control experiment).
 
     Called per-fold after the regular GWAS pass. Uses the same CV split
     (tr/te) but a different set of SNPs, selected deterministically via
     ``random_snp_select(seed=42 + fold_i)``.
 
+    When ``tuned_params`` is provided, it is used for DL model hyperparams
+    (mirroring the GWAS pass) to ensure a fair controlled experiment.
     Model names are suffixed with ``_random`` in results/oof dicts.
     """
+    tp = tuned_params or {}
     gidx_r = random_snp_select(Xtr_raw, n_snps, seed=42 + fold_i)
     Xtr_r = Xtr_raw[:, gidx_r]; Xte_r = Xte_raw[:, gidx_r]
     sc_r = StandardScaler()
@@ -1258,16 +1261,19 @@ def _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
 
     # DL models (random SNPs)
     for mname in DL_NAMES:
-        model = create_model(mname, n_snps)
+        model_tp = tp.get(mname, {})
+        model = create_model(mname, n_snps, overrides=model_tp)
         t0 = time.time()
         if fold_i == 0:
             results[f'{mname}_random']['params'] = sum(p.numel() for p in model.parameters())
         bs = _get_batch_size(mname)
-        wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
+        lr = model_tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
+        wd = model_tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
+        pat = model_tp.get('patience', 30)
         if DEVICE.type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
         model = train_torch_model(model, Xtr_rs, ytr, epochs=300, batch_size=bs,
-                                  lr=2e-3, weight_decay=wd, patience=30)
+                                  lr=lr, weight_decay=wd, patience=pat)
         if DEVICE.type == 'cuda':
             results[f'{mname}_random']['gpu_mem'] = max(
                 results[f'{mname}_random']['gpu_mem'],
@@ -2070,7 +2076,7 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
 
         # Random SNP pass (GWAS control experiment)
         _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te, n_snps, fi,
-                              results, oof_trad_r, oof_dl_r)
+                              results, oof_trad_r, oof_dl_r, tuned_params)
 
     # Trait summary — GWAS
     print(f"\n  {'-'*70}\n  {trait_name} Final Results:\n  "
@@ -2673,9 +2679,7 @@ def run_soybean(quick_test=True):
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run,
-                                 name_suffix='_random', trad_names=TRAD_NAMES_R,
-                                 dl_names=DL_BASE_NAMES_R)
+        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
         all_results[trait] = trait_res
         with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
@@ -2854,7 +2858,6 @@ def _model_color(name):
     if base in _MODEL_COLORS_TRAD: return _MODEL_COLORS_TRAD[base]
     if base in _MODEL_COLORS_DL: return _MODEL_COLORS_DL[base]
     if base in _MODEL_COLORS_ENS: return _MODEL_COLORS_ENS[base]
-    if name in _MODEL_COLORS_ENS: return _MODEL_COLORS_ENS[name]
     return '#BDBDBD'
 
 
@@ -3069,6 +3072,7 @@ def generate_scatter_plots(fig_dir=None):
     print("\n[plot] Generating top-4 per-trait scatter figures from OOF predictions...")
     generated = 0
     N_TOP = 4
+    json_cache = {}  # avoid re-loading same JSON per sub
 
     for tag, sub, fig_prefix, npz_suffix in [
         ('Rice', 'rice', '05', ''),
@@ -3082,8 +3086,10 @@ def generate_scatter_plots(fig_dir=None):
         if not oof_dir.exists():
             continue
 
-        json_path = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json"
-        results_d = _load_json_safe(json_path)
+        if sub not in json_cache:
+            json_cache[sub] = _load_json_safe(
+                SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
+        results_d = json_cache[sub]
         if not results_d:
             continue
 
