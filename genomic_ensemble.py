@@ -372,11 +372,7 @@ class _SpectralBranch(nn.Module):
     def __init__(self, n_freq, n_spec, ch, dropout, max_freq=None):
         super().__init__()
         self.n_spec = n_spec
-        # Clamp max_freq so we never exceed the actual FFT output size
-        raw_max = max_freq or n_freq
-        if raw_max > n_freq:
-            raw_max = n_freq
-        self.max_freq = raw_max
+        self.max_freq = min(max_freq or n_freq, n_freq)  # clamp to FFT output size
         self.spec_r = nn.Parameter(torch.randn(1, n_spec, self.max_freq) * 0.02)
         self.spec_i = nn.Parameter(torch.randn(1, n_spec, self.max_freq) * 0.02)
         self.freq_conv_r = nn.Sequential(
@@ -1654,7 +1650,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
                                       input_dropout=overrides['input_dropout'],
                                       n_spec=overrides['n_spec'],
                                       droppath=overrides['droppath'])
-            bs = 32
+            bs = _get_batch_size(model_name)
         elif model_name == 'FGNplus':
             overrides = {'hidden': trial.suggest_categorical('hidden', [48, 64, 96]),
                          'dropout': trial.suggest_float('dropout', 0.25, 0.5),
@@ -1665,7 +1661,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             model = FGNplus(n_snps=n_snps, hidden=overrides['hidden'],
                             dropout=overrides['dropout'],
                             input_dropout=overrides['input_dropout'])
-            bs = 32
+            bs = _get_batch_size(model_name)
         elif model_name == 'FGN v4':
             overrides = {'hidden': trial.suggest_categorical('hidden', [48, 64, 96]),
                          'dropout': trial.suggest_float('dropout', 0.2, 0.5),
@@ -1675,7 +1671,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
                          'patience': trial.suggest_int('patience', 20, 50)}
             model = FGNv4(n_snps=n_snps, hidden=overrides['hidden'], dropout=overrides['dropout'],
                           input_dropout=overrides['input_dropout'])
-            bs = 128
+            bs = _get_batch_size(model_name)
         elif model_name == 'FusionNet':
             overrides = {'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48, 64]),
                          'dropout': trial.suggest_float('dropout', 0.2, 0.5),
@@ -1683,7 +1679,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
                          'weight_decay': trial.suggest_float('weight_decay', 1e-4, 1e-2, log=True),
                          'patience': trial.suggest_int('patience', 20, 50)}
             model = FusionNet(n_snps=n_snps, hidden_dim=overrides['hidden_dim'], dropout=overrides['dropout'])
-            bs = 64
+            bs = _get_batch_size(model_name)
         elif model_name == 'AdditiveGenomicNet':
             overrides = {'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
                          'dropout': trial.suggest_float('dropout', 0.2, 0.5),
@@ -1693,7 +1689,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
                          'patience': trial.suggest_int('patience', 20, 50)}
             model = AdditiveGenomicNet(n_snps=n_snps, hidden=overrides['hidden'], dropout=overrides['dropout'],
                                        input_dropout=overrides['input_dropout'])
-            bs = 64
+            bs = _get_batch_size(model_name)
         elif model_name == 'GenomicFM':
             overrides = {'k': trial.suggest_categorical('k', [2, 4, 8]),
                          'dropout': trial.suggest_float('dropout', 0.1, 0.4),
@@ -1704,7 +1700,7 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             model = GenomicFM(n_snps=n_snps, k=overrides['k'],
                               dropout=overrides['dropout'],
                               mlp_hidden=overrides['mlp_hidden'])
-            bs = 32
+            bs = _get_batch_size(model_name)
             model = train_torch_model(model, X_tr, y_tr, epochs=200, batch_size=bs,
                                        lr=overrides['lr'], weight_decay=overrides['weight_decay'],
                                        patience=overrides['patience'], val_ratio=0.2)
@@ -2280,8 +2276,11 @@ def run_maize(quick_test=True):
     print(f"\nTraits: {traits}")
 
     var_thresh = 0.005; vars_per_marker = np.var(X_all, axis=0); keep = vars_per_marker >= var_thresh
-    if keep.sum() < X_all.shape[1]: X_all = X_all[:, keep]
-    print(f"  Low-variance filter: {X_all.shape[1]} markers kept")
+    if keep.sum() < X_all.shape[1]:
+        n_before = X_all.shape[1]; X_all = X_all[:, keep]
+        print(f"  Low-variance filter: {n_before} -> {X_all.shape[1]} markers kept")
+    else:
+        print(f"  Low-variance filter: all {X_all.shape[1]} markers kept")
 
     traits_run = traits[:1] if quick_test else traits
     folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
@@ -2398,8 +2397,9 @@ def load_easygese_data(data_dir, trait_names=None):
     vars_per_marker = np.var(G, axis=0)
     keep = vars_per_marker >= var_thresh
     if keep.sum() < G.shape[1]:
+        n_before = G.shape[1]
         G = G[:, keep]
-        print(f"  Low-variance filter: {G.shape[1]} markers kept ({G.shape[1]} -> {keep.sum()})")
+        print(f"  Low-variance filter: {n_before} -> {G.shape[1]} markers kept")
 
     # Detect numeric trait keys (sorted by suffix number)
     num_keys = sorted([k for k in trait_info if k.startswith('trait_') and k[6:].isdigit()],
@@ -2664,10 +2664,7 @@ _MODEL_COLORS_DL = {'FGN': '#FFB74D', 'FGN v2': '#FF9800', 'FGN v4': '#F57C00',
                     'FGN v9': '#FFCC80', 'FGN v10': '#FFE082', 'FGN v11': '#FFECB3',
                     'FGNplus': '#A1887F', 'FGN PCA': '#BCAAA4', 'GenomicFM': '#D7CCC8',
                     'FusionNet': '#E91E63', 'AdditiveGenomicNet': '#F48FB1',
-                    'WheatGP': '#78909C',
-                    'DeepKernelGP': '#CE93D8', 'EFM v3': '#BA68C8', 'FGN v3': '#AB47BC',
-                    'MICNN': '#9C27B0', 'MICNN v2': '#6A1B9A', 'PreFGN': '#8E24AA',
-                    'ResFGN': '#4A148C'}
+                    'WheatGP': '#78909C'}
 _MODEL_COLORS_ENS = {'Stacking (DL)': '#66BB6A', 'Stacking (All)': '#2E7D32',
                      'Trad Ensemble': '#0D47A1', 'Stacking (Pruned)': '#43A047',
                      'Stacking (Greedy)': '#1B5E20', 'Stacking (R²+Greedy)': '#388E3C'}
