@@ -1993,7 +1993,9 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
         tag = tag_map.get(mtype, '')
         trait_res[mname] = {
             'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-            'Type': mtype, 'Time': results[mname]['time'] / folds_run}
+            'Type': mtype,
+            'Time': results[mname]['time'] / folds_run,
+            'Params': results[mname].get('params', 0)}
         print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} "
               f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
 
@@ -2181,7 +2183,7 @@ def run_rice(quick_test=True):
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run}
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
@@ -2315,7 +2317,7 @@ def run_maize(quick_test=True):
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run}
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
@@ -2394,14 +2396,16 @@ def _mean_r2(data, model_name):
 
 
 def generate_bar_charts(fig_dir=None):
-    """Generate bar chart figures (01-04, 07) from ensemble_intermediate.json files.
+    """Generate bar chart figures from ensemble_intermediate.json files.
 
-    Reads results from results/{wheat,rice,maize}_ensemble/ and produces:
-      01_per_dataset_bar_charts.png   — 3-panel per-dataset model comparison
-      02_cross_dataset_comparison.png — models common to all 3 datasets
+    Produces:
+      01_per_dataset_bar_charts.png   — per-dataset model comparison (3 datasets)
+      02_cross_dataset_comparison.png — models common to all datasets
       03_stacking_gain_scatter.png    — Stacking (Greedy) vs best single model
-      04_rice_per_trait_detail.png    — rice top-12 models per trait
-      07_combined_ranking.png         — three-dataset average ranking
+      07_combined_ranking.png         — multi-dataset average ranking
+      08_wheat2000_per_trait_bars.png — wheat2000 per-trait model R²
+      09_rice_per_trait_bars.png      — rice per-trait model R²
+      10_maize_per_trait_bars.png     — maize per-trait model R²
     """
     import matplotlib.pyplot as plt
 
@@ -2409,28 +2413,22 @@ def generate_bar_charts(fig_dir=None):
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
+    # Only 3 datasets: wheat (813) removed per advisor feedback
     DATASETS = []
-    rice_data_for_fig04 = None
-    for tag, sub in [('Wheat', 'wheat'), ('Wheat2000', 'wheat2000'),
-                     ('Rice', 'rice'), ('Maize', 'maize')]:
+    for tag, sub in [('Wheat2000', 'wheat2000'), ('Rice', 'rice'), ('Maize', 'maize')]:
         d = _load_json_safe(SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
         if d:
-            traits = sorted(d.keys())
-            DATASETS.append((tag, d, traits))
-            if sub == 'rice':
-                rice_data_for_fig04 = (d, traits)
+            DATASETS.append((tag, d, sorted(d.keys())))
 
     if len(DATASETS) < 2:
         print("  [plot] Need at least 2 dataset JSONs for bar charts, skipping.")
         return
 
-    print("\n[plot] Generating bar chart figures (01-04, 07)...")
-
-    # --- Fig 01: Per-dataset bar charts ---
     n_datasets = len(DATASETS)
-    fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 14),
-                             squeeze=False)
-    # axes is always 2D with squeeze=False; flatten to 1D for indexing
+    print(f"\n[plot] Generating bar chart figures (01-03, 07-10) from {n_datasets} datasets...")
+
+    # --- Fig 01: Per-dataset bar charts (3 panels) ---
+    fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 14), squeeze=False)
     fig.suptitle('Genomic Prediction Ensemble — Per-Dataset Model Comparison (5-fold CV R²)',
                  fontsize=22, fontweight='bold', y=1.01)
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
@@ -2474,7 +2472,8 @@ def generate_bar_charts(fig_dir=None):
     for bi, (dname, data, _) in enumerate(DATASETS):
         vals = [_mean_r2(data, m) for m in common_sorted]
         c = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0', '#F44336'][bi]
-        ax.bar(x + (bi - (n_datasets-1)/2) * bar_w, vals, bar_w, color=c, edgecolor='white', label=f'{dname} ({len(DATASETS[bi][2])} trait{"s" if len(DATASETS[bi][2])>1 else ""})', zorder=3)
+        ax.bar(x + (bi - (n_datasets-1)/2) * bar_w, vals, bar_w, color=c, edgecolor='white',
+               label=f'{dname} ({len(DATASETS[bi][2])} trait{"s" if len(DATASETS[bi][2])>1 else ""})', zorder=3)
     ax.axhline(y=0, color='#666', linewidth=1)
     ax.set_xticks(x); ax.set_xticklabels(common_sorted, rotation=45, ha='right', fontsize=9)
     ax.set_ylabel('R²', fontsize=13)
@@ -2486,8 +2485,7 @@ def generate_bar_charts(fig_dir=None):
     print("  -> 02_cross_dataset_comparison.png")
 
     # --- Fig 03: Stacking gain scatter ---
-    fig, axes = plt.subplots(1, n_datasets, figsize=(8 * n_datasets, 8),
-                             squeeze=False)
+    fig, axes = plt.subplots(1, n_datasets, figsize=(8 * n_datasets, 8), squeeze=False)
     fig.suptitle('Stacking (Greedy) vs Best Single Model — Per Trait', fontsize=16, fontweight='bold')
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
         ax = axes[0, ax_idx]
@@ -2512,33 +2510,6 @@ def generate_bar_charts(fig_dir=None):
     plt.close()
     print("  -> 03_stacking_gain_scatter.png")
 
-    # --- Fig 04: Rice per-trait detail ---
-    if rice_data_for_fig04:
-        rice_d, rice_traits = rice_data_for_fig04
-        all_rm = list(rice_d[rice_traits[0]].keys())
-        rice_means = {m: _mean_r2(rice_d, m) for m in all_rm}
-        top_rice = sorted([m for m in all_rm if rice_means[m] > -1], key=lambda m: rice_means[m], reverse=True)[:12]
-        fig, axes = plt.subplots(5, 2, figsize=(28, 32))
-        fig.suptitle('Rice: Per-Trait Model Comparison (5-fold CV R²)', fontsize=18, fontweight='bold')
-        for idx, trait in enumerate(rice_traits):
-            ax = axes[idx//2][idx%2]
-            vals = [rice_d[trait][m]['R2'] if m in rice_d[trait] else 0 for m in top_rice]
-            colors = [_model_color(m) for m in top_rice]
-            x = np.arange(len(top_rice))
-            bars = ax.bar(x, vals, 0.65, color=colors, edgecolor='white', linewidth=0.5, zorder=3)
-            best_idx = np.argmax(vals)
-            bars[best_idx].set_edgecolor('#C62828'); bars[best_idx].set_linewidth(2.5)
-            ax.text(best_idx, vals[best_idx]+0.03, f'{vals[best_idx]:.3f}', ha='center', va='bottom',
-                    fontsize=9, fontweight='bold', color='#C62828')
-            ax.axhline(y=0, color='#666', linewidth=0.8)
-            ax.set_xticks(x); ax.set_xticklabels(top_rice, rotation=60, ha='right', fontsize=6)
-            ax.set_ylabel('R²'); ax.set_title(f'{trait}  (best: {top_rice[best_idx]} {vals[best_idx]:.3f})', fontsize=10, fontweight='bold')
-            ax.grid(axis='y', alpha=0.2); ax.set_ylim(min(-0.5, min(vals)-0.1), max(vals)+0.12)
-        fig.tight_layout()
-        fig.savefig(fig_dir/'04_rice_per_trait_detail.png', dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close()
-        print("  -> 04_rice_per_trait_detail.png")
-
     # --- Fig 07: Combined ranking ---
     combined = {}
     for m in all_common:
@@ -2549,7 +2520,8 @@ def generate_bar_charts(fig_dir=None):
     fig, ax = plt.subplots(figsize=(14, 10))
     y_pos = range(len(sorted_all))
     models_r = [s[0] for s in sorted_all]; vals_r = [s[1] for s in sorted_all]
-    bars = ax.barh(y_pos, vals_r, 0.7, color=[_model_color(m) for m in models_r], edgecolor='white', linewidth=1, zorder=3)
+    bars = ax.barh(y_pos, vals_r, 0.7, color=[_model_color(m) for m in models_r],
+                   edgecolor='white', linewidth=1, zorder=3)
     for i in range(min(3, len(sorted_all))): bars[i].set_edgecolor('#C62828'); bars[i].set_linewidth(2.5)
     for i, (m, v) in enumerate(zip(models_r, vals_r)):
         ax.text(v+0.005, i, f'{v:.4f}', va='center', fontsize=10, fontweight='bold')
@@ -2563,14 +2535,63 @@ def generate_bar_charts(fig_dir=None):
     fig.savefig(fig_dir/'07_combined_ranking.png', dpi=180, bbox_inches='tight', facecolor='white')
     plt.close()
     print("  -> 07_combined_ranking.png")
+
+    # --- Figs 08-10: Per-trait bar charts (one figure per dataset, each trait = subplot) ---
+    _per_trait_bar_figures(DATASETS, fig_dir)
     print("[plot] Bar chart figures done.")
 
 
-def generate_scatter_plots(fig_dir=None):
-    """Generate single-model predicted-vs-true scatter plots from saved OOF NPZ files.
+def _per_trait_bar_figures(DATASETS, fig_dir):
+    """Generate per-trait bar chart figures (one figure per dataset)."""
+    import matplotlib.pyplot as plt
 
-    For each trait, generates a scatter for the best single model (non-stacking, non-ensemble).
-    Rice → one multi-panel figure; Maize → one figure; Wheat → one figure.
+    # Fig numbers and layout per dataset
+    layout = {'Wheat2000': ('08', 2, 3, (24, 18)),
+              'Rice':      ('09', 2, 5, (24, 30)),
+              'Maize':     ('10', 2, 2, (24, 12))}
+    for dname, data, traits in DATASETS:
+        fig_num, ncols, _, fsize = layout.get(dname, (None, 2, None, (24, 18)))
+        nrows = (len(traits) + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=fsize)
+        axes_arr = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+
+        # Base models only (no stacking/ensemble)
+        base_models = [m for m in data[traits[0]].keys()
+                       if 'Stacking' not in m and 'Ensemble' not in m]
+        for idx, trait in enumerate(traits):
+            ax = axes_arr[idx]
+            r2s = {m: data[trait][m]['R2'] for m in base_models if m in data[trait]}
+            sorted_m = sorted(r2s, key=r2s.get, reverse=True)
+            vals = [r2s[m] for m in sorted_m]
+            colors = [_model_color(m) for m in sorted_m]
+            x = np.arange(len(sorted_m))
+            bars = ax.bar(x, vals, 0.65, color=colors, edgecolor='white', linewidth=0.5, zorder=3)
+            if vals:
+                best_idx = np.argmax(vals)
+                bars[best_idx].set_edgecolor('#C62828'); bars[best_idx].set_linewidth(2.5)
+                ax.text(best_idx, vals[best_idx] + 0.03, f'{vals[best_idx]:.3f}',
+                        ha='center', va='bottom', fontsize=8, fontweight='bold', color='#C62828')
+                ax.set_title(f'{trait}  (best: {sorted_m[best_idx]}={vals[best_idx]:.3f})',
+                             fontsize=9, fontweight='bold')
+            ax.axhline(y=0, color='#666', linewidth=0.8)
+            ax.set_xticks(x); ax.set_xticklabels(sorted_m, rotation=55, ha='right', fontsize=5.5)
+            ax.set_ylabel('R²'); ax.grid(axis='y', alpha=0.2)
+            y_min = min(-0.5, min(vals)-0.1) if vals else -0.5
+            ax.set_ylim(y_min, max(vals)+0.15 if vals else 1)
+        for idx in range(len(traits), len(axes_arr)):
+            axes_arr[idx].axis('off')
+        fig.suptitle(f'{dname}: Per-Trait Model R² Comparison', fontsize=14, fontweight='bold')
+        fig.tight_layout()
+        out = fig_dir / f'{fig_num}_{dname.lower()}_per_trait_bars.png'
+        fig.savefig(out, dpi=180, bbox_inches='tight', facecolor='white')
+        plt.close()
+        print(f"  -> {out.name}")
+
+
+def generate_scatter_plots(fig_dir=None):
+    """Generate top-4 per-trait predicted-vs-true scatter plots from OOF NPZ files.
+
+    One multi-panel figure per dataset, rows=traits, cols=top-4 models.
     """
     import matplotlib.pyplot as plt
 
@@ -2578,14 +2599,14 @@ def generate_scatter_plots(fig_dir=None):
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n[plot] Generating scatter plot figures from OOF predictions...")
+    print("\n[plot] Generating top-4 per-trait scatter figures from OOF predictions...")
     generated = 0
+    N_TOP = 4
 
-    for tag, sub, ncols, fig_prefix, model_hint in [
-        ('Rice', 'rice', 4, '05', 'XGBoost'),
-        ('Maize', 'maize', 2, '06', 'GBLUP'),
-        ('Wheat', 'wheat', 2, '10', 'XGBoost'),
-        ('Wheat2000', 'wheat2000', 3, '11', 'XGBoost'),
+    for tag, sub, fig_prefix in [
+        ('Rice', 'rice', '05'),
+        ('Maize', 'maize', '06'),
+        ('Wheat2000', 'wheat2000', '11'),
     ]:
         oof_dir = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "oof_predictions"
         if not oof_dir.exists():
@@ -2599,50 +2620,54 @@ def generate_scatter_plots(fig_dir=None):
         if not results_d:
             continue
 
-        n = len(npz_files); rows = (n + ncols - 1) // ncols
-        fig, axes = plt.subplots(rows, ncols, figsize=(ncols*5, rows*4.5))
-        if rows == 1 and ncols == 1:
-            axes = np.array([[axes]])
-        elif rows == 1:
+        traits = sorted(results_d.keys())
+        nrows = len(traits)
+        ncols = N_TOP
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.8))
+        if nrows == 1:
             axes = axes.reshape(1, -1)
-        elif ncols == 1:
-            axes = axes.reshape(-1, 1)
-        fig.suptitle(f'{tag}: Predicted vs True — Best Single Model (5-fold OOF)',
-                     fontsize=16, fontweight='bold')
+        fig.suptitle(f'{tag}: Top-{N_TOP} Single-Model OOF Predictions (per trait)',
+                     fontsize=14, fontweight='bold')
 
-        for idx, npz_path in enumerate(npz_files):
-            trait = npz_path.stem.replace('_oof', '')
-            ax = axes[idx//ncols][idx%ncols]
+        for row_idx, trait in enumerate(traits):
+            npz_path = oof_dir / f"{trait}_oof.npz"
+            if not npz_path.exists():
+                for ci in range(ncols):
+                    axes[row_idx, ci].axis('off')
+                continue
+
             npz_data = np.load(npz_path, allow_pickle=True)
             y_true = npz_data['_y_true']
 
+            # Top-4 single models for this trait
             single_r2 = {
-                m: results_d.get(trait, {}).get(m, {}).get('R2', -999)
-                for m in results_d.get(trait, {})
+                m: results_d[trait][m]['R2']
+                for m in results_d[trait]
                 if 'Stacking' not in m and 'Ensemble' not in m and m in npz_data
             }
-            best_model = max(single_r2, key=single_r2.get) if single_r2 else model_hint
+            top_models = sorted(single_r2, key=single_r2.get, reverse=True)[:N_TOP]
 
-            if best_model in npz_data:
-                oof = npz_data[best_model]
+            for col_idx, mname in enumerate(top_models):
+                ax = axes[row_idx, col_idx]
+                oof = npz_data[mname]
                 r2_val = r2_score(y_true, oof)
-                color = _model_color(best_model)
-                ax.scatter(y_true, oof, alpha=0.5, s=20, c=color, edgecolors='none', zorder=3)
-                mn = min(y_true.min(), oof.min()); mx = max(y_true.max(), oof.max())
+                ax.scatter(y_true, oof, alpha=0.4, s=6, c=_model_color(mname),
+                           edgecolors='none', zorder=3)
+                mn = min(y_true.min(), oof.min())
+                mx = max(y_true.max(), oof.max())
                 pad = (mx - mn) * 0.08
-                ax.plot([mn-pad, mx+pad], [mn-pad, mx+pad], '--', color='#E53935', alpha=0.5, lw=1.2)
-                ax.set_title(f'{trait}\n{best_model}  R²={r2_val:.4f}', fontsize=10, fontweight='bold')
-            else:
-                ax.text(0.5, 0.5, 'OOF data missing', ha='center', va='center', transform=ax.transAxes)
-                ax.set_title(trait, fontsize=10)
-
-            ax.set_xlabel('True'); ax.set_ylabel('Predicted'); ax.grid(alpha=0.2)
-
-        for idx in range(n, rows*ncols):
-            axes[idx//ncols][idx%ncols].axis('off')
+                ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad],
+                        '--', color='#E53935', alpha=0.4, lw=1.0)
+                ax.set_title(f'{mname}\nR²={r2_val:.3f}', fontsize=7, fontweight='bold')
+                ax.set_xlabel('True', fontsize=6)
+                ax.set_ylabel('Predicted', fontsize=6)
+                ax.tick_params(labelsize=5)
+                ax.grid(alpha=0.2)
+            for col_idx in range(len(top_models), ncols):
+                axes[row_idx, col_idx].axis('off')
 
         fig.tight_layout()
-        out_path = fig_dir / f'{fig_prefix}_{sub}_best_scatter.png'
+        out_path = fig_dir / f'{fig_prefix}_{sub}_top4_scatter.png'
         fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
         print(f"  -> {out_path.name}")
@@ -2652,6 +2677,108 @@ def generate_scatter_plots(fig_dir=None):
         print("[plot] Scatter plots done.")
     else:
         print("[plot] No OOF NPZ files found — run full CV first to generate scatter plots.")
+
+
+def generate_efficiency_plots(fig_dir=None):
+    """Generate model efficiency comparison figures.
+
+    Fig 12: per-fold runtime comparison (3 subplots, one per dataset).
+    Fig 13: model parameter count comparison (single chart, log-scale).
+    """
+    import matplotlib.pyplot as plt
+
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    DATASETS = []
+    for tag, sub in [('Wheat2000', 'wheat2000'), ('Rice', 'rice'), ('Maize', 'maize')]:
+        d = _load_json_safe(SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
+        if d:
+            DATASETS.append((tag, d, sorted(d.keys())))
+
+    if not DATASETS:
+        print("[plot] No results for efficiency plots, skipping.")
+        return
+
+    print("\n[plot] Generating efficiency comparison figures (12-13)...")
+
+    # --- Fig 12: Per-fold runtime ---
+    n = len(DATASETS)
+    fig, axes = plt.subplots(1, n, figsize=(7 * n, 8))
+    if n == 1:
+        axes = [axes]
+    for ax_idx, (dname, data, traits) in enumerate(DATASETS):
+        ax = axes[ax_idx]
+        base = [m for m in data[traits[0]].keys()
+                if 'Stacking' not in m and 'Ensemble' not in m]
+        avg_time = {}
+        for m in base:
+            times = [data[t][m].get('Time', 0) for t in traits if m in data[t]]
+            avg_time[m] = np.mean(times) if times else 0
+        sorted_m = sorted(avg_time, key=avg_time.get, reverse=True)
+        vals = [avg_time[m] for m in sorted_m]
+        colors = [_model_color(m) for m in sorted_m]
+        y_pos = np.arange(len(sorted_m))
+        ax.barh(y_pos, vals, 0.7, color=colors, edgecolor='white', linewidth=0.8, zorder=3)
+        for i, (m, v) in enumerate(zip(sorted_m, vals)):
+            label = f'{v:.1f}s' if v < 60 else f'{v/60:.1f}min'
+            ax.text(v + max(vals) * 0.01, i, label, va='center', fontsize=6.5)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(sorted_m, fontsize=7)
+        ax.set_xlabel('Time per fold (seconds)')
+        ax.set_title(f'{dname} ({len(traits)} traits)', fontweight='bold')
+        ax.grid(axis='x', alpha=0.3)
+        ax.invert_yaxis()
+    fig.suptitle('Model Runtime Comparison (5-fold CV, per-fold average)',
+                 fontsize=14, fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(fig_dir / '12_time_comparison.png', dpi=180, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print("  -> 12_time_comparison.png")
+
+    # --- Fig 13: Parameter count ---
+    all_models = set()
+    for _, data, _ in DATASETS:
+        for m in data[list(data.keys())[0]]:
+            if 'Stacking' not in m and 'Ensemble' not in m:
+                all_models.add(m)
+
+    param_counts = {}
+    for m in all_models:
+        counts = []
+        for _, data, traits in DATASETS:
+            if m in data[traits[0]]:
+                counts.append(data[traits[0]][m].get('Params', 0))
+        param_counts[m] = max(counts) if counts else 0
+
+    sorted_m = sorted(param_counts, key=param_counts.get, reverse=True)
+    vals = [param_counts[m] for m in sorted_m]
+    colors = [_model_color(m) for m in sorted_m]
+
+    fig, ax = plt.subplots(figsize=(14, 9))
+    y_pos = np.arange(len(sorted_m))
+    ax.barh(y_pos, vals, 0.7, color=colors, edgecolor='white', linewidth=0.8, zorder=3)
+    ax.set_xscale('log')
+    for i, (m, v) in enumerate(zip(sorted_m, vals)):
+        if v >= 1000000:
+            label = f'{v/1000000:.1f}M'
+        elif v >= 1000:
+            label = f'{v/1000:.0f}K'
+        else:
+            label = str(int(v))
+        ax.text(v * 1.05, i, label, va='center', fontsize=8)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(sorted_m, fontsize=9)
+    ax.set_xlabel('Number of Parameters (log scale)')
+    ax.set_title('Model Parameter Count Comparison', fontsize=14, fontweight='bold')
+    ax.grid(axis='x', alpha=0.3)
+    ax.invert_yaxis()
+    fig.tight_layout()
+    fig.savefig(fig_dir / '13_params_comparison.png', dpi=180, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print("  -> 13_params_comparison.png")
+    print("[plot] Efficiency plots done.")
 
 
 # ============================================================================
@@ -2710,6 +2837,10 @@ if __name__ == '__main__':
             generate_scatter_plots()
         except Exception as e:
             print(f"  [WARNING] Scatter plot generation failed: {e}")
+        try:
+            generate_efficiency_plots()
+        except Exception as e:
+            print(f"  [WARNING] Efficiency plot generation failed: {e}")
 
     print(f"\n{'#'*80}")
     print(f"  All done! Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
