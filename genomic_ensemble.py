@@ -1907,7 +1907,7 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
             print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
 
     kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-    results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0}
+    results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
                for m in ALL_NAMES}
     oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
     oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
@@ -1965,9 +1965,14 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
             wd = tp.get('weight_decay',
                         5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
             pat = tp.get('patience', 30)
+            if DEVICE.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats()
             model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300,
                                       batch_size=bs, lr=lr,
                                       weight_decay=wd, patience=pat)
+            if DEVICE.type == 'cuda':
+                results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
+                    torch.cuda.max_memory_allocated() / (1024 * 1024))
             preds = predict_torch_model(model, Xte_dl_s)
             elapsed = time.time() - t0
             results[mname]['preds'].extend(preds.tolist())
@@ -1995,7 +2000,8 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
             'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
             'Type': mtype,
             'Time': results[mname]['time'] / folds_run,
-            'Params': results[mname].get('params', 0)}
+            'Params': results[mname].get('params', 0),
+            'GPUMem': results[mname].get('gpu_mem', 0.0)}
         print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} "
               f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
 
@@ -2131,7 +2137,7 @@ def run_rice(quick_test=True):
                 print(f"    {tune_name}: val R2={best_r2:.4f}")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0} for m in ALL_NAMES}
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
         oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
         oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
         for fi, (tr, te) in enumerate(kf.split(X_all)):
@@ -2168,7 +2174,12 @@ def run_rice(quick_test=True):
                 lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
                 wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
                 pat = tp.get('patience', 30)
+                if DEVICE.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats()
                 model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+                if DEVICE.type == 'cuda':
+                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
+                        torch.cuda.max_memory_allocated() / (1024 * 1024))
                 preds = predict_torch_model(model, Xte_dl_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
@@ -2183,7 +2194,8 @@ def run_rice(quick_test=True):
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0)}
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
+            'GPUMem': results[mname].get('gpu_mem', 0.0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
@@ -2271,7 +2283,7 @@ def run_maize(quick_test=True):
         print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
 
         kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0} for m in ALL_NAMES}
+        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0} for m in ALL_NAMES}
         oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
         oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
         for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
@@ -2303,7 +2315,12 @@ def run_maize(quick_test=True):
                 if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
                 bs = _get_batch_size(mname)
                 wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
+                if DEVICE.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats()
                 model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
+                if DEVICE.type == 'cuda':
+                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
+                        torch.cuda.max_memory_allocated() / (1024 * 1024))
                 preds = predict_torch_model(model, Xte_s)
                 elapsed = time.time() - t0
                 results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
@@ -2317,7 +2334,8 @@ def run_maize(quick_test=True):
             p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
             r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
             mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0)}
+            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
+            'GPUMem': results[mname].get('gpu_mem', 0.0)}
             print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
 
         _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
@@ -2545,15 +2563,14 @@ def _per_trait_bar_figures(DATASETS, fig_dir):
     """Generate per-trait bar chart figures (one figure per dataset)."""
     import matplotlib.pyplot as plt
 
-    # Fig numbers and layout per dataset
-    layout = {'Wheat2000': ('08', 2, 3, (24, 18)),
-              'Rice':      ('09', 2, 5, (24, 30)),
-              'Maize':     ('10', 2, 2, (24, 12))}
+    layout = {'Wheat2000': ('08', 2, (24, 18)),
+              'Rice':      ('09', 2, (24, 30)),
+              'Maize':     ('10', 2, (24, 12))}
     for dname, data, traits in DATASETS:
-        fig_num, ncols, _, fsize = layout.get(dname, (None, 2, None, (24, 18)))
+        fig_num, ncols, fsize = layout.get(dname, (None, 2, (24, 18)))
         nrows = (len(traits) + ncols - 1) // ncols
         fig, axes = plt.subplots(nrows, ncols, figsize=fsize)
-        axes_arr = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+        axes_arr = axes.flatten()
 
         # Base models only (no stacking/ensemble)
         base_models = [m for m in data[traits[0]].keys()
@@ -2611,9 +2628,6 @@ def generate_scatter_plots(fig_dir=None):
         oof_dir = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "oof_predictions"
         if not oof_dir.exists():
             continue
-        npz_files = sorted(oof_dir.glob("*_oof.npz"))
-        if not npz_files:
-            continue
 
         json_path = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json"
         results_d = _load_json_safe(json_path)
@@ -2638,6 +2652,7 @@ def generate_scatter_plots(fig_dir=None):
 
             npz_data = np.load(npz_path, allow_pickle=True)
             y_true = npz_data['_y_true']
+            yt_min, yt_max = y_true.min(), y_true.max()
 
             # Top-4 single models for this trait
             single_r2 = {
@@ -2650,11 +2665,10 @@ def generate_scatter_plots(fig_dir=None):
             for col_idx, mname in enumerate(top_models):
                 ax = axes[row_idx, col_idx]
                 oof = npz_data[mname]
-                r2_val = r2_score(y_true, oof)
                 ax.scatter(y_true, oof, alpha=0.4, s=6, c=_model_color(mname),
                            edgecolors='none', zorder=3)
-                mn = min(y_true.min(), oof.min())
-                mx = max(y_true.max(), oof.max())
+                mn = min(yt_min, oof.min())
+                mx = max(yt_max, oof.max())
                 pad = (mx - mn) * 0.08
                 ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad],
                         '--', color='#E53935', alpha=0.4, lw=1.0)
@@ -2738,11 +2752,9 @@ def generate_efficiency_plots(fig_dir=None):
     print("  -> 12_time_comparison.png")
 
     # --- Fig 13: Parameter count ---
-    all_models = set()
-    for _, data, _ in DATASETS:
-        for m in data[list(data.keys())[0]]:
-            if 'Stacking' not in m and 'Ensemble' not in m:
-                all_models.add(m)
+    all_models = {m for _, data, _ in DATASETS
+                  for m in data[list(data.keys())[0]]
+                  if 'Stacking' not in m and 'Ensemble' not in m}
 
     param_counts = {}
     for m in all_models:
@@ -2778,6 +2790,49 @@ def generate_efficiency_plots(fig_dir=None):
     fig.savefig(fig_dir / '13_params_comparison.png', dpi=180, bbox_inches='tight', facecolor='white')
     plt.close()
     print("  -> 13_params_comparison.png")
+
+    # --- Fig 14: GPU memory (actual measured, with param-based fallback) ---
+    gpu_mem_mb = {}
+    for m in all_models:
+        mems = []
+        for _, data, traits in DATASETS:
+            if m in data[traits[0]]:
+                mems.append(data[traits[0]][m].get('GPUMem', 0.0))
+        gpu_mem_mb[m] = max(mems) if mems else 0.0
+
+    # Fallback: if no actual GPU mem recorded, estimate from params
+    for m in all_models:
+        if gpu_mem_mb[m] == 0.0 and param_counts.get(m, 0) > 0:
+            p = param_counts[m]
+            gpu_mem_mb[m] = p * 16 / (1024 * 1024)  # estimated training mem
+
+    sorted_m_mem = sorted(gpu_mem_mb, key=gpu_mem_mb.get, reverse=True)
+    vals_mem = [gpu_mem_mb[m] for m in sorted_m_mem]
+    colors_mem = [_model_color(m) for m in sorted_m_mem]
+
+    fig, ax = plt.subplots(figsize=(14, 9))
+    y_pos = np.arange(len(sorted_m_mem))
+    ax.barh(y_pos, vals_mem, 0.7, color=colors_mem, edgecolor='white', linewidth=0.8, zorder=3)
+    for i, (m, v) in enumerate(zip(sorted_m_mem, vals_mem)):
+        if v >= 1000:
+            label = f'{v/1000:.1f} GB'
+        elif v >= 1:
+            label = f'{v:.0f} MB'
+        else:
+            label = '<1 MB (≈ params × 16 B / 1024²)'
+        ax.text(v + max(vals_mem) * 0.01, i, label, va='center', fontsize=8)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(sorted_m_mem, fontsize=9)
+    ax.set_xlabel('GPU Memory (MB) — measured via torch.cuda.max_memory_allocated')
+    ax.set_title('GPU Memory Usage per Model During Training', fontsize=14, fontweight='bold')
+    ax.grid(axis='x', alpha=0.3)
+    ax.invert_yaxis()
+    if any(v > 0 for v in vals_mem):
+        ax.set_xscale('log')
+    fig.tight_layout()
+    fig.savefig(fig_dir / '14_memory_comparison.png', dpi=180, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print("  -> 14_memory_comparison.png")
     print("[plot] Efficiency plots done.")
 
 
