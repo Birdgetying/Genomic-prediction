@@ -1088,8 +1088,8 @@ def train_torch_model(model, X_train, y_train,
     rng = np.random.RandomState(base_seed)
     torch_gen = torch.Generator(device=DEVICE.type if DEVICE.type == 'cuda' else 'cpu')
     torch_gen.manual_seed(base_seed)
-    dl_base_gen = torch.Generator()
-    dl_base_gen.manual_seed(base_seed)
+    dl_gen = torch.Generator()
+    dl_gen.manual_seed(base_seed)
     idx = rng.permutation(n_total)
     val_idx, tr_idx = idx[:n_val], idx[n_val:]
     Xt_full = torch.FloatTensor(X_train[tr_idx]).to(DEVICE)
@@ -1114,8 +1114,6 @@ def train_torch_model(model, X_train, y_train,
         # Avoid batch of size 1 (kills BatchNorm): absorb singleton into previous batch
         while len(tr_idx) % bs == 1 and bs > 1:
             bs += 1
-        dl_gen = torch.Generator()
-        dl_gen.manual_seed(base_seed + ep)
         dl = DataLoader(TensorDataset(Xt, yt), batch_size=bs, shuffle=True, generator=dl_gen)
         for bx, by in dl:
             if use_mixup and ep >= 5:
@@ -1247,33 +1245,34 @@ def maf_filter(X, threshold=MAF_THRESHOLD):
     return np.where(maf >= threshold)[0]
 
 
-def _make_fold_candidate_universe(Xtr_raw, Xte_raw, vt_all, n_requested):
-    """Build the shared post-MAF candidate universe for one CV fold."""
-    maf_idx = maf_filter(Xtr_raw)
+def _make_candidate_universe(X_raw, vt_all, n_requested):
+    """Build the post-MAF candidate universe for one genotype matrix."""
+    maf_idx = maf_filter(X_raw)
     if len(maf_idx) > 0:
-        Xtr_cand = Xtr_raw[:, maf_idx]
-        Xte_cand = Xte_raw[:, maf_idx]
+        X_cand = X_raw[:, maf_idx]
         vt_cand = vt_all[maf_idx] if vt_all is not None else None
         cand_orig_idx = maf_idx
     else:
-        Xtr_cand = Xtr_raw
-        Xte_cand = Xte_raw
+        X_cand = X_raw
         vt_cand = vt_all
-        cand_orig_idx = np.arange(Xtr_raw.shape[1])
-    n_selected = min(int(n_requested), Xtr_cand.shape[1])
+        cand_orig_idx = np.arange(X_raw.shape[1])
+    n_selected = min(int(n_requested), X_cand.shape[1])
     if n_selected <= 0:
         raise ValueError("No SNP candidates available after filtering")
+    return X_cand, vt_cand, cand_orig_idx, n_selected
+
+
+def _make_fold_candidate_universe(Xtr_raw, Xte_raw, vt_all, n_requested):
+    """Build the shared post-MAF candidate universe for one CV fold."""
+    Xtr_cand, vt_cand, cand_orig_idx, n_selected = _make_candidate_universe(
+        Xtr_raw, vt_all, n_requested)
+    Xte_cand = Xte_raw[:, cand_orig_idx]
     return Xtr_cand, Xte_cand, vt_cand, cand_orig_idx, n_selected
 
 
 def _make_tuning_matrix(X_all, y, n_requested):
     """Use GWAS-selected post-MAF features for one shared hyperparameter search."""
-    maf_idx = maf_filter(X_all)
-    if len(maf_idx) > 0:
-        X_cand = X_all[:, maf_idx]
-    else:
-        X_cand = X_all
-    n_selected = min(int(n_requested), X_cand.shape[1])
+    X_cand, _, _, n_selected = _make_candidate_universe(X_all, None, n_requested)
     gidx_t = gwas_select(X_cand, y, n_selected)
     return _as_model_input(X_cand[:, gidx_t]), n_selected
 
@@ -1564,7 +1563,7 @@ def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
         fallback = np.full(len(targets), float(np.mean(targets)), dtype=np.float64)
         r2_v, corr_v, rmse_v = _metric_values(targets, fallback)
         return {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                'OOF_predictions': fallback.tolist(), 'Meta_weights': [],
+                'OOF_predictions': fallback, 'Meta_weights': [],
                 'Meta_intercept': float(np.mean(targets)), 'Base_models': [],
                 'Pruned_models': [], 'Meta_type': meta_type}
 
@@ -1577,7 +1576,7 @@ def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
         sp = np.asarray(oof_preds_dict[only], dtype=np.float64)
         r2_v, corr_v, rmse_v = _metric_values(targets, sp)
         return {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                'OOF_predictions': sp.tolist(), 'Meta_weights': [1.0],
+                'OOF_predictions': sp, 'Meta_weights': [1.0],
                 'Meta_intercept': 0.0, 'Base_models': base_names,
                 'Pruned_models': pruned_names, 'Meta_type': meta_type}
 
@@ -1618,7 +1617,7 @@ def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
     result = {'R2': r2_v,
               'Correlation': corr_v,
               'RMSE': rmse_v,
-              'OOF_predictions': sp.tolist(),
+              'OOF_predictions': sp,
               'Meta_weights': np.ravel(final_meta.coef_).astype(float).tolist(),
               'Meta_intercept': float(final_meta.intercept_),
               'Base_models': base_names,
@@ -1720,7 +1719,7 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run, suffix='
             fallback = np.asarray(oof_r2_filtered[mname], dtype=np.float64)
             r2_v, corr_v, rmse_v = _metric_values(y, fallback)
             srg = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                   'OOF_predictions': fallback.tolist(),
+                   'OOF_predictions': fallback,
                    'Base_models': [mname], 'Greedy_selected': [mname],
                    'R2_filtered': r2_removed, 'Meta_weights': [1.0],
                    'Meta_intercept': 0.0, 'Meta_type': 'fallback'}
@@ -1728,7 +1727,7 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run, suffix='
             fallback = np.full(len(y), float(np.mean(y)), dtype=np.float64)
             r2_v, corr_v, rmse_v = _metric_values(y, fallback)
             srg = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-                   'OOF_predictions': fallback.tolist(),
+                   'OOF_predictions': fallback,
                    'Base_models': [], 'Greedy_selected': [],
                    'R2_filtered': r2_removed, 'Meta_weights': [],
                    'Meta_intercept': float(np.mean(y)), 'Meta_type': 'mean_fallback'}
@@ -1767,7 +1766,7 @@ def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test
 
     X = _as_model_input(X)
     y = np.asarray(y, dtype=np.float32)
-    X_cand, _, _, cand_orig_idx, n_selected = _make_fold_candidate_universe(X, X, None, n_snps)
+    X_cand, _, cand_orig_idx, n_selected = _make_candidate_universe(X, None, n_snps)
     gidx_rel = gwas_select(X_cand, y, n_selected)
     gidx = cand_orig_idx[gidx_rel]
     X_selected = _as_model_input(X[:, gidx])
@@ -2577,7 +2576,7 @@ def _filter_models_for_arm(models, arm='gwas', include_ensemble=True):
         out.append(m)
     return out
 
-def generate_bar_charts(fig_dir=None):
+def generate_bar_charts(fig_dir=None, datasets=None):
     """Generate bar chart figures from ensemble_intermediate.json files.
 
     Produces:
@@ -2595,7 +2594,7 @@ def generate_bar_charts(fig_dir=None):
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    DATASETS = _load_plot_datasets()
+    DATASETS = datasets if datasets is not None else _load_plot_datasets()
 
     if len(DATASETS) < 1:
         print("  [plot] No dataset JSONs found for bar charts, skipping.")
@@ -2768,7 +2767,7 @@ def _per_trait_bar_figures(DATASETS, fig_dir):
         print(f"  -> {out.name}")
 
 
-def generate_scatter_plots(fig_dir=None):
+def generate_scatter_plots(fig_dir=None, datasets=None):
     """Generate top-4 per-trait predicted-vs-true scatter plots for GWAS and random arms."""
     import matplotlib.pyplot as plt
 
@@ -2780,13 +2779,20 @@ def generate_scatter_plots(fig_dir=None):
     generated = 0
     N_TOP = 4
 
-    for dname, results_d, traits in _load_plot_datasets():
+    DATASETS = datasets if datasets is not None else _load_plot_datasets()
+
+    for dname, results_d, traits in DATASETS:
         spec = _dataset_spec_by_tag(dname)
         sub = spec['sub']
         oof_dir = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "oof_predictions"
         if not oof_dir.exists():
             continue
         for arm, suffix in [('gwas', ''), ('random', '_random')]:
+            existing_npz = [oof_dir / f"{trait}{suffix}_oof.npz"
+                            for trait in traits
+                            if (oof_dir / f"{trait}{suffix}_oof.npz").exists()]
+            if not existing_npz:
+                continue
             nrows = len(traits)
             ncols = N_TOP
             fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.3, max(1, nrows) * 3.6), squeeze=False)
@@ -2843,7 +2849,7 @@ def generate_scatter_plots(fig_dir=None):
         print("[plot] No OOF NPZ files found — run full CV first to generate scatter plots.")
 
 
-def generate_efficiency_plots(fig_dir=None, include_random=False):
+def generate_efficiency_plots(fig_dir=None, include_random=False, datasets=None):
     """Generate model efficiency comparison figures.
 
     Fig 12: per-fold runtime comparison (3 subplots, one per dataset).
@@ -2855,7 +2861,7 @@ def generate_efficiency_plots(fig_dir=None, include_random=False):
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    DATASETS = _load_plot_datasets()
+    DATASETS = datasets if datasets is not None else _load_plot_datasets()
 
     if not DATASETS:
         print("[plot] No results for efficiency plots, skipping.")
@@ -2982,6 +2988,27 @@ def generate_efficiency_plots(fig_dir=None, include_random=False):
     print("[plot] Efficiency plots done.")
 
 
+def generate_all_plots(fig_dir=None, include_scatter=True, include_efficiency=True, fail_soft=True):
+    """Generate all standard figures while loading result JSONs only once."""
+    datasets = _load_plot_datasets()
+
+    def _call(label, fn, *args, **kwargs):
+        if fail_soft:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                print(f"  [WARNING] {label} generation failed: {e}")
+                return None
+        return fn(*args, **kwargs)
+
+    _call('Bar chart', generate_bar_charts, fig_dir=fig_dir, datasets=datasets)
+    if include_scatter:
+        _call('Scatter plot', generate_scatter_plots, fig_dir=fig_dir, datasets=datasets)
+    if include_efficiency:
+        _call('Efficiency plot', generate_efficiency_plots, fig_dir=fig_dir, datasets=datasets)
+
+
+
 # ============================================================================
 # Section M: Dispatcher
 # ============================================================================
@@ -3014,18 +3041,7 @@ if __name__ == '__main__':
     print(f"{'#'*80}")
 
     def _run_all_plots():
-        try:
-            generate_bar_charts()
-        except Exception as e:
-            print(f"  [WARNING] Bar chart generation failed: {e}")
-        try:
-            generate_scatter_plots()
-        except Exception as e:
-            print(f"  [WARNING] Scatter plot generation failed: {e}")
-        try:
-            generate_efficiency_plots()
-        except Exception as e:
-            print(f"  [WARNING] Efficiency plot generation failed: {e}")
+        generate_all_plots(fail_soft=True)
 
     if plot_only:
         print(f"\n{'#'*80}")

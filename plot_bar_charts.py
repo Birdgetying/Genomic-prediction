@@ -1,12 +1,7 @@
 #!/usr/bin/env python
-"""Plot wrapper: regenerate ensemble figures from genomic_ensemble.py — no training/GPU needed."""
+"""Plot wrapper: regenerate ensemble figures from genomic_ensemble.py — no training needed."""
 import io
-import os
-import random
 import sys
-
-import numpy as np
-import torch
 
 # Fix Windows console encoding for Unicode characters (R², Δ, etc.)
 if sys.platform == 'win32':
@@ -15,22 +10,7 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-RANDOM_SEED = 42
-random.seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(RANDOM_SEED)
-    torch.cuda.manual_seed_all(RANDOM_SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-# PYTHONHASHSEED must be set at process launch: export PYTHONHASHSEED=42
-
-from genomic_ensemble import (  # noqa: E402
-    generate_bar_charts,
-    generate_efficiency_plots,
-    generate_scatter_plots,
-)
+from genomic_ensemble import generate_all_plots  # noqa: E402
 
 
 def main():
@@ -43,10 +23,8 @@ def main():
 
     only_bar = '--bar-only' in sys.argv
     print("Regenerating figures via genomic_ensemble plotting wrappers...")
-    generate_bar_charts(fig_dir=fig_dir)
-    if not only_bar:
-        generate_scatter_plots(fig_dir=fig_dir)
-        generate_efficiency_plots(fig_dir=fig_dir)
+    generate_all_plots(fig_dir=fig_dir, include_scatter=not only_bar,
+                       include_efficiency=not only_bar)
     print("Done.")
 
 
