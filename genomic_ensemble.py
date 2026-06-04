@@ -1246,19 +1246,29 @@ def maf_filter(X, threshold=MAF_THRESHOLD):
 
 
 def _make_candidate_universe(X_raw, vt_all, n_requested):
-    """Build the post-MAF candidate universe for one genotype matrix."""
+    """Build the candidate universe from markers that pass the MAF filter.
+
+    The function never falls back to unfiltered markers: if too few markers pass
+    MAF, the selected SNP count is reduced instead of reintroducing low-MAF
+    variants.  Callers inside CV must pass only the outer training fold.
+    """
+    requested = min(int(n_requested), X_raw.shape[1])
     maf_idx = maf_filter(X_raw)
-    if len(maf_idx) > 0:
-        X_cand = X_raw[:, maf_idx]
-        vt_cand = vt_all[maf_idx] if vt_all is not None else None
-        cand_orig_idx = maf_idx
-    else:
-        X_cand = X_raw
-        vt_cand = vt_all
-        cand_orig_idx = np.arange(X_raw.shape[1])
-    n_selected = min(int(n_requested), X_cand.shape[1])
+    if len(maf_idx) <= 0:
+        raise ValueError(
+            f"No SNP candidates pass MAF >= {MAF_THRESHOLD:.3f}; "
+            "refusing unfiltered fallback")
+
+    X_cand = X_raw[:, maf_idx]
+    vt_cand = vt_all[maf_idx] if vt_all is not None else None
+    cand_orig_idx = maf_idx
+    n_selected = min(requested, X_cand.shape[1])
     if n_selected <= 0:
-        raise ValueError("No SNP candidates available after filtering")
+        raise ValueError("No SNP candidates available after MAF filtering")
+    if n_selected < requested:
+        print(f"    [WARN] MAF retained {X_cand.shape[1]} markers; "
+              f"selected SNP count reduced from {requested} to {n_selected} "
+              "without low-MAF fallback")
     return X_cand, vt_cand, cand_orig_idx, n_selected
 
 
@@ -1270,10 +1280,16 @@ def _make_fold_candidate_universe(Xtr_raw, Xte_raw, vt_all, n_requested):
     return Xtr_cand, Xte_cand, vt_cand, cand_orig_idx, n_selected
 
 
-def _make_tuning_matrix(X_all, y, n_requested):
-    """Use GWAS-selected post-MAF features for one shared hyperparameter search."""
-    X_cand, _, _, n_selected = _make_candidate_universe(X_all, None, n_requested)
-    gidx_t = gwas_select(X_cand, y, n_selected)
+def _make_tuning_matrix(X_train_fold, y_train_fold, n_requested):
+    """Use fold-train-only GWAS features for an inner hyperparameter search.
+
+    Do not call this on full trait data when reporting outer-CV metrics; the
+    MAF filter and GWAS selection must be fitted only inside each outer training
+    fold to avoid test-fold label leakage.
+    """
+    X_cand, _, _, n_selected = _make_candidate_universe(
+        X_train_fold, None, n_requested)
+    gidx_t = gwas_select(X_cand, y_train_fold, n_selected)
     return _as_model_input(X_cand[:, gidx_t]), n_selected
 
 
@@ -1799,12 +1815,19 @@ def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test
 
     meta = {'trait': trait_name, 'n_snps': n_selected, 'gwas_indices': gidx.tolist(),
             'n_samples': len(y), 'input': 'raw_genotype_float32',
+            'fit_scope': 'full_data_deployment_not_cv_metric',
             'models': list(trad_models.keys()) + DL_NAMES}
     with open(deploy_dir / "deployment_meta.json", 'w', encoding='utf-8') as f: json.dump(meta, f, indent=2)
     print(f"    [saved] deployment_meta")
 
 
 def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15, seed=RANDOM_SEED):
+    """Tune one DL model using only the data supplied by the caller.
+
+    For paper CV metrics, callers must pass an outer training fold only.  This
+    function performs its own inner hold-out split and must never receive full
+    trait data to choose hyperparameters later reused across outer CV folds.
+    """
     try: import optuna
     except ImportError: print(f"    [SKIP] Optuna not installed, using defaults"); return {}, 0.0
     seed = int(seed)
@@ -2082,18 +2105,12 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
     print(f"  {len(y)} samples, {X_all.shape[1]} markers -> up to {n_requested} selected")
     print("  Input representation: raw genotype float32 (no feature standardization)")
 
+    # CV metrics use fixed hyperparameters.  Any future tuning must happen
+    # inside each outer training fold only; full-data tuning is deployment-only.
     tuned_params = {}
     if not quick_test:
-        print(f"\n  [AutoML] Tuning hyperparams ...")
-        X_tune, n_tune = _make_tuning_matrix(X_all, y, n_requested)
-        for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet',
-                          'AdditiveGenomicNet', 'GenomicFM']:
-            tune_seed = _stable_seed(seed_context, tune_name, 'tune')
-            best_p, best_r2 = tune_model_hyperparams(
-                tune_name, X_tune, y, n_tune, n_trials=15, seed=tune_seed)
-            tuned_params[tune_name] = best_p
-            pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
-            print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
+        print("\n  [AutoML] Skipped during CV to avoid test-fold label leakage; "
+              "using fixed hyperparameters.")
 
     kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
     results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
@@ -2227,7 +2244,12 @@ def _run_ensemble_traits(trait_data, output_dir, crop_label, quick_test):
 
     for t_idx, trait in enumerate(traits_run):
         print(f"\n{'='*80}\n  TRAIT [{t_idx+1}/{len(traits_run)}]: {trait}\n{'='*80}")
-        X_all, y, vt_all = trait_data[trait]
+        item = trait_data[trait]
+        if len(item) == 2:
+            X_all, y = item
+            vt_all = None
+        else:
+            X_all, y, vt_all = item
         trait_res = _run_trait_pipeline(
             X_all, y, vt_all, trait, folds_run, output_dir, quick_test)
         all_results[trait] = trait_res
@@ -2292,7 +2314,7 @@ def load_rice_data():
         y = np.array(td['values']).astype(np.float32)
         X_t = G[idxs]
         mask = ~np.isnan(y) & (y > -8)  # -9 is missing-value sentinel
-        trait_data[t] = (_as_model_input(X_t[mask]), y[mask], None)
+        trait_data[t] = (_as_model_input(X_t[mask]), y[mask])
         if mask.sum() < len(y):
             print(f"  {t}: {mask.sum()} samples (removed {len(y) - mask.sum()} sentinel -9)")
     return trait_data
@@ -2373,7 +2395,7 @@ def run_maize(quick_test=True):
     else:
         print(f"  Low-variance filter: all {X_all.shape[1]} markers kept")
 
-    trait_data = {trait: (_as_model_input(X_all), y.astype(np.float32), None)
+    trait_data = {trait: (_as_model_input(X_all), y.astype(np.float32))
                   for trait, y in y_dict.items()}
     _run_ensemble_traits(trait_data, output_dir, 'Maize', quick_test)
 
@@ -2382,28 +2404,38 @@ def run_maize(quick_test=True):
 # ============================================================================
 
 def load_easygese_data(data_dir, trait_names=None):
-    """Generic loader for genotype_matrix.npz + trait_data.json format.
+    """Generic loader for EasyGeSe-style genotype NPZ + trait JSON data.
 
-    Automatically handles both numeric trait keys (trait_00, trait_01, …) and
-    semantic trait names via an optional ``_trait_names`` metadata field in the
-    JSON.
-
-    Parameters
-    ----------
-    data_dir : str
-        Path to the data directory containing ``genotype_matrix.npz`` and
-        ``trait_data.json``.
-    trait_names : list of str or None
-        Manual override for trait names.  If ``None`` the function tries to
-        read ``_trait_names`` from the JSON; if that is also missing the raw
-        numeric keys (``trait_00``, …) are used verbatim.
-
-    Returns
-    -------
-    trait_data : dict {trait_name: (X, y)}
+    The loader keeps the downstream contract ``{trait_name: (X, y)}`` but is
+    tolerant to common schema variants: genotype arrays named ``G``/``X``/etc.,
+    numeric ``trait_00`` keys, a nested ``traits`` dict, or semantic top-level
+    trait keys.
     """
-    data = np.load(os.path.join(data_dir, "genotype_matrix.npz"), allow_pickle=True)
-    G = data['G']
+    genotype_path = os.path.join(data_dir, "genotype_matrix.npz")
+    npz = np.load(genotype_path, allow_pickle=True)
+    try:
+        keys = list(npz.files)
+        preferred = ['G', 'genotype', 'genotypes', 'X', 'matrix', 'genotype_matrix']
+        G = None
+        g_key = None
+        for key in preferred + [k for k in keys if k not in preferred]:
+            if key not in keys:
+                continue
+            arr = np.asarray(npz[key])
+            if arr.ndim == 2 and np.issubdtype(arr.dtype, np.number):
+                G = arr
+                g_key = key
+                break
+        if G is None:
+            raise ValueError(f"No 2D numeric genotype matrix found in {genotype_path}; "
+                             f"available keys={keys}")
+    finally:
+        npz.close()
+
+    G = _as_model_input(G)
+    if g_key != 'G':
+        print(f"  [INFO] Using genotype matrix key '{g_key}' from {genotype_path}")
+
     with open(os.path.join(data_dir, "trait_data.json"), encoding='utf-8') as f:
         trait_info = json.load(f)
 
@@ -2416,35 +2448,105 @@ def load_easygese_data(data_dir, trait_names=None):
         G = G[:, keep]
         print(f"  Low-variance filter: {n_before} -> {G.shape[1]} markers kept")
 
-    # Detect numeric trait keys (sorted by suffix number)
-    num_keys = sorted([k for k in trait_info if k.startswith('trait_') and k[6:].isdigit()],
-                      key=lambda k: int(k[6:]))
-    if not num_keys:
-        raise ValueError(f"No `trait_NN` keys found in {data_dir}/trait_data.json")
+    metadata_keys = {'_trait_names', 'trait_names', 'samples', 'sample_ids', 'metadata'}
 
-    # Resolve semantic names
+    def _numeric_trait_sort(keys_in):
+        num = [k for k in keys_in if isinstance(k, str) and k.startswith('trait_') and k[6:].isdigit()]
+        if num:
+            return sorted(num, key=lambda k: int(k[6:]))
+        return list(keys_in)
+
+    num_keys = _numeric_trait_sort(trait_info.keys())
+    num_keys = [k for k in num_keys if isinstance(k, str) and k.startswith('trait_') and k[6:].isdigit()]
+    if num_keys:
+        trait_items = [(k, trait_info[k]) for k in num_keys]
+    else:
+        traits_obj = trait_info.get('traits')
+        if isinstance(traits_obj, dict):
+            trait_items = [(k, traits_obj[k]) for k in _numeric_trait_sort(traits_obj.keys())]
+        else:
+            trait_items = [(k, v) for k, v in trait_info.items()
+                           if k not in metadata_keys and isinstance(v, (dict, list))]
+        if not trait_items:
+            raise ValueError(f"No trait entries found in {data_dir}/trait_data.json")
+
     if trait_names is None:
-        trait_names = trait_info.get('_trait_names', None)
-    if trait_names is None:
-        trait_names = num_keys  # fall back to numeric keys
+        trait_names = trait_info.get('_trait_names', trait_info.get('trait_names', None))
+    if isinstance(trait_names, str):
+        trait_names = [trait_names]
+    if trait_names is not None and not isinstance(trait_names, dict):
+        trait_names = list(trait_names)
+        if len(trait_names) < len(trait_items):
+            print(f"  [WARN] Only {len(trait_names)} trait names for {len(trait_items)} keys; "
+                  "using provided names + key fallback")
 
-    if len(trait_names) < len(num_keys):
-        print(f"  [WARN] Only {len(trait_names)} trait names for {len(num_keys)} keys; "
-              f"using provided names + numeric fallback")
-        trait_names = list(trait_names) + num_keys[len(trait_names):]
+    def _display_name(i, key):
+        if isinstance(trait_names, dict):
+            return str(trait_names.get(key, key))
+        if trait_names is not None and i < len(trait_names):
+            return str(trait_names[i])
+        return str(key)
 
-    print(f"  {G.shape[0]} samples x {G.shape[1]} SNPs  |  {len(num_keys)} traits")
+    def _to_float(value):
+        if value is None:
+            return np.nan
+        if isinstance(value, str):
+            s = value.strip()
+            if s.lower() in ('', 'na', 'nan', 'null', 'none', 'missing'):
+                return np.nan
+            value = s
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return np.nan
+
+    def _extract_values(td):
+        if isinstance(td, dict):
+            for key in ('values', 'phenotypes', 'phenotype', 'y', 'trait_values'):
+                if key in td:
+                    return td[key]
+        elif isinstance(td, list):
+            return td
+        return None
+
+    def _extract_indices(td, n_values):
+        if isinstance(td, dict):
+            for key in ('genotype_indices', 'sample_indices', 'indices'):
+                if key in td:
+                    return td[key]
+        return np.arange(n_values)
+
+    print(f"  {G.shape[0]} samples x {G.shape[1]} SNPs  |  {len(trait_items)} traits")
 
     trait_data = {}
-    for i, key in enumerate(num_keys):
-        tname = trait_names[i]
-        td = trait_info[key]
-        idxs = td['genotype_indices']
-        y = np.array(td['values']).astype(np.float32)
-        X_t = G[idxs]
-        mask = ~np.isnan(y)
-        trait_data[tname] = (_as_model_input(X_t[mask]), y[mask], None)
+    for i, (key, td) in enumerate(trait_items):
+        tname = _display_name(i, key)
+        raw_values = _extract_values(td)
+        if raw_values is None:
+            print(f"  [WARN] Trait {key}: no values field found, skipping")
+            continue
+        y = np.asarray([_to_float(v) for v in raw_values], dtype=np.float32)
+        try:
+            idxs = np.asarray(_extract_indices(td, len(y)), dtype=np.int64)
+        except (TypeError, ValueError):
+            print(f"  [WARN] Trait {key}: invalid sample indices, skipping")
+            continue
+        if len(idxs) != len(y):
+            n = min(len(idxs), len(y))
+            print(f"  [WARN] Trait {key}: {len(idxs)} indices vs {len(y)} values; truncating to {n}")
+            idxs, y = idxs[:n], y[:n]
+        in_bounds = (idxs >= 0) & (idxs < G.shape[0])
+        if not np.all(in_bounds):
+            print(f"  [WARN] Trait {key}: dropping {np.sum(~in_bounds)} out-of-range indices")
+            idxs, y = idxs[in_bounds], y[in_bounds]
+        mask = np.isfinite(y)
+        if not np.any(mask):
+            print(f"  [WARN] Trait {key}: no finite phenotype values after filtering, skipping")
+            continue
+        trait_data[tname] = (_as_model_input(G[idxs][mask]), y[mask])
 
+    if not trait_data:
+        raise ValueError(f"No usable traits found in {data_dir}/trait_data.json")
     return trait_data
 
 
@@ -2530,12 +2632,12 @@ def _mean_r2(data, model_name):
 def _dataset_specs():
     """Unified plotting dataset specifications."""
     return [
-        {'tag': 'Wheat', 'sub': 'wheat', 'fig': '08', 'ncols': 2, 'figsize': (24, 14)},
-        {'tag': 'Wheat2000', 'sub': 'wheat2000', 'fig': '08', 'ncols': 2, 'figsize': (24, 18)},
-        {'tag': 'Rice', 'sub': 'rice', 'fig': '09', 'ncols': 2, 'figsize': (24, 30)},
-        {'tag': 'Maize', 'sub': 'maize', 'fig': '10', 'ncols': 2, 'figsize': (24, 12)},
-        {'tag': 'Soybean', 'sub': 'soybean', 'fig': '10', 'ncols': 2, 'figsize': (18, 8)},
-        {'tag': 'WheatGABI', 'sub': 'wheat_gabi', 'fig': '10', 'ncols': 4, 'figsize': (32, 24)},
+        {'tag': 'Wheat', 'sub': 'wheat', 'bar_prefix': '08_wheat', 'scatter_prefix': '05_wheat', 'ncols': 2, 'figsize': (24, 14)},
+        {'tag': 'Wheat2000', 'sub': 'wheat2000', 'bar_prefix': '08_wheat2000', 'scatter_prefix': '11_wheat2000', 'ncols': 2, 'figsize': (24, 18)},
+        {'tag': 'Rice', 'sub': 'rice', 'bar_prefix': '09_rice', 'scatter_prefix': '05_rice', 'ncols': 2, 'figsize': (24, 30)},
+        {'tag': 'Maize', 'sub': 'maize', 'bar_prefix': '10_maize', 'scatter_prefix': '06_maize', 'ncols': 2, 'figsize': (24, 12)},
+        {'tag': 'Soybean', 'sub': 'soybean', 'bar_prefix': '10_soybean', 'scatter_prefix': '06_soybean', 'ncols': 2, 'figsize': (18, 8)},
+        {'tag': 'WheatGABI', 'sub': 'wheat_gabi', 'bar_prefix': '10_wheat_gabi', 'scatter_prefix': '11_wheat_gabi', 'ncols': 4, 'figsize': (32, 24)},
     ]
 
 
@@ -2725,7 +2827,8 @@ def _per_trait_bar_figures(DATASETS, fig_dir):
     """Generate per-trait bar chart figures (one figure per dataset)."""
     import matplotlib.pyplot as plt
 
-    layout = {spec['tag']: (spec['fig'], spec['ncols'], spec['figsize'], spec['sub'])
+    layout = {spec['tag']: (spec.get('bar_prefix', spec.get('fig', 'xx')),
+                            spec['ncols'], spec['figsize'], spec['sub'])
               for spec in _dataset_specs()}
     for dname, data, traits in DATASETS:
         fig_num, ncols, fsize, sub = layout.get(dname, ('xx', 2, (24, 18), dname.lower()))
@@ -2761,7 +2864,7 @@ def _per_trait_bar_figures(DATASETS, fig_dir):
             axes_arr[idx].axis('off')
         fig.suptitle(f'{dname}: Per-Trait Model R² Comparison', fontsize=14, fontweight='bold')
         fig.tight_layout()
-        out = fig_dir / f'{fig_num}_{sub}_per_trait_bars.png'
+        out = fig_dir / f'{fig_num}_per_trait_bars.png'
         fig.savefig(out, dpi=180, bbox_inches='tight', facecolor='white')
         plt.close()
         print(f"  -> {out.name}")
@@ -2835,7 +2938,8 @@ def generate_scatter_plots(fig_dir=None, datasets=None):
                     axes[row_idx, col_idx].axis('off')
             if any_trait:
                 fig.tight_layout()
-                out_path = fig_dir / f'{spec["fig"]}_{sub}_{arm}_top4_scatter.png'
+                fig_prefix = spec.get('scatter_prefix', spec.get('fig', f'xx_{sub}'))
+                out_path = fig_dir / f'{fig_prefix}_{arm}_top4_scatter.png'
                 fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
                 plt.close()
                 print(f"  -> {out_path.name}")
@@ -2989,14 +3093,22 @@ def generate_efficiency_plots(fig_dir=None, include_random=False, datasets=None)
 
 
 def generate_all_plots(fig_dir=None, include_scatter=True, include_efficiency=True, fail_soft=True):
-    """Generate all standard figures while loading result JSONs only once."""
+    """Generate all standard figures while loading result JSONs only once.
+
+    Returns ``True`` when every requested plotting function completed without
+    raising, otherwise ``False``.  Non-exception skips (for example missing OOF
+    NPZ files) remain normal successful outcomes.
+    """
     datasets = _load_plot_datasets()
+    ok = True
 
     def _call(label, fn, *args, **kwargs):
+        nonlocal ok
         if fail_soft:
             try:
                 return fn(*args, **kwargs)
             except Exception as e:
+                ok = False
                 print(f"  [WARNING] {label} generation failed: {e}")
                 return None
         return fn(*args, **kwargs)
@@ -3006,6 +3118,7 @@ def generate_all_plots(fig_dir=None, include_scatter=True, include_efficiency=Tr
         _call('Scatter plot', generate_scatter_plots, fig_dir=fig_dir, datasets=datasets)
     if include_efficiency:
         _call('Efficiency plot', generate_efficiency_plots, fig_dir=fig_dir, datasets=datasets)
+    return ok
 
 
 
@@ -3040,14 +3153,17 @@ if __name__ == '__main__':
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*80}")
 
+    exit_code = 0
+
     def _run_all_plots():
-        generate_all_plots(fail_soft=True)
+        return generate_all_plots(fail_soft=True)
 
     if plot_only:
         print(f"\n{'#'*80}")
         print("  Generating visualization figures only...")
         print(f"{'#'*80}")
-        _run_all_plots()
+        if not _run_all_plots():
+            exit_code = 2
     elif crop == 'all':
         import subprocess
         procs = []
@@ -3062,11 +3178,14 @@ if __name__ == '__main__':
         for i, p in enumerate(procs):
             p.wait()
             print(f"  Subprocess {all_crops[i]} finished (rc={p.returncode})")
+            if p.returncode:
+                exit_code = p.returncode if exit_code == 0 else exit_code
         if full_mode and not no_plots:
             print(f"\n{'#'*80}")
             print("  Generating visualization figures once after all subprocesses...")
             print(f"{'#'*80}")
-            _run_all_plots()
+            if not _run_all_plots() and exit_code == 0:
+                exit_code = 2
     else:
         if crop == 'wheat': run_wheat(quick_test=not full_mode)
         if crop == 'wheat2000': run_wheat2000(quick_test=not full_mode)
@@ -3080,8 +3199,13 @@ if __name__ == '__main__':
         print(f"\n{'#'*80}")
         print(f"  Generating visualization figures...")
         print(f"{'#'*80}")
-        _run_all_plots()
+        if not _run_all_plots() and exit_code == 0:
+            exit_code = 2
 
     print(f"\n{'#'*80}")
-    print(f"  All done! Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if exit_code:
+        print(f"  Finished with failures (exit={exit_code}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        print(f"  All done! Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*80}")
+    sys.exit(exit_code)
