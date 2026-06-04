@@ -2,26 +2,22 @@
 """
 Genomic Prediction Ensemble — Consolidated Self-Contained Script
 ==================================================================
-Wheat + Rice + Maize pipelines bundled into one file for HPC deployment.
-No local imports — all model definitions, training utilities, and shared
-modules are inlined.
+Wheat + Wheat2000 + Rice + Maize + Soybean + WheatGABI pipelines bundled
+into one file for HPC deployment.  No local imports — all model definitions,
+training utilities, and shared modules are inlined.
 
 Usage:
-  python genomic_ensemble.py wheat          # Quick test: 1 trait x 2 folds
-  python genomic_ensemble.py wheat --full   # Full: all traits x 5 folds
-  python genomic_ensemble.py rice
-  python genomic_ensemble.py rice --full
-  python genomic_ensemble.py maize
-  python genomic_ensemble.py maize --full
-  python genomic_ensemble.py all --full     # Run all three crops
+  python genomic_ensemble.py wheat --no-plots       # Quick test: 1 trait x 2 folds
+  python genomic_ensemble.py wheat --full           # Full: all traits x 5 folds
+  python genomic_ensemble.py all --full             # Run all six datasets
+  python genomic_ensemble.py plot --plot-only       # Regenerate figures only
 """
 
-import json, time, os, sys, random
+import json, time, os, sys, random, hashlib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
-from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import RidgeCV, ElasticNetCV, LassoCV
 from scipy.stats import pearsonr
 import xgboost as xgb
@@ -94,18 +90,52 @@ SOYBEAN_TRAIT_NAMES = ['Canopy_wilting', 'Water_use_efficiency']
 # Wheat GABI data paths (EasyGeSe benchmark — iSELECT 90k chip)
 WHEAT_GABI_DATA_DIR = PROJECT_DIR + "/results/wheat_GABI"
 
-# Seed
-random.seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(RANDOM_SEED)
-    torch.cuda.manual_seed_all(RANDOM_SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+# Seed / deterministic helpers
+def set_global_seed(seed=RANDOM_SEED):
+    """Set all process-local RNGs used by this script."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_global_seed(RANDOM_SEED)
 # PYTHONHASHSEED must be set at process launch: export PYTHONHASHSEED=42
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def _stable_seed(*parts, base=RANDOM_SEED):
+    """Stable 31-bit seed independent of Python's hash randomization."""
+    text = '|'.join(str(p) for p in (base, *parts))
+    return int(hashlib.sha256(text.encode('utf-8')).hexdigest()[:8], 16) % (2**31 - 1)
+
+
+def _as_model_input(X):
+    """Return genotype features in the canonical no-scaler representation."""
+    return np.asarray(X, dtype=np.float32)
+
+
+def _safe_corr(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    if len(y_true) < 2 or np.std(y_true) < 1e-12 or np.std(y_pred) < 1e-12:
+        return 0.0
+    val = pearsonr(y_true, y_pred)[0]
+    return 0.0 if np.isnan(val) else float(val)
+
+
+def _metric_values(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    return (float(r2_score(y_true, y_pred)),
+            _safe_corr(y_true, y_pred),
+            float(np.sqrt(np.mean((y_pred - y_true) ** 2))))
 
 TYPE_TRAD = 'Traditional'
 TYPE_DL = 'DL'
@@ -1046,12 +1076,20 @@ def train_torch_model(model, X_train, y_train,
                       epochs=300, batch_size=128, lr=1e-3, weight_decay=1e-4,
                       patience=30, val_ratio=0.15, grad_clip=1.0,
                       use_swa=False, use_mixup=False, mixup_alpha=0.4,
-                      label_smooth=0.0, colsample=1.0, l1_lambda=0.0):
+                      label_smooth=0.0, colsample=1.0, l1_lambda=0.0,
+                      seed=None):
+    if seed is not None:
+        set_global_seed(seed)
     model = model.to(DEVICE)
     n_total = len(X_train)
     n_snps = X_train.shape[1]
     n_val = max(1, int(n_total * val_ratio))
-    rng = np.random.RandomState(RANDOM_SEED)
+    base_seed = RANDOM_SEED if seed is None else int(seed)
+    rng = np.random.RandomState(base_seed)
+    torch_gen = torch.Generator(device=DEVICE.type if DEVICE.type == 'cuda' else 'cpu')
+    torch_gen.manual_seed(base_seed)
+    dl_base_gen = torch.Generator()
+    dl_base_gen.manual_seed(base_seed)
     idx = rng.permutation(n_total)
     val_idx, tr_idx = idx[:n_val], idx[n_val:]
     Xt_full = torch.FloatTensor(X_train[tr_idx]).to(DEVICE)
@@ -1067,7 +1105,7 @@ def train_torch_model(model, X_train, y_train,
         model.train()
         # Per-epoch colsample: same feature mask for all samples this epoch
         if colsample < 1.0:
-            cmask = torch.rand(n_snps, device=DEVICE) < colsample
+            cmask = torch.rand(n_snps, device=DEVICE, generator=torch_gen) < colsample
             Xt = Xt_full * cmask.float()
             Xv = Xv_full * cmask.float()
         else:
@@ -1076,16 +1114,18 @@ def train_torch_model(model, X_train, y_train,
         # Avoid batch of size 1 (kills BatchNorm): absorb singleton into previous batch
         while len(tr_idx) % bs == 1 and bs > 1:
             bs += 1
-        dl = DataLoader(TensorDataset(Xt, yt), batch_size=bs, shuffle=True)
+        dl_gen = torch.Generator()
+        dl_gen.manual_seed(base_seed + ep)
+        dl = DataLoader(TensorDataset(Xt, yt), batch_size=bs, shuffle=True, generator=dl_gen)
         for bx, by in dl:
             if use_mixup and ep >= 5:
-                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                lam = rng.beta(mixup_alpha, mixup_alpha)
                 lam = max(lam, 1.0 - lam)
-                perm = torch.randperm(bx.size(0), device=DEVICE)
+                perm = torch.randperm(bx.size(0), device=DEVICE, generator=torch_gen)
                 bx = lam * bx + (1.0 - lam) * bx[perm]
                 by = lam * by + (1.0 - lam) * by[perm]
             if label_smooth > 0:
-                noise = torch.randn_like(by) * label_smooth
+                noise = torch.randn(by.shape, device=by.device, dtype=by.dtype, generator=torch_gen) * label_smooth
                 by = by + noise
             opt.zero_grad()
             loss = crit(model(bx).squeeze(), by)
@@ -1151,21 +1191,21 @@ class GBLUP:
 
 
 class XGBoostModel:
-    def __init__(self, n_estimators=500, max_depth=6, lr=0.05):
+    def __init__(self, n_estimators=500, max_depth=6, lr=0.05, seed=RANDOM_SEED):
         self.params = {
             'n_estimators': n_estimators, 'max_depth': max_depth,
             'learning_rate': lr, 'subsample': 0.8, 'colsample_bytree': 0.8,
             'reg_alpha': 0.1, 'reg_lambda': 1.0,
-            'random_state': RANDOM_SEED, 'n_jobs': 8, 'verbosity': 0}
+            'random_state': int(seed), 'n_jobs': 8, 'verbosity': 0}
     def fit(self, X, y): self.model = xgb.XGBRegressor(**self.params); self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
 
 
 class ElasticNetModel:
-    def __init__(self):
+    def __init__(self, seed=RANDOM_SEED):
         self.model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
                                   alphas=np.logspace(-4, 2, 20),
-                                  cv=3, random_state=RANDOM_SEED, max_iter=5000, n_jobs=8)
+                                  cv=3, random_state=int(seed), max_iter=5000, n_jobs=8)
     def fit(self, X, y): self.model.fit(X, y); return self
     def predict(self, X): return self.model.predict(X)
 
@@ -1207,50 +1247,73 @@ def maf_filter(X, threshold=MAF_THRESHOLD):
     return np.where(maf >= threshold)[0]
 
 
-def _select_dl_markers(Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps):
-    """Select markers for DL models based on global MARKER_SELECTOR config."""
+def _make_fold_candidate_universe(Xtr_raw, Xte_raw, vt_all, n_requested):
+    """Build the shared post-MAF candidate universe for one CV fold."""
+    maf_idx = maf_filter(Xtr_raw)
+    if len(maf_idx) > 0:
+        Xtr_cand = Xtr_raw[:, maf_idx]
+        Xte_cand = Xte_raw[:, maf_idx]
+        vt_cand = vt_all[maf_idx] if vt_all is not None else None
+        cand_orig_idx = maf_idx
+    else:
+        Xtr_cand = Xtr_raw
+        Xte_cand = Xte_raw
+        vt_cand = vt_all
+        cand_orig_idx = np.arange(Xtr_raw.shape[1])
+    n_selected = min(int(n_requested), Xtr_cand.shape[1])
+    if n_selected <= 0:
+        raise ValueError("No SNP candidates available after filtering")
+    return Xtr_cand, Xte_cand, vt_cand, cand_orig_idx, n_selected
+
+
+def _make_tuning_matrix(X_all, y, n_requested):
+    """Use GWAS-selected post-MAF features for one shared hyperparameter search."""
+    maf_idx = maf_filter(X_all)
+    if len(maf_idx) > 0:
+        X_cand = X_all[:, maf_idx]
+    else:
+        X_cand = X_all
+    n_selected = min(int(n_requested), X_cand.shape[1])
+    gidx_t = gwas_select(X_cand, y, n_selected)
+    return _as_model_input(X_cand[:, gidx_t]), n_selected
+
+
+def _select_dl_markers(Xtr_cand, Xte_cand, ytr, gidx_gwas, vt_cand, n_selected):
+    """Select markers for DL models from the same fold candidate universe."""
     if MARKER_SELECTOR == 'haplotype':
-        gidx_dl = haplotype_select(Xtr_raw, ytr, n_snps, vt_maf)
+        gidx_dl = haplotype_select(Xtr_cand, ytr, n_selected, vt_cand)
     elif MARKER_SELECTOR == 'hybrid':
-        gidx_dl = hybrid_select(Xtr_raw, ytr, n_snps, vt_maf, gwas_frac=HAPLO_GWAS_FRAC)
+        gidx_dl = hybrid_select(Xtr_cand, ytr, n_selected, vt_cand, gwas_frac=HAPLO_GWAS_FRAC)
     else:
         gidx_dl = gidx_gwas
-    Xtr_dl = Xtr_raw[:, gidx_dl]; Xte_dl = Xte_raw[:, gidx_dl]
-    vt_dl = vt_maf[gidx_dl] if vt_maf is not None else None
-    sc_dl = StandardScaler(); Xtr_dl_s = sc_dl.fit_transform(Xtr_dl).astype(np.float32)
-    Xte_dl_s = sc_dl.transform(Xte_dl).astype(np.float32)
-    return gidx_dl, vt_dl, Xtr_dl_s, Xte_dl_s
+    Xtr_dl = _as_model_input(Xtr_cand[:, gidx_dl])
+    Xte_dl = _as_model_input(Xte_cand[:, gidx_dl])
+    vt_dl = vt_cand[gidx_dl] if vt_cand is not None else None
+    return gidx_dl, vt_dl, Xtr_dl, Xte_dl
 
 
-def _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
-                          results, oof_trad_r, oof_dl_r, tuned_params=None):
-    """Train all models on randomly-selected SNPs (GWAS control experiment).
+def _run_fold_random_pass(Xtr_cand, Xte_cand, ytr, yte, te_idx, n_selected, fold_i,
+                          results, oof_trad_r, oof_dl_r, tuned_params=None,
+                          seed_context=''):
+    """Train all models on random SNPs from the same post-MAF candidate universe."""
+    gidx_r = random_snp_select(
+        Xtr_cand, n_selected,
+        seed=_stable_seed(seed_context, fold_i, 'random_snp_selection'))
+    Xtr_rs = _as_model_input(Xtr_cand[:, gidx_r])
+    Xte_rs = _as_model_input(Xte_cand[:, gidx_r])
 
-    Called per-fold after the regular GWAS pass. Uses the same CV split
-    (tr/te) but a different set of SNPs, selected deterministically via
-    ``random_snp_select(seed=42 + fold_i)``.
+    G_fold_train_r = Xtr_rs @ Xtr_rs.T / n_selected
+    G_fold_te_tr_r = Xte_rs @ Xtr_rs.T / n_selected
 
-    When ``tuned_params`` is provided, it is used for DL model hyperparams
-    (mirroring the GWAS pass) to ensure a fair controlled experiment.
-    Model names are suffixed with ``_random`` in results/oof dicts.
-    """
-    tp = tuned_params or {}
-    gidx_r = random_snp_select(Xtr_raw, n_snps, seed=42 + fold_i)
-    Xtr_r = Xtr_raw[:, gidx_r]; Xte_r = Xte_raw[:, gidx_r]
-    sc_r = StandardScaler()
-    Xtr_rs = sc_r.fit_transform(Xtr_r).astype(np.float32)
-    Xte_rs = sc_r.transform(Xte_r).astype(np.float32)
-
-    G_fold_train_r = Xtr_rs @ Xtr_rs.T / n_snps
-    G_fold_te_tr_r = Xte_rs @ Xtr_rs.T / n_snps
-
-    # Traditional models (random SNPs)
-    trad_configs_r = _make_trad_configs(G_fold_train_r, G_fold_te_tr_r, n_snps, len(Xtr_rs))
+    # Traditional models (random SNPs); paired seed matches GWAS arm.
+    trad_seed = _stable_seed(seed_context, fold_i, 'traditional', 'train')
+    trad_configs_r = _make_trad_configs(G_fold_train_r, G_fold_te_tr_r, n_selected, len(Xtr_rs), seed=trad_seed)
     for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs_r:
+        set_global_seed(_stable_seed(seed_context, fold_i, tname, 'train'))
         t0 = time.time()
         tmodel = build_fn()
         fit_fn(tmodel, Xtr_rs, ytr)
-        preds = pred_fn(tmodel, Xte_rs)
+        preds = np.asarray(pred_fn(tmodel, Xte_rs), dtype=np.float32)
         rname = f'{tname}_random'
         results[rname]['preds'].extend(preds.tolist())
         results[rname]['targets'].extend(yte.tolist())
@@ -1259,21 +1322,22 @@ def _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
             results[rname]['params'] = param_count
         oof_trad_r[tname][te_idx] = preds
 
-    # DL models (random SNPs)
+    # DL models (random SNPs); paired seed matches GWAS arm for the same fold/model.
     for mname in DL_NAMES:
-        model_tp = tp.get(mname, {})
-        model = create_model(mname, n_snps, overrides=model_tp)
+        hp = _get_train_hparams(mname, tuned_params)
+        train_seed = _stable_seed(seed_context, fold_i, mname, 'train')
+        set_global_seed(train_seed)
+        model_tp = (tuned_params or {}).get(mname, {})
+        model = create_model(mname, n_selected, overrides=model_tp)
         t0 = time.time()
         if fold_i == 0:
             results[f'{mname}_random']['params'] = sum(p.numel() for p in model.parameters())
-        bs = _get_batch_size(mname)
-        lr = model_tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-        wd = model_tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
-        pat = model_tp.get('patience', 30)
         if DEVICE.type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
-        model = train_torch_model(model, Xtr_rs, ytr, epochs=300, batch_size=bs,
-                                  lr=lr, weight_decay=wd, patience=pat)
+        model = train_torch_model(model, Xtr_rs, ytr, epochs=300,
+                                  batch_size=hp['batch_size'], lr=hp['lr'],
+                                  weight_decay=hp['weight_decay'],
+                                  patience=hp['patience'], seed=train_seed)
         if DEVICE.type == 'cuda':
             results[f'{mname}_random']['gpu_mem'] = max(
                 results[f'{mname}_random']['gpu_mem'],
@@ -1285,10 +1349,9 @@ def _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
         results[rname]['targets'].extend(yte.tolist())
         results[rname]['time'] += elapsed
         print(f"    {rname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-        if mname in DL_BASE_NAMES:
-            oof_dl_r[mname][te_idx] = preds
+        oof_dl_r[mname][te_idx] = preds
+        del model
     torch.cuda.empty_cache()
-
 
 def create_model(name, n_snps, overrides=None):
     o = overrides or {}
@@ -1325,6 +1388,7 @@ LASSO_ALPHAS = np.logspace(-4, 2, 30)
 ENET_ALPHAS = np.logspace(-4, 2, 20)
 
 TRAD_NAMES = ['RRBLUP', 'GBLUP', 'XGBoost', 'ElasticNet', 'GWAS_RRBLUP']
+# FGN v8 is intentionally excluded: it is a documented failed model variant.
 DL_BASE_NAMES = ['FGN', 'FGN v2', 'FGN v4', 'FGN v5', 'FGN v6', 'FGN v7', 'FGN v9', 'FGN v10', 'FGN v11', 'FGNplus', 'GenomicFM', 'FGN PCA', 'WheatGP']
 DL_NAMES = DL_BASE_NAMES + ['FusionNet', 'AdditiveGenomicNet']
 ALL_NAMES = TRAD_NAMES + DL_NAMES
@@ -1348,13 +1412,25 @@ def _get_batch_size(mname):
     return 32 if mname.startswith('FGN') else 128
 
 
-def _make_trad_configs(G_train, G_te_tr, n_snps, n_train):
+def _get_train_hparams(mname, tuned_params=None):
+    """Return the canonical DL training hyperparameters for one model."""
+    tp = (tuned_params or {}).get(mname, {})
+    return {
+        'batch_size': _get_batch_size(mname),
+        'lr': tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3),
+        'weight_decay': tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3),
+        'patience': tp.get('patience', 30),
+    }
+
+
+def _make_trad_configs(G_train, G_te_tr, n_snps, n_train, seed=RANDOM_SEED):
     """Per-fold traditional model configs — GBLUP closures capture G matrices."""
+    seed = int(seed)
     return [
         ('RRBLUP', lambda: RRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps + 1),
         ('GBLUP', lambda: GBLUP(), lambda m, _x, yt: m.fit(G_train, yt), lambda m, _x: m.predict(G_te_tr), n_train + 1),
-        ('XGBoost', lambda: XGBoostModel(n_estimators=300), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), 300 * 6 * 2),
-        ('ElasticNet', lambda: ElasticNetModel(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps + 1),
+        ('XGBoost', lambda: XGBoostModel(n_estimators=300, seed=seed), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), 300 * 6 * 2),
+        ('ElasticNet', lambda: ElasticNetModel(seed=seed), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps + 1),
         ('GWAS_RRBLUP', lambda: GWASWeightedRRBLUP(), lambda m, Xs, yt: m.fit(Xs, yt), lambda m, Xs: m.predict(Xs), n_snps * 2 + 1),
     ]
 
@@ -1475,64 +1551,75 @@ def _greedy_forward_select(oof_preds_dict, targets, meta_type='ElasticNet',
 
 def stacking_evaluate(oof_preds_dict, targets, n_folds=5,
                       meta_type='ElasticNet', prune_corr=True):
-    """Evaluate a stacking ensemble with flexible meta-learner and optional pruning.
+    """Evaluate stacking from original-order OOF base predictions.
 
-    Args:
-        oof_preds_dict: {model_name: OOF_predictions_array}
-        targets: phenotype values
-        n_folds: inner CV folds for honest evaluation
-        meta_type: 'ElasticNet' (default), 'Ridge', 'Lasso'
-        prune_corr: if True, correlation-prune before stacking (r > 0.995)
-
-    Returns:
-        dict with R2, Correlation, Meta_weights, Meta_intercept, Base_models,
-        Pruned_models (if pruning was applied)
+    Returns honest inner-CV OOF predictions, R², correlation, and true RMSE.
     """
+    targets = np.asarray(targets, dtype=np.float64)
+    oof_preds_dict = {k: np.asarray(v, dtype=np.float64) for k, v in oof_preds_dict.items()}
     original_names = list(oof_preds_dict.keys())
     pruned_names = []
+
+    if not original_names:
+        fallback = np.full(len(targets), float(np.mean(targets)), dtype=np.float64)
+        r2_v, corr_v, rmse_v = _metric_values(targets, fallback)
+        return {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+                'OOF_predictions': fallback.tolist(), 'Meta_weights': [],
+                'Meta_intercept': float(np.mean(targets)), 'Base_models': [],
+                'Pruned_models': [], 'Meta_type': meta_type}
 
     if prune_corr and len(original_names) > 2:
         oof_preds_dict, pruned_names = _prune_correlated(oof_preds_dict, targets)
 
     base_names = list(oof_preds_dict.keys())
     if len(base_names) < 2:
-        # single model → just return its performance
-        r2_v = float(r2_score(targets, oof_preds_dict[base_names[0]]))
-        corr_v = float(pearsonr(targets, oof_preds_dict[base_names[0]])[0])
-        return {'R2': r2_v, 'Correlation': corr_v,
-                'Meta_weights': [1.0], 'Meta_intercept': 0.0,
-                'Base_models': base_names, 'Pruned_models': pruned_names}
+        only = base_names[0]
+        sp = np.asarray(oof_preds_dict[only], dtype=np.float64)
+        r2_v, corr_v, rmse_v = _metric_values(targets, sp)
+        return {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+                'OOF_predictions': sp.tolist(), 'Meta_weights': [1.0],
+                'Meta_intercept': 0.0, 'Base_models': base_names,
+                'Pruned_models': pruned_names, 'Meta_type': meta_type}
 
     X_meta = np.column_stack([oof_preds_dict[m] for m in base_names])
 
-    # Inner CV for honest evaluation
-    kf = KFold(n_splits=min(n_folds, len(targets)//3), shuffle=True, random_state=RANDOM_SEED)
-    sp = np.zeros(len(targets))
+    n_splits = min(n_folds, max(2, len(targets) // 3), len(targets))
+    sp = np.zeros(len(targets), dtype=np.float64)
 
-    for tr, te in kf.split(X_meta):
-        if meta_type == 'Lasso':
-            m = LassoCV(alphas=LASSO_ALPHAS, cv=3, max_iter=10000, random_state=42)
-        elif meta_type == 'ElasticNet':
-            m = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
-                             alphas=ENET_ALPHAS, cv=3, max_iter=10000, random_state=42)
-        else:  # Ridge (default)
-            m = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=3)
-        m.fit(X_meta[tr], targets[tr])
-        sp[te] = m.predict(X_meta[te])
+    if n_splits < 2:
+        sp[:] = np.mean(targets)
+    else:
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
+        for tr, te in kf.split(X_meta):
+            inner_cv = min(3, max(2, len(tr) // 3), len(tr))
+            if meta_type == 'Lasso':
+                m = LassoCV(alphas=LASSO_ALPHAS, cv=inner_cv, max_iter=10000, random_state=RANDOM_SEED)
+            elif meta_type == 'ElasticNet':
+                m = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
+                                 alphas=ENET_ALPHAS, cv=inner_cv, max_iter=10000,
+                                 random_state=RANDOM_SEED)
+            else:
+                m = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=inner_cv)
+            m.fit(X_meta[tr], targets[tr])
+            sp[te] = m.predict(X_meta[te])
 
-    # Full fit for weight extraction
+    final_cv = min(5, max(2, len(targets) // 3), len(targets))
     if meta_type == 'Lasso':
-        final_meta = LassoCV(alphas=LASSO_ALPHAS, cv=5, max_iter=10000, random_state=42)
+        final_meta = LassoCV(alphas=LASSO_ALPHAS, cv=final_cv, max_iter=10000, random_state=RANDOM_SEED)
     elif meta_type == 'ElasticNet':
         final_meta = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, 1],
-                                  alphas=ENET_ALPHAS, cv=5, max_iter=10000, random_state=42)
+                                  alphas=ENET_ALPHAS, cv=final_cv, max_iter=10000,
+                                  random_state=RANDOM_SEED)
     else:
-        final_meta = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=5)
+        final_meta = RidgeCV(alphas=RIDGE_ALPHAS, fit_intercept=True, cv=final_cv)
     final_meta.fit(X_meta, targets)
 
-    result = {'R2': float(r2_score(targets, sp)),
-              'Correlation': float(pearsonr(targets, sp)[0]),
-              'Meta_weights': final_meta.coef_.tolist(),
+    r2_v, corr_v, rmse_v = _metric_values(targets, sp)
+    result = {'R2': r2_v,
+              'Correlation': corr_v,
+              'RMSE': rmse_v,
+              'OOF_predictions': sp.tolist(),
+              'Meta_weights': np.ravel(final_meta.coef_).astype(float).tolist(),
               'Meta_intercept': float(final_meta.intercept_),
               'Base_models': base_names,
               'Meta_type': meta_type}
@@ -1567,41 +1654,42 @@ def stacking_evaluate_greedy(oof_preds_dict, targets, n_folds=5, meta_type='Elas
     return result
 
 
-def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run, suffix=''):
-    """Run stacking ensembles and add results to trait_res.
+def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run, suffix='', stacking_oof=None):
+    """Run stacking ensembles and add results to trait_res without best-single flooring."""
+    if folds_run < 3:
+        return {}
 
-    Produces 6 ensemble variants (with optional ``suffix`` for _random models):
-      - Stacking (DL)        — DL models only, Ridge meta-learner
-      - Stacking (All)       — all models, Ridge meta-learner
-      - Trad Ensemble        — traditional models only, Ridge
-      - Stacking (Pruned)    — all models, ElasticNet meta-learner, correlation-pruned
-      - Stacking (Greedy)    — greedy forward selection + ElasticNet meta-learner
-      - Stacking (R²+Greedy) — R² filter + greedy forward selection + ElasticNet
-
-    Each variant is floored at best_single_model performance so the ensemble
-    never regresses below the best individual model.
-    """
-    if folds_run < 3: return
+    y = np.asarray(y, dtype=np.float64)
     n_cv = min(5, folds_run)
+    selection = 'random' if suffix else 'gwas'
 
-    singles = [(name, r) for name, r in trait_res.items()
-               if r.get('Type') != TYPE_ENS and not name.startswith('Best')]
-    best_name, best_info = max(singles, key=lambda x: x[1]['R2'])
-    best_single_r2 = best_info['R2']
-    best_single_corr = best_info.get('Correlation', 0.0)
+    def _display_names(names):
+        if not suffix:
+            return list(names)
+        return [name if str(name).endswith(suffix) else f'{name}{suffix}' for name in names]
 
-    def _record(name, result, **extra):
-        """Record a stacking variant with best-single safety floor."""
-        r2 = result['R2']
-        corr = result.get('Correlation', 0.0)
-        if r2 < best_single_r2:
-            r2 = best_single_r2
-            corr = best_single_corr
-        trait_res[name + suffix] = {'R2': r2, 'Correlation': corr, 'RMSE': 0.0,
-                                    'Type': TYPE_ENS,
-                                    'Meta_weights': result.get('Meta_weights', []),
-                                    'Base_models': result.get('Base_models', []),
-                                    **extra}
+    def _record(name, result):
+        out_name = name + suffix
+        entry = {'R2': float(result.get('R2', np.nan)),
+                 'Correlation': float(result.get('Correlation', 0.0)),
+                 'RMSE': float(result.get('RMSE', np.nan)),
+                 'Type': TYPE_ENS,
+                 'DisplayName': out_name,
+                 'Selection': selection,
+                 'Meta_weights': result.get('Meta_weights', []),
+                 'Meta_intercept': float(result.get('Meta_intercept', 0.0)),
+                 'Base_models': _display_names(result.get('Base_models', [])),
+                 'Meta_type': result.get('Meta_type', '')}
+        if 'OOF_predictions' in result and stacking_oof is not None:
+            stacking_oof[out_name] = np.asarray(result['OOF_predictions'], dtype=np.float32)
+        if result.get('Pruned_models'):
+            entry['Pruned_models'] = _display_names(result.get('Pruned_models', []))
+        if result.get('Greedy_selected'):
+            entry['Greedy_selected'] = _display_names(result.get('Greedy_selected', []))
+        if result.get('R2_filtered'):
+            entry['R2_filtered'] = _display_names(result.get('R2_filtered', []))
+        trait_res[out_name] = entry
+        return entry
 
     oof_all = {**oof_trad, **oof_dl}
 
@@ -1616,73 +1704,80 @@ def _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run, suffix='
     _record('Trad Ensemble', tsr)
 
     sp = stacking_evaluate(oof_all, y, n_folds=n_cv, meta_type='ElasticNet', prune_corr=True)
-    _record('Stacking (Pruned)', sp, Pruned_models=sp.get('Pruned_models', []))
+    _record('Stacking (Pruned)', sp)
 
     sg = stacking_evaluate_greedy(oof_all, y, n_folds=n_cv, meta_type='ElasticNet')
-    _record('Stacking (Greedy)', sg,
-            Greedy_selected=sg.get('Greedy_selected', []),
-            Pruned_models=sg.get('Pruned_models', []))
+    _record('Stacking (Greedy)', sg)
 
     oof_r2_filtered, r2_removed = _filter_by_r2(oof_all, y, threshold=0.0)
     if len(oof_r2_filtered) >= 2:
         srg = stacking_evaluate_greedy(oof_r2_filtered, y, n_folds=n_cv, meta_type='ElasticNet')
-        _record('Stacking (R²+Greedy)', srg,
-                Greedy_selected=srg.get('Greedy_selected', []),
-                Pruned_models=srg.get('Pruned_models', []),
-                R2_filtered=r2_removed)
+        srg['R2_filtered'] = r2_removed
+        _record('Stacking (R²+Greedy)', srg)
     else:
         if len(oof_r2_filtered) == 1:
             mname = list(oof_r2_filtered.keys())[0]
-            fallback_r2 = float(r2_score(y, oof_r2_filtered[mname]))
-            fallback_corr = float(pearsonr(y, oof_r2_filtered[mname])[0])
+            fallback = np.asarray(oof_r2_filtered[mname], dtype=np.float64)
+            r2_v, corr_v, rmse_v = _metric_values(y, fallback)
+            srg = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+                   'OOF_predictions': fallback.tolist(),
+                   'Base_models': [mname], 'Greedy_selected': [mname],
+                   'R2_filtered': r2_removed, 'Meta_weights': [1.0],
+                   'Meta_intercept': 0.0, 'Meta_type': 'fallback'}
         else:
-            fallback_r2 = best_single_r2
-            fallback_corr = best_single_corr
-        srg = {'R2': fallback_r2, 'Correlation': fallback_corr}
-        _record('Stacking (R²+Greedy)', srg,
-                Greedy_selected=list(oof_r2_filtered.keys()),
-                Pruned_models=[], R2_filtered=r2_removed)
+            fallback = np.full(len(y), float(np.mean(y)), dtype=np.float64)
+            r2_v, corr_v, rmse_v = _metric_values(y, fallback)
+            srg = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+                   'OOF_predictions': fallback.tolist(),
+                   'Base_models': [], 'Greedy_selected': [],
+                   'R2_filtered': r2_removed, 'Meta_weights': [],
+                   'Meta_intercept': float(np.mean(y)), 'Meta_type': 'mean_fallback'}
+        _record('Stacking (R²+Greedy)', srg)
 
     n_greedy_pool = len(oof_all) - len(sg.get('Pruned_models', []))
-    print(f"  {'Stacking (DL)':<24s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f}")
-    print(f"  {'Stacking (All)':<24s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f}")
-    print(f"  {'Trad Ensemble':<24s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f}")
-    print(f"  {'Stacking (Pruned)':<24s} {sp['R2']:8.4f} {sp['Correlation']:8.4f}  "
-          f"[ElasticNet, pruned={len(sp.get('Pruned_models',[]))}]")
-    print(f"  {'Stacking (Greedy)':<24s} {sg['R2']:8.4f} {sg['Correlation']:8.4f}  "
-          f"[ElasticNet, selected={len(sg.get('Greedy_selected',[]))}/{n_greedy_pool}]")
-    gs = sg.get('Greedy_selected', [])
+    prefix = ' [random]' if suffix else ' [gwas]'
+    print(f"  {'Stacking (DL)'+prefix:<33s} {sr_dl['R2']:8.4f} {sr_dl['Correlation']:8.4f} RMSE={sr_dl['RMSE']:.4f}")
+    print(f"  {'Stacking (All)'+prefix:<33s} {sr_all['R2']:8.4f} {sr_all['Correlation']:8.4f} RMSE={sr_all['RMSE']:.4f}")
+    print(f"  {'Trad Ensemble'+prefix:<33s} {tsr['R2']:8.4f} {tsr['Correlation']:8.4f} RMSE={tsr['RMSE']:.4f}")
+    print(f"  {'Stacking (Pruned)'+prefix:<33s} {sp['R2']:8.4f} {sp['Correlation']:8.4f}  "
+          f"[ElasticNet, pruned={len(sp.get('Pruned_models', []))}]")
+    print(f"  {'Stacking (Greedy)'+prefix:<33s} {sg['R2']:8.4f} {sg['Correlation']:8.4f}  "
+          f"[ElasticNet, selected={len(sg.get('Greedy_selected', []))}/{n_greedy_pool}]")
+    gs = _display_names(sg.get('Greedy_selected', []))
     if gs:
         print(f"    Greedy selected: {gs}")
     if len(oof_r2_filtered) >= 2:
-        print(f"  {'Stacking (R²+Greedy)':<24s} {srg['R2']:8.4f} {srg['Correlation']:8.4f}  "
-              f"[R²-filter removed {len(r2_removed)}: {r2_removed}]")
-        rgs = srg.get('Greedy_selected', [])
+        print(f"  {'Stacking (R²+Greedy)'+prefix:<33s} {srg['R2']:8.4f} {srg['Correlation']:8.4f}  "
+              f"[R²-filter removed {len(r2_removed)}: {_display_names(r2_removed)}]")
+        rgs = _display_names(srg.get('Greedy_selected', []))
         if rgs:
             print(f"    R²+Greedy selected: {rgs}")
     else:
-        print(f"  {'Stacking (R²+Greedy)':<24s} SKIP (only {len(oof_r2_filtered)} models after R² filter)")
+        print(f"  {'Stacking (R²+Greedy)'+prefix:<33s} fallback after R² filter ({len(oof_r2_filtered)} kept)")
+    return stacking_oof or {}
 
 
 def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test=False):
-    """Fit all models on full data and save to disk for later inference."""
+    """Fit all models on full raw genotype data and save to disk for later inference."""
     import pickle
     deploy_dir = output_dir / f"deployed_{trait_name}"
     if deploy_dir.exists(): import shutil; shutil.rmtree(str(deploy_dir))
     deploy_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n  Deploying models on full dataset ({len(y)} samples) ...")
+    print(f"\n  Deploying models on full dataset ({len(y)} samples, raw genotype input) ...")
 
-    gidx = gwas_select(X, y, n_snps)
-    X_f = X[:, gidx]
-    sc = StandardScaler(); X_s = sc.fit_transform(X_f).astype(np.float32)
-    with open(deploy_dir / "scaler.pkl", 'wb') as f: pickle.dump(sc, f)
+    X = _as_model_input(X)
+    y = np.asarray(y, dtype=np.float32)
+    X_cand, _, _, cand_orig_idx, n_selected = _make_fold_candidate_universe(X, X, None, n_snps)
+    gidx_rel = gwas_select(X_cand, y, n_selected)
+    gidx = cand_orig_idx[gidx_rel]
+    X_selected = _as_model_input(X[:, gidx])
 
-    G_full = X_s @ X_s.T / n_snps
-    trad_models = {'RRBLUP': (RRBLUP(), X_s),
+    G_full = X_selected @ X_selected.T / float(n_selected)
+    trad_models = {'RRBLUP': (RRBLUP(), X_selected),
                    'GBLUP': (GBLUP(), G_full),
-                   'XGBoost': (XGBoostModel(n_estimators=300), X_s),
-                   'ElasticNet': (ElasticNetModel(), X_s),
-                   'GWAS_RRBLUP': (GWASWeightedRRBLUP(), X_s)}
+                   'XGBoost': (XGBoostModel(n_estimators=300, seed=_stable_seed(trait_name, 'XGBoost', 'deploy')), X_selected),
+                   'ElasticNet': (ElasticNetModel(seed=_stable_seed(trait_name, 'ElasticNet', 'deploy')), X_selected),
+                   'GWAS_RRBLUP': (GWASWeightedRRBLUP(), X_selected)}
     for tname, (tm, X_in) in trad_models.items():
         tm.fit(X_in, y)
         with open(deploy_dir / f"{tname}.pkl", 'wb') as f: pickle.dump(tm, f)
@@ -1690,34 +1785,44 @@ def deploy_models(X, y, n_snps, trait_name, output_dir, tuned_params, quick_test
 
     for mname in DL_NAMES:
         tp = tuned_params.get(mname, {}) if tuned_params else {}
-        model = create_model(mname, n_snps, overrides=tp)
-        lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-        wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
-        pat = tp.get('patience', 30)
-        bs = _get_batch_size(mname)
-        model = train_torch_model(model, X_s, y, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
+        hp = _get_train_hparams(mname, tuned_params)
+        train_seed = _stable_seed(trait_name, mname, 'deploy_train')
+        set_global_seed(train_seed)
+        model = create_model(mname, n_selected, overrides=tp)
+        model = train_torch_model(model, X_selected, y, epochs=300,
+                                  batch_size=hp['batch_size'], lr=hp['lr'],
+                                  weight_decay=hp['weight_decay'], patience=hp['patience'],
+                                  seed=train_seed)
         torch.save(model.state_dict(), deploy_dir / f"{mname}.pt")
         print(f"    [saved] {mname}.pt")
         del model
     torch.cuda.empty_cache()
 
-    meta = {'trait': trait_name, 'n_snps': n_snps, 'gwas_indices': gidx.tolist(),
-            'n_samples': len(y), 'models': list(trad_models.keys()) + DL_NAMES}
+    meta = {'trait': trait_name, 'n_snps': n_selected, 'gwas_indices': gidx.tolist(),
+            'n_samples': len(y), 'input': 'raw_genotype_float32',
+            'models': list(trad_models.keys()) + DL_NAMES}
     with open(deploy_dir / "deployment_meta.json", 'w', encoding='utf-8') as f: json.dump(meta, f, indent=2)
     print(f"    [saved] deployment_meta")
 
 
-def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
+def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15, seed=RANDOM_SEED):
     try: import optuna
     except ImportError: print(f"    [SKIP] Optuna not installed, using defaults"); return {}, 0.0
+    seed = int(seed)
+    set_global_seed(seed)
+    X_train = _as_model_input(X_train)
+    y_train = np.asarray(y_train, dtype=np.float32)
     n_val = max(16, int(len(y_train) * 0.2))
-    rng = np.random.RandomState(RANDOM_SEED)
+    n_val = min(n_val, max(1, len(y_train) - 2))
+    rng = np.random.RandomState(seed)
     idx = rng.permutation(len(y_train))
     val_idx, tr_idx = idx[:n_val], idx[n_val:]
     X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
     X_val, y_val = X_train[val_idx], y_train[val_idx]
 
     def objective(trial):
+        trial_seed = _stable_seed(seed, model_name, trial.number, 'optuna_trial')
+        set_global_seed(trial_seed)
         if model_name == 'FGN':
             overrides = {'hidden': trial.suggest_categorical('hidden', [32, 48, 64]),
                          'dropout': trial.suggest_float('dropout', 0.3, 0.55),
@@ -1785,19 +1890,21 @@ def tune_model_hyperparams(model_name, X_train, y_train, n_snps, n_trials=15):
             bs = _get_batch_size(model_name)
             model = train_torch_model(model, X_tr, y_tr, epochs=200, batch_size=bs,
                                        lr=overrides['lr'], weight_decay=overrides['weight_decay'],
-                                       patience=overrides['patience'], val_ratio=0.2)
+                                       patience=overrides['patience'], val_ratio=0.2,
+                                       seed=trial_seed)
             preds = predict_torch_model(model, X_val)
             return float(r2_score(y_val, preds))
         else: raise ValueError(f"Unknown model for tuning: {model_name}")
         model = train_torch_model(model, X_tr, y_tr, epochs=300, batch_size=bs,
                                   lr=overrides.get('lr', 2e-3),
                                   weight_decay=overrides.get('weight_decay', 1e-3),
-                                  patience=overrides.get('patience', 30))
+                                  patience=overrides.get('patience', 30),
+                                  seed=trial_seed)
         preds = predict_torch_model(model, X_val)
         return float(r2_score(y_val, preds))
 
     study = optuna.create_study(direction='maximize',
-                                sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+                                sampler=optuna.samplers.TPESampler(seed=seed),
                                 pruner=optuna.pruners.MedianPruner(n_startup_trials=5))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study.best_params, study.best_value
@@ -1966,32 +2073,25 @@ def load_wheat2000_data():
 
 def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
                         quick_test):
-    """Run ensemble pipeline for a single trait. Returns trait_res dict.
-
-    Shared by run_wheat() and run_wheat2000() only.
-    (run_rice, run_maize, run_soybean, run_wheat_gabi inline their own loops.)
-    vt_all can be None (CSV data w/o variant type annotations) or a real
-    per-marker variant-type array (VCF data).
-    """
-    y = y.astype(np.float32)
-    n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-    print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
+    """Run the full GWAS-vs-Random ensemble pipeline for one trait."""
+    X_all = _as_model_input(X_all)
+    y = np.asarray(y, dtype=np.float32)
+    if vt_all is not None:
+        vt_all = np.asarray(vt_all)
+    n_requested = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
+    seed_context = f"{output_dir.name}:{trait_name}"
+    print(f"  {len(y)} samples, {X_all.shape[1]} markers -> up to {n_requested} selected")
+    print("  Input representation: raw genotype float32 (no feature standardization)")
 
     tuned_params = {}
     if not quick_test:
         print(f"\n  [AutoML] Tuning hyperparams ...")
-        maf_tune = maf_filter(X_all)
-        if len(maf_tune) >= n_snps:
-            gidx_t = gwas_select(X_all[:, maf_tune], y, n_snps)
-            X_tune = X_all[:, maf_tune][:, gidx_t]
-        else:
-            X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
-        sc_tune = StandardScaler()
-        X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
+        X_tune, n_tune = _make_tuning_matrix(X_all, y, n_requested)
         for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet',
                           'AdditiveGenomicNet', 'GenomicFM']:
+            tune_seed = _stable_seed(seed_context, tune_name, 'tune')
             best_p, best_r2 = tune_model_hyperparams(
-                tune_name, X_tune_s, y, n_snps, n_trials=15)
+                tune_name, X_tune, y, n_tune, n_trials=15, seed=tune_seed)
             tuned_params[tune_name] = best_p
             pstr = ', '.join(f'{k}={v}' for k, v in best_p.items())
             print(f"    {tune_name}: val R2={best_r2:.4f}  [{pstr}]")
@@ -1999,39 +2099,34 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
     kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
     results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
                for m in ALL_NAMES + ALL_NAMES_RANDOM}
-    oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-    oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-    oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-    oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
+    oof_trad = {m: np.zeros(len(y), dtype=np.float32) for m in TRAD_NAMES}
+    oof_dl = {m: np.zeros(len(y), dtype=np.float32) for m in DL_NAMES}
+    oof_trad_r = {m: np.zeros(len(y), dtype=np.float32) for m in TRAD_NAMES}
+    oof_dl_r = {m: np.zeros(len(y), dtype=np.float32) for m in DL_NAMES}
 
     for fi, (tr, te) in enumerate(kf.split(X_all)):
         print(f"\n  --- Fold {fi+1}/{folds_run} ---")
-        Xtr_raw, Xte_raw = X_all[tr], X_all[te]
+        Xtr_raw, Xte_raw = _as_model_input(X_all[tr]), _as_model_input(X_all[te])
         ytr, yte = y[tr], y[te]
-        maf_idx = maf_filter(Xtr_raw)
-        if len(maf_idx) >= n_snps:
-            Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]
-            vt_maf = vt_all[maf_idx] if vt_all is not None else None
-        else:
-            vt_maf = vt_all
+        Xtr_cand, Xte_cand, vt_cand, _, n_selected = _make_fold_candidate_universe(
+            Xtr_raw, Xte_raw, vt_all, n_requested)
+        print(f"    Candidate universe after MAF: {Xtr_cand.shape[1]} markers; selected={n_selected}")
 
-        # Traditional models
-        gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
-        Xtr_trad = Xtr_raw[:, gidx_gwas]
-        Xte_trad = Xte_raw[:, gidx_gwas]
-        sc_trad = StandardScaler()
-        Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
-        Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
-        G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps
-        G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
+        gidx_gwas = gwas_select(Xtr_cand, ytr, n_selected)
+        Xtr_gwas = _as_model_input(Xtr_cand[:, gidx_gwas])
+        Xte_gwas = _as_model_input(Xte_cand[:, gidx_gwas])
+        G_fold_train = Xtr_gwas @ Xtr_gwas.T / float(n_selected)
+        G_fold_te_tr = Xte_gwas @ Xtr_gwas.T / float(n_selected)
 
+        trad_seed = _stable_seed(seed_context, fi, 'traditional', 'train')
         trad_configs = _make_trad_configs(
-            G_fold_train, G_fold_te_tr, n_snps, len(tr))
+            G_fold_train, G_fold_te_tr, n_selected, len(tr), seed=trad_seed)
         for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
+            set_global_seed(_stable_seed(seed_context, fi, tname, 'train'))
             t0 = time.time()
             tmodel = build_fn()
-            fit_fn(tmodel, Xtr_trad_s, ytr)
-            preds = pred_fn(tmodel, Xte_trad_s)
+            fit_fn(tmodel, Xtr_gwas, ytr)
+            preds = np.asarray(pred_fn(tmodel, Xte_gwas), dtype=np.float32)
             results[tname]['preds'].extend(preds.tolist())
             results[tname]['targets'].extend(yte.tolist())
             results[tname]['time'] += time.time() - t0
@@ -2040,88 +2135,80 @@ def _run_trait_pipeline(X_all, y, vt_all, trait_name, folds_run, output_dir,
             oof_trad[tname][te] = preds
             print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
 
-        # DL models
-        gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
-            Xtr_raw, Xte_raw, ytr, gidx_gwas, vt_maf, n_snps)
-
-        for mi, mname in enumerate(DL_NAMES):
-            tp = tuned_params.get(mname, {})
-            model = create_model(mname, n_snps, overrides=tp)
+        gidx_dl, _, Xtr_dl, Xte_dl = _select_dl_markers(
+            Xtr_cand, Xte_cand, ytr, gidx_gwas, vt_cand, n_selected)
+        for mname in DL_NAMES:
+            hp = _get_train_hparams(mname, tuned_params)
+            train_seed = _stable_seed(seed_context, fi, mname, 'train')
+            set_global_seed(train_seed)
+            model_tp = (tuned_params or {}).get(mname, {})
+            model = create_model(mname, n_selected, overrides=model_tp)
             t0 = time.time()
             if fi == 0:
-                results[mname]['params'] = sum(
-                    p.numel() for p in model.parameters())
-            bs = _get_batch_size(mname)
-            lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-            wd = tp.get('weight_decay',
-                        5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
-            pat = tp.get('patience', 30)
+                results[mname]['params'] = sum(p.numel() for p in model.parameters())
             if DEVICE.type == 'cuda':
                 torch.cuda.reset_peak_memory_stats()
-            model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300,
-                                      batch_size=bs, lr=lr,
-                                      weight_decay=wd, patience=pat)
+            model = train_torch_model(model, Xtr_dl, ytr, epochs=300,
+                                      batch_size=hp['batch_size'], lr=hp['lr'],
+                                      weight_decay=hp['weight_decay'],
+                                      patience=hp['patience'], seed=train_seed)
             if DEVICE.type == 'cuda':
-                results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
+                results[mname]['gpu_mem'] = max(
+                    results[mname]['gpu_mem'],
                     torch.cuda.max_memory_allocated() / (1024 * 1024))
-            preds = predict_torch_model(model, Xte_dl_s)
+            preds = np.asarray(predict_torch_model(model, Xte_dl), dtype=np.float32)
             elapsed = time.time() - t0
             results[mname]['preds'].extend(preds.tolist())
             results[mname]['targets'].extend(yte.tolist())
             results[mname]['time'] += elapsed
+            oof_dl[mname][te] = preds
             print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-            if mname in DL_BASE_NAMES:
-                oof_dl[mname][te] = preds
+            del model
         torch.cuda.empty_cache()
 
-        # Random SNP pass (GWAS control experiment)
-        _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te, n_snps, fi,
-                              results, oof_trad_r, oof_dl_r, tuned_params)
+        _run_fold_random_pass(Xtr_cand, Xte_cand, ytr, yte, te, n_selected, fi,
+                              results, oof_trad_r, oof_dl_r, tuned_params,
+                              seed_context=seed_context)
 
-    # Trait summary — GWAS
     print(f"\n  {'-'*70}\n  {trait_name} Final Results:\n  "
-          f"{'Model':<16s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
+          f"{'Model':<28s} {'R2':>8s} {'Corr':>8s} {'RMSE':>8s} {'Time':>8s}\n  {'-'*70}")
     trait_res = {}
-    for mname in ALL_NAMES:
-        p = np.array(results[mname]['preds'])
-        t = np.array(results[mname]['targets'])
-        r2_v = float(r2_score(t, p))
-        corr_v = float(pearsonr(t, p)[0])
-        rmse_v = float(np.sqrt(np.mean((p - t) ** 2)))
-        mtype = _model_type(mname)
-        tag_map = {TYPE_TRAD: ' [Trad]', TYPE_DL: ' [DL]'}
-        tag = tag_map.get(mtype, '')
-        trait_res[mname] = {
-            'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-            'Type': mtype,
-            'Time': results[mname]['time'] / folds_run,
-            'Params': results[mname].get('params', 0),
-            'GPUMem': results[mname].get('gpu_mem', 0.0)}
-        print(f"  {mname+tag:<24s} {r2_v:8.4f} {corr_v:8.4f} "
-              f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
-    # Trait summary — Random SNP
-    for mname in ALL_NAMES_RANDOM:
-        p = np.array(results[mname]['preds'])
-        t = np.array(results[mname]['targets'])
-        r2_v = float(r2_score(t, p))
-        corr_v = float(pearsonr(t, p)[0])
-        rmse_v = float(np.sqrt(np.mean((p - t) ** 2)))
-        base = mname.replace('_random', '')
-        trait_res[mname] = {
-            'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
-            'Type': _model_type(base),
-            'Time': results[mname]['time'] / folds_run,
-            'Params': results[mname].get('params', 0),
-            'GPUMem': results[mname].get('gpu_mem', 0.0)}
-        print(f"  {mname:<22s} {r2_v:8.4f} {corr_v:8.4f} "
-              f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
 
-    _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-    _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
-    _save_oof_npz(results, ALL_NAMES, output_dir, trait_name)
-    _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait_name}_random")
+    def _summarize(names, selection):
+        for mname in names:
+            p = np.asarray(results[mname]['preds'], dtype=np.float32)
+            t = np.asarray(results[mname]['targets'], dtype=np.float32)
+            r2_v, corr_v, rmse_v = _metric_values(t, p)
+            base = mname.replace('_random', '')
+            mtype = _model_type(base)
+            trait_res[mname] = {
+                'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v,
+                'Type': mtype, 'Selection': selection, 'DisplayName': mname,
+                'Time': results[mname]['time'] / folds_run,
+                'Params': results[mname].get('params', 0),
+                'GPUMem': results[mname].get('gpu_mem', 0.0)}
+            print(f"  {mname:<28s} {r2_v:8.4f} {corr_v:8.4f} "
+                  f"{rmse_v:8.4f} {results[mname]['time']/folds_run:7.1f}s")
+
+    _summarize(ALL_NAMES, 'gwas')
+    _summarize(ALL_NAMES_RANDOM, 'random')
+
+    stacking_oof = {}
+    stacking_oof_r = {}
+    _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run,
+                             suffix='', stacking_oof=stacking_oof)
+    _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run,
+                             suffix='_random', stacking_oof=stacking_oof_r)
+
+    oof_gwas_named = {**oof_trad, **oof_dl, **stacking_oof}
+    oof_random_named = {**{f'{m}_random': v for m, v in oof_trad_r.items()},
+                        **{f'{m}_random': v for m, v in oof_dl_r.items()},
+                        **stacking_oof_r}
+    _save_oof_npz(oof_gwas_named, y, output_dir, trait_name)
+    _save_oof_npz(oof_random_named, y, output_dir, f"{trait_name}_random")
+
     if not quick_test:
-        deploy_models(X_all, y, n_snps, trait_name, output_dir,
+        deploy_models(X_all, y, n_requested, trait_name, output_dir,
                       tuned_params, quick_test)
     return trait_res
 
@@ -2206,7 +2293,7 @@ def load_rice_data():
         y = np.array(td['values']).astype(np.float32)
         X_t = G[idxs]
         mask = ~np.isnan(y) & (y > -8)  # -9 is missing-value sentinel
-        trait_data[t] = (X_t[mask], y[mask])
+        trait_data[t] = (_as_model_input(X_t[mask]), y[mask], None)
         if mask.sum() < len(y):
             print(f"  {t}: {mask.sum()} samples (removed {len(y) - mask.sum()} sentinel -9)")
     return trait_data
@@ -2220,128 +2307,7 @@ def run_rice(quick_test=True):
     print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
     if DEVICE.type == 'cuda': print(f"GPU: {torch.cuda.get_device_name(0)}")
     trait_data = load_rice_data()
-    trait_names = sorted(trait_data.keys())
-    print(f"\n实验性状: {trait_names}")
-
-    traits_run = trait_names[:1] if quick_test else trait_names
-    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
-    if quick_test: print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
-
-    all_results = {}; total_t0 = time.time()
-
-    for t_idx, trait in enumerate(traits_run):
-        print(f"\n{'='*80}\n  TRAIT [{t_idx+1}/{len(traits_run)}]: {trait}\n{'='*80}")
-        X_all, y = trait_data[trait]; y = y.astype(np.float32)
-        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        tuned_params = {}
-        if not quick_test:
-            print(f"\n  [AutoML] Tuning ...")
-            maf_tune = maf_filter(X_all)
-            if len(maf_tune) >= n_snps:
-                gidx_t = gwas_select(X_all[:, maf_tune], y, n_snps)
-                X_tune = X_all[:, maf_tune][:, gidx_t]
-            else: X_tune = X_all[:, gwas_select(X_all, y, n_snps)]
-            sc_tune = StandardScaler(); X_tune_s = sc_tune.fit_transform(X_tune).astype(np.float32)
-            for tune_name in ['FGN', 'FGNplus', 'FGN v4', 'FusionNet', 'AdditiveGenomicNet', 'GenomicFM']:
-                best_p, best_r2 = tune_model_hyperparams(tune_name, X_tune_s, y, n_snps, n_trials=15)
-                tuned_params[tune_name] = best_p
-                print(f"    {tune_name}: val R2={best_r2:.4f}")
-
-        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
-                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
-        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        for fi, (tr, te) in enumerate(kf.split(X_all)):
-            print(f"\n  --- Fold {fi+1}/{folds_run} ---")
-            Xtr_raw, Xte_raw = X_all[tr], X_all[te]; ytr, yte = y[tr], y[te]
-            maf_idx = maf_filter(Xtr_raw)
-            if len(maf_idx) >= n_snps: Xtr_raw, Xte_raw = Xtr_raw[:, maf_idx], Xte_raw[:, maf_idx]
-            gidx_gwas = gwas_select(Xtr_raw, ytr, n_snps)
-            Xtr_trad = Xtr_raw[:, gidx_gwas]; Xte_trad = Xte_raw[:, gidx_gwas]
-            sc_trad = StandardScaler(); Xtr_trad_s = sc_trad.fit_transform(Xtr_trad).astype(np.float32)
-            Xte_trad_s = sc_trad.transform(Xte_trad).astype(np.float32)
-            G_fold_train = Xtr_trad_s @ Xtr_trad_s.T / n_snps; G_fold_te_tr = Xte_trad_s @ Xtr_trad_s.T / n_snps
-
-            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr))
-            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
-                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_trad_s, ytr)
-                preds = pred_fn(tmodel, Xte_trad_s)
-                results[tname]['preds'].extend(preds.tolist()); results[tname]['targets'].extend(yte.tolist())
-                results[tname]['time'] += time.time() - t0
-                if fi == 0: results[tname]['params'] = param_count
-                oof_trad[tname][te] = preds
-                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
-
-            # DL marker selection (configurable)
-            gidx_dl, _, Xtr_dl_s, Xte_dl_s = _select_dl_markers(
-                Xtr_raw, Xte_raw, ytr, gidx_gwas, None, n_snps)
-
-            for mi, mname in enumerate(DL_NAMES):
-                tp = tuned_params.get(mname, {})
-                model = create_model(mname, n_snps, overrides=tp)
-                t0 = time.time()
-                if fi == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = _get_batch_size(mname)
-                lr = tp.get('lr', 1e-3 if mname == 'FusionNet' else 2e-3)
-                wd = tp.get('weight_decay', 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3)
-                pat = tp.get('patience', 30)
-                if DEVICE.type == 'cuda':
-                    torch.cuda.reset_peak_memory_stats()
-                model = train_torch_model(model, Xtr_dl_s, ytr, epochs=300, batch_size=bs, lr=lr, weight_decay=wd, patience=pat)
-                if DEVICE.type == 'cuda':
-                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
-                        torch.cuda.max_memory_allocated() / (1024 * 1024))
-                preds = predict_torch_model(model, Xte_dl_s)
-                elapsed = time.time() - t0
-                results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-                if mname in DL_BASE_NAMES: oof_dl[mname][te] = preds
-            torch.cuda.empty_cache()
-
-            # Random SNP pass (GWAS control experiment)
-            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te, n_snps, fi,
-                                  results, oof_trad_r, oof_dl_r)
-
-        # Summary — GWAS
-        print(f"\n  {trait} Final Results:")
-        trait_res = {}
-        for mname in ALL_NAMES:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
-            'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-        # Summary — Random SNP
-        for mname in ALL_NAMES_RANDOM:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            base = mname.replace('_random', '')
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
-                                'Time': results[mname]['time']/folds_run,
-                                'Params': results[mname].get('params', 0),
-                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-
-        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
-        all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
-            json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
-        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
-        if not quick_test:
-            deploy_models(X_all, y, n_snps, trait, output_dir, tuned_params, quick_test)
-
-    if not quick_test:
-        _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Rice')
-    else:
-        print("\nRice Quick Test Done!")
+    _run_ensemble_traits(trait_data, output_dir, 'Rice', quick_test)
 
 
 # ============================================================================
@@ -2397,114 +2363,20 @@ def run_maize(quick_test=True):
     if DEVICE.type == 'cuda': print(f"GPU: {torch.cuda.get_device_name(0)}")
     max_markers = 10000 if quick_test else None
     X_all, y_dict = load_iranian_data(max_markers=max_markers)
-    traits = sorted(y_dict.keys())
-    print(f"\nTraits: {traits}")
 
-    var_thresh = 0.005; vars_per_marker = np.var(X_all, axis=0); keep = vars_per_marker >= var_thresh
+    var_thresh = 0.005
+    vars_per_marker = np.var(X_all, axis=0)
+    keep = vars_per_marker >= var_thresh
     if keep.sum() < X_all.shape[1]:
-        n_before = X_all.shape[1]; X_all = X_all[:, keep]
+        n_before = X_all.shape[1]
+        X_all = X_all[:, keep]
         print(f"  Low-variance filter: {n_before} -> {X_all.shape[1]} markers kept")
     else:
         print(f"  Low-variance filter: all {X_all.shape[1]} markers kept")
 
-    traits_run = traits[:1] if quick_test else traits
-    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
-    total_t0 = time.time(); all_results = {}
-
-    for trait in traits_run:
-        print(f"\n{'='*60}\nTrait: {trait}\n{'='*60}")
-        y = y_dict[trait].astype(np.float32)
-        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
-                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
-        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
-            print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
-            Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
-            maf_idx = maf_filter(Xtr_raw, MAF_THRESHOLD)
-            if len(maf_idx) >= n_snps:
-                gidx = gwas_select(Xtr_raw[:, maf_idx], ytr, n_snps); gidx = maf_idx[gidx]
-            else: gidx = gwas_select(Xtr_raw, ytr, n_snps)
-            Xtr = Xtr_raw[:, gidx]; Xte = Xte_raw[:, gidx]
-            sc = StandardScaler(); Xtr_s = sc.fit_transform(Xtr).astype(np.float32); Xte_s = sc.transform(Xte).astype(np.float32)
-
-            G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
-
-            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr_idx))
-            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
-                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
-                preds = pred_fn(tmodel, Xte_s)
-                results[tname]['preds'].extend(preds.tolist()); results[tname]['targets'].extend(yte.tolist())
-                results[tname]['time'] += time.time() - t0
-                if fold_i == 0: results[tname]['params'] = param_count
-                oof_trad[tname][te_idx] = preds
-                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
-
-            # DL
-            for mi, mname in enumerate(DL_NAMES):
-                model = create_model(mname, n_snps)
-                t0 = time.time()
-                if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = _get_batch_size(mname)
-                wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
-                if DEVICE.type == 'cuda':
-                    torch.cuda.reset_peak_memory_stats()
-                model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
-                if DEVICE.type == 'cuda':
-                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
-                        torch.cuda.max_memory_allocated() / (1024 * 1024))
-                preds = predict_torch_model(model, Xte_s)
-                elapsed = time.time() - t0
-                results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-                if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
-            torch.cuda.empty_cache()
-
-            # Random SNP pass (GWAS control experiment)
-            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
-                                  results, oof_trad_r, oof_dl_r)
-
-        # Summary — GWAS
-        trait_res = {}
-        for mname in ALL_NAMES:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
-            'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-        # Summary — Random SNP
-        for mname in ALL_NAMES_RANDOM:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            base = mname.replace('_random', '')
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
-                                'Time': results[mname]['time']/folds_run,
-                                'Params': results[mname].get('params', 0),
-                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-
-        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
-        all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
-            json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
-        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
-        if not quick_test:
-            deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
-
-    if not quick_test:
-        _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Maize')
-    else:
-        print("\nMaize Quick Test Done!")
-
+    trait_data = {trait: (_as_model_input(X_all), y.astype(np.float32), None)
+                  for trait, y in y_dict.items()}
+    _run_ensemble_traits(trait_data, output_dir, 'Maize', quick_test)
 
 # ============================================================================
 # Section K2: EasyGeSe Benchmark Data Loader + Soybean / Wheat GABI Pipelines
@@ -2572,17 +2444,13 @@ def load_easygese_data(data_dir, trait_names=None):
         y = np.array(td['values']).astype(np.float32)
         X_t = G[idxs]
         mask = ~np.isnan(y)
-        trait_data[tname] = (X_t[mask], y[mask])
+        trait_data[tname] = (_as_model_input(X_t[mask]), y[mask], None)
 
     return trait_data
 
 
 def run_soybean(quick_test=True):
-    """Soybean SoySNP50K ensemble pipeline.
-
-    Source: Kaler et al. (2017) TAG.  SoySNP50K chip, 346 US soybean genotypes,
-    20 526 SNPs, 2 abiotic-stress traits (canopy wilting, water-use efficiency).
-    """
+    """Soybean SoySNP50K ensemble pipeline."""
     _script_dir = Path(__file__).resolve().parent
     output_dir = _script_dir / "results" / "soybean_ensemble"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2590,116 +2458,11 @@ def run_soybean(quick_test=True):
     print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
     if DEVICE.type == 'cuda': print(f"GPU: {torch.cuda.get_device_name(0)}")
     trait_data = load_easygese_data(SOYBEAN_DATA_DIR, SOYBEAN_TRAIT_NAMES)
-    traits = sorted(trait_data.keys())
-    print(f"\nTraits: {traits}")
-
-    traits_run = traits[:1] if quick_test else traits
-    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
-    if quick_test: print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
-
-    total_t0 = time.time(); all_results = {}
-
-    for trait in traits_run:
-        print(f"\n{'='*60}\nTrait: {trait}\n{'='*60}")
-        X_all, y = trait_data[trait]; y = y.astype(np.float32)
-        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
-                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
-        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
-            print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
-            Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
-            maf_idx = maf_filter(Xtr_raw, MAF_THRESHOLD)
-            if len(maf_idx) >= n_snps:
-                gidx = gwas_select(Xtr_raw[:, maf_idx], ytr, n_snps); gidx = maf_idx[gidx]
-            else: gidx = gwas_select(Xtr_raw, ytr, n_snps)
-            Xtr = Xtr_raw[:, gidx]; Xte = Xte_raw[:, gidx]
-            sc = StandardScaler(); Xtr_s = sc.fit_transform(Xtr).astype(np.float32); Xte_s = sc.transform(Xte).astype(np.float32)
-
-            G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
-
-            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr_idx))
-            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
-                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
-                preds = pred_fn(tmodel, Xte_s)
-                results[tname]['preds'].extend(preds.tolist()); results[tname]['targets'].extend(yte.tolist())
-                results[tname]['time'] += time.time() - t0
-                if fold_i == 0: results[tname]['params'] = param_count
-                oof_trad[tname][te_idx] = preds
-                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
-
-            # DL
-            for mi, mname in enumerate(DL_NAMES):
-                model = create_model(mname, n_snps)
-                t0 = time.time()
-                if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = _get_batch_size(mname)
-                wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
-                if DEVICE.type == 'cuda':
-                    torch.cuda.reset_peak_memory_stats()
-                model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
-                if DEVICE.type == 'cuda':
-                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
-                        torch.cuda.max_memory_allocated() / (1024 * 1024))
-                preds = predict_torch_model(model, Xte_s)
-                elapsed = time.time() - t0
-                results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-                if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
-            torch.cuda.empty_cache()
-
-            # Random SNP pass (GWAS control experiment)
-            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
-                                  results, oof_trad_r, oof_dl_r)
-
-        # Summary — GWAS
-        trait_res = {}
-        for mname in ALL_NAMES:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
-            'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-        # Summary — Random SNP
-        for mname in ALL_NAMES_RANDOM:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            base = mname.replace('_random', '')
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
-                                'Time': results[mname]['time']/folds_run,
-                                'Params': results[mname].get('params', 0),
-                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-
-        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
-        all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
-            json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
-        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
-        if not quick_test:
-            deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
-
-    if not quick_test:
-        _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Soybean')
-    else:
-        print("\nSoybean Quick Test Done!")
+    _run_ensemble_traits(trait_data, output_dir, 'Soybean', quick_test)
 
 
 def run_wheat_gabi(quick_test=True):
-    """Wheat GABI iSELECT 90k ensemble pipeline.
-
-    Source: Gogna et al. (2022) Scientific Data.  iSELECT 90k SNP chip,
-    371 European elite winter/spring wheat lines, 12 546 SNPs, 16 traits.
-    """
+    """Wheat GABI iSELECT 90k ensemble pipeline."""
     _script_dir = Path(__file__).resolve().parent
     output_dir = _script_dir / "results" / "wheat_gabi_ensemble"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2707,129 +2470,26 @@ def run_wheat_gabi(quick_test=True):
     print(f"Device: {DEVICE}  |  Quick test: {quick_test}")
     if DEVICE.type == 'cuda': print(f"GPU: {torch.cuda.get_device_name(0)}")
     trait_data = load_easygese_data(WHEAT_GABI_DATA_DIR)
-    traits = sorted(trait_data.keys())
-    print(f"\nTraits: {traits}")
+    _run_ensemble_traits(trait_data, output_dir, 'Wheat GABI', quick_test)
 
-    traits_run = traits[:1] if quick_test else traits
-    folds_run = min(2, N_FOLDS) if quick_test else N_FOLDS
-    if quick_test: print(f"  [QUICK TEST] {len(traits_run)} trait x {folds_run} folds")
+def _save_oof_npz(oof_predictions, y_true, output_dir, trait_name):
+    """Save original-sample-order OOF predictions as NPZ for plotting.
 
-    total_t0 = time.time(); all_results = {}
-
-    for trait in traits_run:
-        print(f"\n{'='*60}\nTrait: {trait}\n{'='*60}")
-        X_all, y = trait_data[trait]; y = y.astype(np.float32)
-        n_snps = min(GWAS_TOP_K, max(50, X_all.shape[1] - 50))
-        print(f"  {len(y)} samples, {X_all.shape[1]} markers -> {n_snps} GWAS-selected")
-
-        kf = KFold(n_splits=folds_run, shuffle=True, random_state=RANDOM_SEED)
-        results = {m: {'preds': [], 'targets': [], 'params': 0, 'time': 0.0, 'gpu_mem': 0.0}
-                   for m in ALL_NAMES + ALL_NAMES_RANDOM}
-        oof_trad = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        oof_trad_r = {m: np.zeros(len(y)) for m in TRAD_NAMES}
-        oof_dl_r = {m: np.zeros(len(y)) for m in DL_BASE_NAMES}
-        for fold_i, (tr_idx, te_idx) in enumerate(kf.split(X_all)):
-            print(f"\n  --- Fold {fold_i+1}/{folds_run} ---")
-            Xtr_raw, Xte_raw = X_all[tr_idx], X_all[te_idx]; ytr, yte = y[tr_idx], y[te_idx]
-            maf_idx = maf_filter(Xtr_raw, MAF_THRESHOLD)
-            if len(maf_idx) >= n_snps:
-                gidx = gwas_select(Xtr_raw[:, maf_idx], ytr, n_snps); gidx = maf_idx[gidx]
-            else: gidx = gwas_select(Xtr_raw, ytr, n_snps)
-            Xtr = Xtr_raw[:, gidx]; Xte = Xte_raw[:, gidx]
-            sc = StandardScaler(); Xtr_s = sc.fit_transform(Xtr).astype(np.float32); Xte_s = sc.transform(Xte).astype(np.float32)
-
-            G_fold_train = Xtr_s @ Xtr_s.T / n_snps; G_fold_te_tr = Xte_s @ Xtr_s.T / n_snps
-
-            trad_configs = _make_trad_configs(G_fold_train, G_fold_te_tr, n_snps, len(tr_idx))
-            for tname, build_fn, fit_fn, pred_fn, param_count in trad_configs:
-                t0 = time.time(); tmodel = build_fn(); fit_fn(tmodel, Xtr_s, ytr)
-                preds = pred_fn(tmodel, Xte_s)
-                results[tname]['preds'].extend(preds.tolist()); results[tname]['targets'].extend(yte.tolist())
-                results[tname]['time'] += time.time() - t0
-                if fold_i == 0: results[tname]['params'] = param_count
-                oof_trad[tname][te_idx] = preds
-                print(f"    {tname:<16s} R2={r2_score(yte, preds):+.4f}")
-
-            # DL
-            for mi, mname in enumerate(DL_NAMES):
-                model = create_model(mname, n_snps)
-                t0 = time.time()
-                if fold_i == 0: results[mname]['params'] = sum(p.numel() for p in model.parameters())
-                bs = _get_batch_size(mname)
-                wd = 5e-3 if mname == 'AdditiveGenomicNet' else 1e-3
-                if DEVICE.type == 'cuda':
-                    torch.cuda.reset_peak_memory_stats()
-                model = train_torch_model(model, Xtr_s, ytr, epochs=300, batch_size=bs, lr=2e-3, weight_decay=wd, patience=30)
-                if DEVICE.type == 'cuda':
-                    results[mname]['gpu_mem'] = max(results[mname]['gpu_mem'],
-                        torch.cuda.max_memory_allocated() / (1024 * 1024))
-                preds = predict_torch_model(model, Xte_s)
-                elapsed = time.time() - t0
-                results[mname]['preds'].extend(preds.tolist()); results[mname]['targets'].extend(yte.tolist()); results[mname]['time'] += elapsed
-                print(f"    {mname:<22s} R2={r2_score(yte, preds):+.4f}  ({elapsed:.1f}s)")
-                if mname in DL_BASE_NAMES: oof_dl[mname][te_idx] = preds
-            torch.cuda.empty_cache()
-
-            # Random SNP pass (GWAS control experiment)
-            _run_fold_random_pass(Xtr_raw, Xte_raw, ytr, yte, te_idx, n_snps, fold_i,
-                                  results, oof_trad_r, oof_dl_r)
-
-        # Summary — GWAS
-        trait_res = {}
-        for mname in ALL_NAMES:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            mtype = _model_type(mname)
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': mtype, 'Time': results[mname]['time']/folds_run, 'Params': results[mname].get('params', 0),
-            'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-        # Summary — Random SNP
-        for mname in ALL_NAMES_RANDOM:
-            p = np.array(results[mname]['preds']); t = np.array(results[mname]['targets'])
-            r2_v = float(r2_score(t, p)); corr_v = float(pearsonr(t, p)[0]); rmse_v = float(np.sqrt(np.mean((p-t)**2)))
-            base = mname.replace('_random', '')
-            trait_res[mname] = {'R2': r2_v, 'Correlation': corr_v, 'RMSE': rmse_v, 'Type': _model_type(base),
-                                'Time': results[mname]['time']/folds_run,
-                                'Params': results[mname].get('params', 0),
-                                'GPUMem': results[mname].get('gpu_mem', 0.0)}
-            print(f"  {mname:<20s} R2={r2_v:+.4f}  Corr={corr_v:+.4f}  RMSE={rmse_v:.4f}")
-
-        _add_stacking_to_results(oof_dl, oof_trad, y, trait_res, folds_run)
-        _add_stacking_to_results(oof_dl_r, oof_trad_r, y, trait_res, folds_run, suffix='_random')
-        all_results[trait] = trait_res
-        with open(output_dir / "ensemble_intermediate.json", 'w', encoding='utf-8') as f:
-            json.dump(all_results, f, indent=2, ensure_ascii=False)
-        _save_oof_npz(results, ALL_NAMES, output_dir, trait)
-        _save_oof_npz(results, ALL_NAMES_RANDOM, output_dir, f"{trait}_random")
-        if not quick_test:
-            deploy_models(X_all, y, n_snps, trait, output_dir, None, quick_test)
-
-    if not quick_test:
-        _print_final_summary(all_results, traits_run, output_dir, total_t0, 'Wheat GABI')
-    else:
-        print("\nWheat GABI Quick Test Done!")
-
-def _save_oof_npz(results, all_names, output_dir, trait_name):
-    """Save per-model OOF predictions as NPZ for later scatter plot generation.
-
-    Uses results[m]['targets'] (fold-concatenation order) as the aligned
-    ground-truth — predictions are accumulated in the same fold order, so
-    both arrays remain correctly paired inside the NPZ.
+    ``oof_predictions`` must map display/model names to arrays indexed in the same
+    order as the original trait sample vector ``y_true``.  This keeps ``_y_true`` in
+    original sample order and supports base + stacking OOF in the same file.
     """
     oof_dir = output_dir / "oof_predictions"
     oof_dir.mkdir(parents=True, exist_ok=True)
-    # All models share the same fold-concatenated target order
-    aligned_y = np.array(results[all_names[0]]['targets'], dtype=np.float32)
+    aligned_y = np.asarray(y_true, dtype=np.float32)
     data = {'_y_true': aligned_y}
-    for m in all_names:
-        p = np.array(results[m]['preds'], dtype=np.float32)
+    for m, preds in oof_predictions.items():
+        p = np.asarray(preds, dtype=np.float32)
         if len(p) == len(aligned_y):
             data[m] = p
     path = oof_dir / f"{trait_name}_oof.npz"
     np.savez_compressed(path, **data)
     print(f"  OOF saved: {path}")
-
 
 def _load_json_safe(path):
     if os.path.exists(str(path)):
@@ -2866,6 +2526,57 @@ def _mean_r2(data, model_name):
     return np.mean(r2s) if r2s else float('nan')
 
 
+
+
+def _dataset_specs():
+    """Unified plotting dataset specifications."""
+    return [
+        {'tag': 'Wheat', 'sub': 'wheat', 'fig': '08', 'ncols': 2, 'figsize': (24, 14)},
+        {'tag': 'Wheat2000', 'sub': 'wheat2000', 'fig': '08', 'ncols': 2, 'figsize': (24, 18)},
+        {'tag': 'Rice', 'sub': 'rice', 'fig': '09', 'ncols': 2, 'figsize': (24, 30)},
+        {'tag': 'Maize', 'sub': 'maize', 'fig': '10', 'ncols': 2, 'figsize': (24, 12)},
+        {'tag': 'Soybean', 'sub': 'soybean', 'fig': '10', 'ncols': 2, 'figsize': (18, 8)},
+        {'tag': 'WheatGABI', 'sub': 'wheat_gabi', 'fig': '10', 'ncols': 4, 'figsize': (32, 24)},
+    ]
+
+
+def _load_plot_datasets():
+    script_dir = Path(__file__).resolve().parent
+    datasets = []
+    for spec in _dataset_specs():
+        d = _load_json_safe(script_dir / "results" / f"{spec['sub']}_ensemble" / "ensemble_intermediate.json")
+        if d:
+            datasets.append((spec['tag'], d, sorted(d.keys())))
+    return datasets
+
+
+def _dataset_spec_by_tag(tag):
+    for spec in _dataset_specs():
+        if spec['tag'] == tag:
+            return spec
+    return {'tag': tag, 'sub': tag.lower(), 'fig': 'xx', 'ncols': 2, 'figsize': (24, 18)}
+
+
+def _is_random_model(name):
+    return str(name).endswith('_random')
+
+
+def _is_single_model(name):
+    return 'Stacking' not in name and 'Ensemble' not in name
+
+
+def _filter_models_for_arm(models, arm='gwas', include_ensemble=True):
+    out = []
+    for m in models:
+        if arm == 'gwas' and _is_random_model(m):
+            continue
+        if arm == 'random' and not _is_random_model(m):
+            continue
+        if not include_ensemble and not _is_single_model(m):
+            continue
+        out.append(m)
+    return out
+
 def generate_bar_charts(fig_dir=None):
     """Generate bar chart figures from ensemble_intermediate.json files.
 
@@ -2884,15 +2595,10 @@ def generate_bar_charts(fig_dir=None):
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # Only 3 datasets: wheat (813) removed per advisor feedback
-    DATASETS = []
-    for tag, sub in [('Wheat2000', 'wheat2000'), ('Rice', 'rice'), ('Maize', 'maize')]:
-        d = _load_json_safe(SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
-        if d:
-            DATASETS.append((tag, d, sorted(d.keys())))
+    DATASETS = _load_plot_datasets()
 
-    if len(DATASETS) < 2:
-        print("  [plot] Need at least 2 dataset JSONs for bar charts, skipping.")
+    if len(DATASETS) < 1:
+        print("  [plot] No dataset JSONs found for bar charts, skipping.")
         return
 
     n_datasets = len(DATASETS)
@@ -2904,35 +2610,38 @@ def generate_bar_charts(fig_dir=None):
                  fontsize=22, fontweight='bold', y=1.01)
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
         ax = axes[0, ax_idx]
-        all_models = list(data[traits[0]].keys())
+        all_models = _filter_models_for_arm(list(data[traits[0]].keys()), arm='gwas', include_ensemble=True)
         means = {m: _mean_r2(data, m) for m in all_models}
         sorted_m = sorted([m for m in all_models if means[m] > -1], key=lambda m: means[m], reverse=True)[:20]
         vals = [means[m] for m in sorted_m]
         colors = [_model_color(m) for m in sorted_m]
         x = np.arange(len(sorted_m))
         bars = ax.bar(x, vals, 0.7, color=colors, edgecolor='white', linewidth=0.8, zorder=3)
-        best_idx = np.argmax(vals)
-        bars[best_idx].set_edgecolor('#C62828'); bars[best_idx].set_linewidth(3.0)
-        for i, (m, v) in enumerate(zip(sorted_m, vals)):
-            if i < 8 or v == max(vals):
-                ax.text(i, v + 0.02, f'{v:.3f}', ha='center', va='bottom',
-                        fontsize=8 if v != max(vals) else 10,
-                        fontweight='bold' if v == max(vals) else 'normal',
-                        color='#C62828' if v == max(vals) else '#555')
+        if vals:
+            best_idx = int(np.argmax(vals))
+            bars[best_idx].set_edgecolor('#C62828'); bars[best_idx].set_linewidth(3.0)
+            for i, (m, v) in enumerate(zip(sorted_m, vals)):
+                if i < 8 or v == max(vals):
+                    ax.text(i, v + 0.02, f'{v:.3f}', ha='center', va='bottom',
+                            fontsize=8 if v != max(vals) else 10,
+                            fontweight='bold' if v == max(vals) else 'normal',
+                            color='#C62828' if v == max(vals) else '#555')
+            ax.set_title(f'{dname} ({len(traits)} trait{"s" if len(traits)>1 else ""})  Best: {sorted_m[best_idx]} ({vals[best_idx]:.3f})',
+                         fontsize=13, fontweight='bold')
+            ax.set_ylim(min(-0.5, min(vals)-0.15), max(vals)+0.15)
+        else:
+            ax.set_title(f'{dname}: no GWAS models', fontsize=13, fontweight='bold')
         ax.axhline(y=0, color='#666', linewidth=1)
         ax.set_xticks(x); ax.set_xticklabels(sorted_m, rotation=55, ha='right', fontsize=7.5)
         ax.set_ylabel('R²', fontsize=13)
-        ax.set_title(f'{dname} ({len(traits)} trait{"s" if len(traits)>1 else ""})  Best: {sorted_m[0]} ({vals[best_idx]:.3f})',
-                     fontsize=13, fontweight='bold')
         ax.grid(axis='y', alpha=0.3)
-        ax.set_ylim(min(-0.5, min(vals)-0.15), max(vals)+0.15)
     fig.tight_layout()
     fig.savefig(fig_dir/'01_per_dataset_bar_charts.png', dpi=180, bbox_inches='tight', facecolor='white')
     plt.close()
     print("  -> 01_per_dataset_bar_charts.png")
 
     # --- Fig 02: Cross-dataset comparison ---
-    model_sets = [set(data[traits[0]].keys()) for _, data, traits in DATASETS]
+    model_sets = [set(_filter_models_for_arm(data[traits[0]].keys(), arm='gwas', include_ensemble=True)) for _, data, traits in DATASETS]
     common = model_sets[0]
     for s in model_sets[1:]: common = common & s
     all_common = sorted(common, key=lambda m: np.mean([_mean_r2(d, m) for _, d, _ in DATASETS]), reverse=True)
@@ -2942,7 +2651,8 @@ def generate_bar_charts(fig_dir=None):
     x = np.arange(len(common_sorted)); bar_w = 0.25
     for bi, (dname, data, _) in enumerate(DATASETS):
         vals = [_mean_r2(data, m) for m in common_sorted]
-        c = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0', '#F44336'][bi]
+        dataset_colors = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0', '#F44336', '#00897B']
+        c = dataset_colors[bi % len(dataset_colors)]
         ax.bar(x + (bi - (n_datasets-1)/2) * bar_w, vals, bar_w, color=c, edgecolor='white',
                label=f'{dname} ({len(DATASETS[bi][2])} trait{"s" if len(DATASETS[bi][2])>1 else ""})', zorder=3)
     ax.axhline(y=0, color='#666', linewidth=1)
@@ -2960,7 +2670,7 @@ def generate_bar_charts(fig_dir=None):
     fig.suptitle('Stacking (Greedy) vs Best Single Model — Per Trait', fontsize=16, fontweight='bold')
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
         ax = axes[0, ax_idx]
-        singles = [m for m in data[traits[0]].keys() if 'Stacking' not in m and 'Ensemble' not in m]
+        singles = _filter_models_for_arm([m for m in data[traits[0]].keys() if _is_single_model(m)], arm='gwas', include_ensemble=False)
         stk_key = 'Stacking (Greedy)' if 'Stacking (Greedy)' in data[traits[0]] else 'Stacking (All)'
         xs, ys = [], []
         for t in traits:
@@ -2983,7 +2693,7 @@ def generate_bar_charts(fig_dir=None):
 
     # --- Fig 07: Combined ranking ---
     combined = {}
-    for m in all_common:
+    for m in [x for x in all_common if not _is_random_model(x)]:
         v = np.mean([_mean_r2(d, m) for _, d, _ in DATASETS])
         if min(_mean_r2(d, m) for _, d, _ in DATASETS) > -1:
             combined[m] = v
@@ -3001,7 +2711,7 @@ def generate_bar_charts(fig_dir=None):
                 fontweight='bold' if 'Stacking' in m or 'Ensemble' in m else 'normal')
     ax.set_yticks([]); ax.set_xlabel('Mean R² (all-dataset avg)', fontsize=12)
     ax.set_title('Multi-Dataset Combined Ranking', fontsize=15, fontweight='bold')
-    ax.grid(axis='x', alpha=0.25); ax.set_xlim(-0.75, max(vals_r)+0.08); ax.invert_yaxis()
+    ax.grid(axis='x', alpha=0.25); ax.set_xlim(-0.75, max(vals_r)+0.08 if vals_r else 1); ax.invert_yaxis()
     fig.tight_layout()
     fig.savefig(fig_dir/'07_combined_ranking.png', dpi=180, bbox_inches='tight', facecolor='white')
     plt.close()
@@ -3016,18 +2726,18 @@ def _per_trait_bar_figures(DATASETS, fig_dir):
     """Generate per-trait bar chart figures (one figure per dataset)."""
     import matplotlib.pyplot as plt
 
-    layout = {'Wheat2000': ('08', 2, (24, 18)),
-              'Rice':      ('09', 2, (24, 30)),
-              'Maize':     ('10', 2, (24, 12))}
+    layout = {spec['tag']: (spec['fig'], spec['ncols'], spec['figsize'], spec['sub'])
+              for spec in _dataset_specs()}
     for dname, data, traits in DATASETS:
-        fig_num, ncols, fsize = layout.get(dname, (None, 2, (24, 18)))
+        fig_num, ncols, fsize, sub = layout.get(dname, ('xx', 2, (24, 18), dname.lower()))
         nrows = (len(traits) + ncols - 1) // ncols
         fig, axes = plt.subplots(nrows, ncols, figsize=fsize)
         axes_arr = axes.flatten()
 
         # Base models only (no stacking/ensemble)
-        base_models = [m for m in data[traits[0]].keys()
-                       if 'Stacking' not in m and 'Ensemble' not in m]
+        base_models = _filter_models_for_arm(
+            [m for m in data[traits[0]].keys() if _is_single_model(m)],
+            arm='gwas', include_ensemble=False)
         for idx, trait in enumerate(traits):
             ax = axes_arr[idx]
             r2s = {m: data[trait][m]['R2'] for m in base_models if m in data[trait]}
@@ -3052,17 +2762,14 @@ def _per_trait_bar_figures(DATASETS, fig_dir):
             axes_arr[idx].axis('off')
         fig.suptitle(f'{dname}: Per-Trait Model R² Comparison', fontsize=14, fontweight='bold')
         fig.tight_layout()
-        out = fig_dir / f'{fig_num}_{dname.lower()}_per_trait_bars.png'
+        out = fig_dir / f'{fig_num}_{sub}_per_trait_bars.png'
         fig.savefig(out, dpi=180, bbox_inches='tight', facecolor='white')
         plt.close()
         print(f"  -> {out.name}")
 
 
 def generate_scatter_plots(fig_dir=None):
-    """Generate top-4 per-trait predicted-vs-true scatter plots from OOF NPZ files.
-
-    One multi-panel figure per dataset, rows=traits, cols=top-4 models.
-    """
+    """Generate top-4 per-trait predicted-vs-true scatter plots for GWAS and random arms."""
     import matplotlib.pyplot as plt
 
     SCRIPT_DIR = Path(__file__).resolve().parent
@@ -3072,85 +2779,63 @@ def generate_scatter_plots(fig_dir=None):
     print("\n[plot] Generating top-4 per-trait scatter figures from OOF predictions...")
     generated = 0
     N_TOP = 4
-    json_cache = {}  # avoid re-loading same JSON per sub
 
-    for tag, sub, fig_prefix, npz_suffix in [
-        ('Rice', 'rice', '05', ''),
-        ('Maize', 'maize', '06', ''),
-        ('Wheat2000', 'wheat2000', '11', ''),
-        ('Rice (random)', 'rice', '05r', '_random'),
-        ('Maize (random)', 'maize', '06r', '_random'),
-        ('Wheat2000 (random)', 'wheat2000', '11r', '_random'),
-    ]:
+    for dname, results_d, traits in _load_plot_datasets():
+        spec = _dataset_spec_by_tag(dname)
+        sub = spec['sub']
         oof_dir = SCRIPT_DIR / "results" / f"{sub}_ensemble" / "oof_predictions"
         if not oof_dir.exists():
             continue
-
-        if sub not in json_cache:
-            json_cache[sub] = _load_json_safe(
-                SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
-        results_d = json_cache[sub]
-        if not results_d:
-            continue
-
-        traits = sorted(results_d.keys())
-        # For random SNP pass, select only random models
-        model_filter_suffix = npz_suffix
-        nrows = len(traits)
-        ncols = N_TOP
-        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.8))
-        if nrows == 1:
-            axes = axes.reshape(1, -1)
-        snp_label = ' (Random SNPs)' if npz_suffix else ''
-        fig.suptitle(f'{tag}: Top-{N_TOP} Single-Model OOF Predictions{snp_label} (per trait)',
-                     fontsize=14, fontweight='bold')
-
-        for row_idx, trait in enumerate(traits):
-            npz_path = oof_dir / f"{trait}{npz_suffix}_oof.npz"
-            if not npz_path.exists():
-                for ci in range(ncols):
-                    axes[row_idx, ci].axis('off')
-                continue
-
-            npz_data = np.load(npz_path, allow_pickle=True)
-            y_true = npz_data['_y_true']
-            yt_min, yt_max = y_true.min(), y_true.max()
-
-            # Top-4 single models for this trait (GWAS or random depending on suffix)
-            single_r2 = {
-                m: results_d[trait][m]['R2']
-                for m in results_d[trait]
-                if 'Stacking' not in m and 'Ensemble' not in m
-                and m.endswith(model_filter_suffix)
-                and m in npz_data
-            }
-            top_models = sorted(single_r2, key=single_r2.get, reverse=True)[:N_TOP]
-
-            for col_idx, mname in enumerate(top_models):
-                ax = axes[row_idx, col_idx]
-                oof = npz_data[mname]
-                ax.scatter(y_true, oof, alpha=0.4, s=6, c=_model_color(mname),
-                           edgecolors='none', zorder=3)
-                mn = min(yt_min, oof.min())
-                mx = max(yt_max, oof.max())
-                pad = (mx - mn) * 0.08
-                ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad],
-                        '--', color='#E53935', alpha=0.4, lw=1.0)
-                r2_val = single_r2[mname]
-                ax.set_title(f'{mname}\nR²={r2_val:.3f}', fontsize=7, fontweight='bold')
-                ax.set_xlabel('True', fontsize=6)
-                ax.set_ylabel('Predicted', fontsize=6)
-                ax.tick_params(labelsize=5)
-                ax.grid(alpha=0.2)
-            for col_idx in range(len(top_models), ncols):
-                axes[row_idx, col_idx].axis('off')
-
-        fig.tight_layout()
-        out_path = fig_dir / f'{fig_prefix}_{sub}_top4_scatter.png'
-        fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close()
-        print(f"  -> {out_path.name}")
-        generated += 1
+        for arm, suffix in [('gwas', ''), ('random', '_random')]:
+            nrows = len(traits)
+            ncols = N_TOP
+            fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.3, max(1, nrows) * 3.6), squeeze=False)
+            fig.suptitle(f'{dname}: Top-{N_TOP} Single-Model OOF Predictions ({arm.upper()} SNPs)',
+                         fontsize=14, fontweight='bold')
+            any_trait = False
+            for row_idx, trait in enumerate(traits):
+                npz_path = oof_dir / f"{trait}{suffix}_oof.npz"
+                if not npz_path.exists():
+                    for ci in range(ncols):
+                        axes[row_idx, ci].axis('off')
+                    continue
+                npz_data = np.load(npz_path, allow_pickle=True)
+                y_true = npz_data['_y_true']
+                single_r2 = {
+                    m: results_d[trait][m]['R2']
+                    for m in results_d[trait]
+                    if _is_single_model(m)
+                    and ((_is_random_model(m) and arm == 'random') or ((not _is_random_model(m)) and arm == 'gwas'))
+                    and m in npz_data
+                }
+                top_models = sorted(single_r2, key=single_r2.get, reverse=True)[:N_TOP]
+                if top_models:
+                    any_trait = True
+                yt_min, yt_max = float(y_true.min()), float(y_true.max())
+                for col_idx, mname in enumerate(top_models):
+                    ax = axes[row_idx, col_idx]
+                    oof = np.asarray(npz_data[mname], dtype=np.float32)
+                    ax.scatter(y_true, oof, alpha=0.4, s=6, c=_model_color(mname), edgecolors='none', zorder=3)
+                    mn = min(yt_min, float(oof.min()))
+                    mx = max(yt_max, float(oof.max()))
+                    pad = (mx - mn) * 0.08
+                    ax.plot([mn - pad, mx + pad], [mn - pad, mx + pad], '--', color='#E53935', alpha=0.4, lw=1.0)
+                    ax.set_title(f'{mname}\nR²={single_r2[mname]:.3f}', fontsize=7, fontweight='bold')
+                    ax.set_xlabel('True', fontsize=6)
+                    ax.set_ylabel('Predicted', fontsize=6)
+                    ax.tick_params(labelsize=5)
+                    ax.grid(alpha=0.2)
+                for col_idx in range(len(top_models), ncols):
+                    axes[row_idx, col_idx].axis('off')
+            if any_trait:
+                fig.tight_layout()
+                out_path = fig_dir / f'{spec["fig"]}_{sub}_{arm}_top4_scatter.png'
+                fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
+                plt.close()
+                print(f"  -> {out_path.name}")
+                generated += 1
+            else:
+                plt.close()
 
     if generated:
         print("[plot] Scatter plots done.")
@@ -3158,7 +2843,7 @@ def generate_scatter_plots(fig_dir=None):
         print("[plot] No OOF NPZ files found — run full CV first to generate scatter plots.")
 
 
-def generate_efficiency_plots(fig_dir=None):
+def generate_efficiency_plots(fig_dir=None, include_random=False):
     """Generate model efficiency comparison figures.
 
     Fig 12: per-fold runtime comparison (3 subplots, one per dataset).
@@ -3170,11 +2855,7 @@ def generate_efficiency_plots(fig_dir=None):
     fig_dir = Path(fig_dir) if fig_dir else SCRIPT_DIR / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    DATASETS = []
-    for tag, sub in [('Wheat2000', 'wheat2000'), ('Rice', 'rice'), ('Maize', 'maize')]:
-        d = _load_json_safe(SCRIPT_DIR / "results" / f"{sub}_ensemble" / "ensemble_intermediate.json")
-        if d:
-            DATASETS.append((tag, d, sorted(d.keys())))
+    DATASETS = _load_plot_datasets()
 
     if not DATASETS:
         print("[plot] No results for efficiency plots, skipping.")
@@ -3190,7 +2871,7 @@ def generate_efficiency_plots(fig_dir=None):
     for ax_idx, (dname, data, traits) in enumerate(DATASETS):
         ax = axes[ax_idx]
         base = [m for m in data[traits[0]].keys()
-                if 'Stacking' not in m and 'Ensemble' not in m]
+                if _is_single_model(m) and (include_random or not _is_random_model(m))]
         avg_time = {}
         for m in base:
             times = [data[t][m].get('Time', 0) for t in traits if m in data[t]]
@@ -3202,7 +2883,7 @@ def generate_efficiency_plots(fig_dir=None):
         ax.barh(y_pos, vals, 0.7, color=colors, edgecolor='white', linewidth=0.8, zorder=3)
         for i, (m, v) in enumerate(zip(sorted_m, vals)):
             label = f'{v:.1f}s' if v < 60 else f'{v/60:.1f}min'
-            ax.text(v + max(vals) * 0.01, i, label, va='center', fontsize=6.5)
+            ax.text(v + (max(vals) if vals else 1) * 0.01, i, label, va='center', fontsize=6.5)
         ax.set_yticks(y_pos)
         ax.set_yticklabels(sorted_m, fontsize=7)
         ax.set_xlabel('Time per fold (seconds)')
@@ -3219,7 +2900,7 @@ def generate_efficiency_plots(fig_dir=None):
     # --- Fig 13: Parameter count ---
     all_models = {m for _, data, _ in DATASETS
                   for m in data[list(data.keys())[0]]
-                  if 'Stacking' not in m and 'Ensemble' not in m}
+                  if _is_single_model(m) and (include_random or not _is_random_model(m))}
 
     param_counts = {}
     for m in all_models:
@@ -3285,7 +2966,7 @@ def generate_efficiency_plots(fig_dir=None):
             label = f'{v:.0f} MB'
         else:
             label = '<1 MB (≈ params × 16 B / 1024²)'
-        ax.text(v + max(vals_mem) * 0.01, i, label, va='center', fontsize=8)
+        ax.text(v + (max(vals_mem) if vals_mem else 1) * 0.01, i, label, va='center', fontsize=8)
     ax.set_yticks(y_pos)
     ax.set_yticklabels(sorted_m_mem, fontsize=9)
     ax.set_xlabel('GPU Memory (MB) — measured via torch.cuda.max_memory_allocated')
@@ -3308,17 +2989,22 @@ def generate_efficiency_plots(fig_dir=None):
 if __name__ == '__main__':
     crop = sys.argv[1] if len(sys.argv) > 1 else ''
     full_mode = '--full' in sys.argv
+    no_plots = '--no-plots' in sys.argv
+    plot_only = '--plot-only' in sys.argv or crop == 'plot'
 
-    if crop not in ('wheat', 'wheat2000', 'rice', 'maize', 'soybean', 'wheatgabi', 'all'):
-        print("Usage: python genomic_ensemble.py <wheat|wheat2000|rice|maize|soybean|wheatgabi|all> [--full]")
+    if crop not in ('wheat', 'wheat2000', 'rice', 'maize', 'soybean', 'wheatgabi', 'all', 'plot'):
+        print("Usage: python genomic_ensemble.py <wheat|wheat2000|rice|maize|soybean|wheatgabi|all|plot> [--full] [--no-plots] [--plot-only]")
         print("  wheat     — Run wheat ensemble pipeline (VCF data)")
         print("  wheat2000 — Run wheat2000 ensemble pipeline (CSV data, 2000×33K)")
         print("  rice      — Run rice ensemble pipeline")
         print("  maize     — Run maize ensemble pipeline")
         print("  soybean   — Run soybean SoySNP50K ensemble pipeline")
         print("  wheatgabi — Run wheat GABI iSELECT 90k ensemble pipeline")
-        print("  all       — Run wheat+rice+maize+soybean+wheatgabi pipelines")
+        print("  all       — Run all six crop/dataset pipelines")
+        print("  plot      — Generate figures only")
         print("  --full    — Full mode (all traits x 5 folds)")
+        print("  --no-plots   — Do not auto-generate figures after full run")
+        print("  --plot-only  — Generate figures only")
         sys.exit(1)
 
     print(f"\n{'#'*80}")
@@ -3327,32 +3013,7 @@ if __name__ == '__main__':
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*80}")
 
-    if crop == 'all':
-        import subprocess
-        procs = []
-        all_crops = ['wheat', 'wheat2000', 'rice', 'maize', 'soybean', 'wheatgabi']
-        for c in all_crops:
-            cmd = [sys.executable, __file__, c]
-            if full_mode:
-                cmd.append('--full')
-            print(f"  Launching subprocess: {' '.join(cmd)}")
-            procs.append(subprocess.Popen(cmd))
-        for i, p in enumerate(procs):
-            p.wait()
-            print(f"  Subprocess {all_crops[i]} finished (rc={p.returncode})")
-    else:
-        if crop == 'wheat': run_wheat(quick_test=not full_mode)
-        if crop == 'wheat2000': run_wheat2000(quick_test=not full_mode)
-        if crop == 'rice': run_rice(quick_test=not full_mode)
-        if crop == 'maize': run_maize(quick_test=not full_mode)
-        if crop == 'soybean': run_soybean(quick_test=not full_mode)
-        if crop == 'wheatgabi': run_wheat_gabi(quick_test=not full_mode)
-
-    # Auto-generate visualization figures in full mode
-    if full_mode:
-        print(f"\n{'#'*80}")
-        print(f"  Generating visualization figures...")
-        print(f"{'#'*80}")
+    def _run_all_plots():
         try:
             generate_bar_charts()
         except Exception as e:
@@ -3365,6 +3026,45 @@ if __name__ == '__main__':
             generate_efficiency_plots()
         except Exception as e:
             print(f"  [WARNING] Efficiency plot generation failed: {e}")
+
+    if plot_only:
+        print(f"\n{'#'*80}")
+        print("  Generating visualization figures only...")
+        print(f"{'#'*80}")
+        _run_all_plots()
+    elif crop == 'all':
+        import subprocess
+        procs = []
+        all_crops = ['wheat', 'wheat2000', 'rice', 'maize', 'soybean', 'wheatgabi']
+        for c in all_crops:
+            cmd = [sys.executable, __file__, c]
+            if full_mode:
+                cmd.append('--full')
+            cmd.append('--no-plots')
+            print(f"  Launching subprocess: {' '.join(cmd)}")
+            procs.append(subprocess.Popen(cmd))
+        for i, p in enumerate(procs):
+            p.wait()
+            print(f"  Subprocess {all_crops[i]} finished (rc={p.returncode})")
+        if full_mode and not no_plots:
+            print(f"\n{'#'*80}")
+            print("  Generating visualization figures once after all subprocesses...")
+            print(f"{'#'*80}")
+            _run_all_plots()
+    else:
+        if crop == 'wheat': run_wheat(quick_test=not full_mode)
+        if crop == 'wheat2000': run_wheat2000(quick_test=not full_mode)
+        if crop == 'rice': run_rice(quick_test=not full_mode)
+        if crop == 'maize': run_maize(quick_test=not full_mode)
+        if crop == 'soybean': run_soybean(quick_test=not full_mode)
+        if crop == 'wheatgabi': run_wheat_gabi(quick_test=not full_mode)
+
+    # Auto-generate visualization figures in full mode for single-dataset runs.
+    if full_mode and not no_plots and not plot_only and crop != 'all':
+        print(f"\n{'#'*80}")
+        print(f"  Generating visualization figures...")
+        print(f"{'#'*80}")
+        _run_all_plots()
 
     print(f"\n{'#'*80}")
     print(f"  All done! Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
